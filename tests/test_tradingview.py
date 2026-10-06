@@ -90,13 +90,40 @@ def test_malicious_input_cannot_escape_config():
 
 def test_chart_height_defaults_large():
     html = tradingview_widget_html("NASDAQ:AAPL")
-    assert "height:900px" in html  # terminal-scale default
-    assert tradingview_widget_html("NASDAQ:AAPL", height=950).count(
-        "height:950px") == 1
-    assert tradingview_widget_html("NASDAQ:AAPL", height=700).count(
-        "height:700px") == 1
+    # Large default: 900px of actual chart + 32px attribution container.
+    assert "height:900px" in html  # widget child = real chart height
+    assert "height:932px" in html  # outer container incl. attribution
+    assert tradingview_widget_html("NASDAQ:AAPL", height=650).count(
+        "height:650px") == 1
+    assert tradingview_widget_html("NASDAQ:AAPL", height=650).count(
+        "height:682px") == 1
     with pytest.raises(ValueError):
         tradingview_widget_html("NASDAQ:AAPL", height=200)
+
+
+def test_chart_height_propagates_through_embed_chain():
+    # Every level of the embed must carry an explicit height so the
+    # rendered candlestick area (not just the iframe) hits the target.
+    html = tradingview_widget_html("NASDAQ:AAPL", height=900)
+    assert "html,body" in html  # root height/margin reset present
+    # Official widget target class with explicit pixel height.
+    m = re.search(
+        r'<div class="tradingview-widget-container__widget" style="([^"]*)"',
+        html)
+    assert m is not None
+    assert "height:900px" in m.group(1) and "width:100%" in m.group(1)
+    assert "calc(100%" not in m.group(1)  # no percentage-height reliance
+    # Outer container carries chart + attribution explicitly.
+    m2 = re.search(
+        r'<div class="tradingview-widget-container" style="([^"]*)"', html)
+    assert m2 is not None
+    assert "height:932px" in m2.group(1) and "width:100%" in m2.group(1)
+    # Attribution line kept (required) with its own explicit height.
+    assert "tradingview-widget-copyright" in html
+    # Config carries explicit dimensions alongside autosize.
+    payload = html.split("async>", 1)[1].rsplit("</script>", 1)[0]
+    config = json.loads(payload)
+    assert config["height"] == 900 and config["width"] == "100%"
 
 
 def test_chart_full_width_autosize_config():

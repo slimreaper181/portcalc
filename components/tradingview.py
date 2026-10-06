@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from dataclasses import dataclass
 
 from analytics.validation import validate_ticker_symbol
+
+# Room reserved for the required TradingView attribution line.
+_ATTRIBUTION_PX = 32
 
 # TradingView symbol charset: exchange prefix, separators, no whitespace or
 # HTML/JS metacharacters.
@@ -185,12 +187,24 @@ def tradingview_widget_html(
 ) -> str:
     """Build the official Advanced Chart embed HTML for a symbol.
 
+    Height chain (every level gets an explicit height so the rendered
+    candlestick area — not just the iframe — hits the requested size)::
+
+        Streamlit iframe (height + attribution allowance)
+        └─ html/body (100%, margin/padding reset)
+           └─ .tradingview-widget-container (explicit ``height`` px)
+              ├─ .tradingview-widget-container__widget (explicit px —
+              │  the exact class the official embed script targets; a
+              │  random ``id`` here leaves the widget at its ~200px default)
+              └─ attribution line (required, never removed)
+
     Args:
         symbol: Resolved TradingView symbol (strictly validated).
         watchlist: Extra symbols for the widget watchlist (each validated).
         interval: Chart interval (``D`` daily default).
         theme: ``dark`` (matches the terminal aesthetic) or ``light``.
-        height: Usable chart height in px (attribution line included).
+        height: Actual chart height in px (Standard ≈ 650, Large ≈ 900).
+            The attribution line is added on top of this value.
 
     Returns:
         Self-contained HTML string for ``streamlit.components.v1.html``.
@@ -213,6 +227,8 @@ def tradingview_widget_html(
 
     config = {
         "autosize": True,
+        "width": "100%",
+        "height": height,
         "symbol": sym,
         "interval": interval,
         "timezone": "exchange",
@@ -226,11 +242,22 @@ def tradingview_widget_html(
         "support_host": "https://www.tradingview.com",
     }
     payload = _safe_json(config)
-    container_id = f"tv_{uuid.uuid4().hex[:8]}"
     return (
+        "<style>"
+        "html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;"
+        "background:#0d1117;}"
+        "</style>"
         f'<div class="tradingview-widget-container" '
-        f'style="height:{height}px;width:100%">'
-        f'<div id="{container_id}" style="height:calc(100% - 32px);width:100%"></div>'
+        f'style="width:100%;height:{height + _ATTRIBUTION_PX}px;">'
+        f'<div class="tradingview-widget-container__widget" '
+        f'style="width:100%;height:{height}px;"></div>'
+        '<div class="tradingview-widget-copyright" '
+        f'style="height:{_ATTRIBUTION_PX}px;line-height:{_ATTRIBUTION_PX}px;'
+        'text-align:center;font-size:12px;font-family:monospace;">'
+        '<a href="https://www.tradingview.com/" rel="noopener nofollow" '
+        'target="_blank" style="color:#58a6ff;text-decoration:none;">'
+        '<span>Track all markets on TradingView</span></a>'
+        "</div>"
         '<script type="text/javascript" '
         'src="https://s3.tradingview.com/external-embedding/'
         'embed-widget-advanced-chart.js" async>'
@@ -247,8 +274,13 @@ def render_tradingview_chart(
     theme: str = "dark",
     height: int = 900,
 ) -> None:
-    """Render the Advanced Chart widget inside Streamlit (full width)."""
+    """Render the Advanced Chart widget inside Streamlit (full width).
+
+    The iframe is sized to the actual chart height plus the attribution
+    line and a small margin, so no large blank region appears beneath a
+    short chart (or vice versa).
+    """
     from streamlit.components.v1 import html as _html
 
     _html(tradingview_widget_html(symbol, watchlist, interval, theme, height),
-          height=height, scrolling=False)
+          height=height + _ATTRIBUTION_PX + 8, scrolling=False)

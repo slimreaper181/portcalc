@@ -1766,9 +1766,10 @@ with tab_security:
     with size_col:
         chart_size = st.selectbox(
             "Chart Size", ["Standard", "Large"], index=1, key="tv_chart_size",
-            help="Standard ≈ 700px tall, Large ≈ 950px tall.",
+            help="Standard renders a ~650px chart, Large ~900px.",
         )
-    tv_height = 950 if chart_size == "Large" else 700
+    # Actual rendered chart heights (attribution line added on top).
+    tv_height = 900 if chart_size == "Large" else 650
     hints = {}
     for t in tickers:
         try:
