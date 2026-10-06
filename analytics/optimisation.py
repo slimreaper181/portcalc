@@ -6,12 +6,15 @@ efficient frontier, and rebalancing trade engine.
 
 All optimisers validate weight bounds up front (see
 :func:`analytics.validation.validate_weight_bounds`) and return an
-``OptimResult`` with ``success=False`` plus a human-readable message when
-constraints are infeasible — they never propagate NaN weights or raise into
-the UI. Inputs are expected in the canonical ticker order.
+``OptimResult`` with ``success=False``, ``weights=None`` and a human-readable
+message when constraints are infeasible or the solver fails. A failed
+optimisation never yields fallback weights — callers must check ``success``
+(and ``weights is not None``) before using any numeric fields, which are NaN
+on failure. Inputs are expected in the canonical ticker order.
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -22,16 +25,20 @@ from .validation import validate_weight_bounds
 
 @dataclass
 class OptimResult:
-    """Container for a single portfolio optimisation result."""
-    weights: np.ndarray
+    """Container for a single portfolio optimisation result.
+
+    On success, ``weights`` holds the optimal weight vector and the numeric
+    fields are finite. On failure, ``weights`` is None and the numeric fields
+    are NaN; ``message`` explains why. Never use the numeric fields (or a
+    previous portfolio's weights presented as a solution) when
+    ``success`` is False.
+    """
+    weights: Optional[np.ndarray]
     expected_return: float
     volatility: float
     sharpe: float
     success: bool
     message: str
-
-
-_EQUAL_WEIGHTS_MSG = "equal-weight fallback"
 
 
 def _make_constraints(n: int) -> list[dict]:
@@ -68,34 +75,29 @@ def _check_inputs(mu: np.ndarray, cov: np.ndarray) -> tuple[np.ndarray, np.ndarr
     return mu_arr, cov_arr, n
 
 
-def _failure(n: int, mu: np.ndarray, cov: np.ndarray, rf: float, message: str) -> OptimResult:
-    """Build a safe fallback result (equal weights, finite stats)."""
-    w = np.ones(n) / n
-    try:
-        ret = _port_ret(w, mu)
-        vol = _port_vol(w, cov)
-    except Exception:
-        ret, vol = 0.0, 0.0
-    if not np.isfinite(ret):
-        ret = 0.0
-    if not np.isfinite(vol) or vol < 0:
-        vol = 0.0
-    sr = (ret - rf) / vol if vol > 0 else 0.0
+def _failure(n: int, message: str) -> OptimResult:
+    """Build an explicit failure result: no weights, NaN stats, message.
+
+    A failed optimisation must never be mistaken for a solution, so no
+    fallback (e.g. equal-weight) portfolio is returned.
+    """
     return OptimResult(
-        weights=w, expected_return=float(ret), volatility=float(vol),
-        sharpe=float(sr), success=False, message=message,
+        weights=None, expected_return=float("nan"),
+        volatility=float("nan"), sharpe=float("nan"),
+        success=False, message=message,
     )
 
 
 def _validate_bounds_or_failure(
-    n: int, mu_arr: np.ndarray, cov_arr: np.ndarray, rf: float,
-    min_weight: float, max_weight: float,
+    n: int,
+    min_weight: float,
+    max_weight: float,
 ) -> OptimResult | None:
     """Return a failure OptimResult if bounds are infeasible, else None."""
     try:
         validate_weight_bounds(n, min_weight, max_weight)
     except ValueError as e:
-        return _failure(n, mu_arr, cov_arr, rf, str(e))
+        return _failure(n, str(e))
     return None
 
 
@@ -218,11 +220,11 @@ def min_variance(
         max_weight: Maximum weight per asset.
 
     Returns:
-        OptimResult with optimal weights (``success=False`` with a message
-        and equal-weight fallback if infeasible or non-convergent).
+        OptimResult with optimal weights (``success=False``, ``weights=None``
+        and a message if infeasible or non-convergent).
     """
     mu_arr, cov_arr, n = _check_inputs(mu, cov)
-    failed = _validate_bounds_or_failure(n, mu_arr, cov_arr, rf, min_weight, max_weight)
+    failed = _validate_bounds_or_failure(n, min_weight, max_weight)
     if failed is not None:
         return failed
     w0 = np.ones(n) / n
@@ -237,12 +239,12 @@ def min_variance(
             options={"ftol": 1e-12, "maxiter": 1000},
         )
     except Exception as e:  # never leak solver exceptions to the UI
-        return _failure(n, mu_arr, cov_arr, rf, f"Min-variance optimisation failed: {e}")
+        return _failure(n, f"Min-variance optimisation failed: {e}")
 
     w = np.asarray(res.x, dtype=float)
     if not res.success or not np.all(np.isfinite(w)):
         msg = res.message if isinstance(res.message, str) else str(res.message)
-        bad = _failure(n, mu_arr, cov_arr, rf, f"Min-variance did not converge: {msg}")
+        bad = _failure(n, f"Min-variance did not converge: {msg}")
         return bad
 
     ret = _port_ret(w, mu_arr)
@@ -270,11 +272,11 @@ def max_sharpe(
         max_weight: Maximum weight per asset.
 
     Returns:
-        OptimResult with optimal weights (fallback on failure, see
-        :func:`min_variance`).
+        OptimResult with optimal weights (``success=False``, ``weights=None``
+        and a message on failure, see :func:`min_variance`).
     """
     mu_arr, cov_arr, n = _check_inputs(mu, cov)
-    failed = _validate_bounds_or_failure(n, mu_arr, cov_arr, rf, min_weight, max_weight)
+    failed = _validate_bounds_or_failure(n, min_weight, max_weight)
     if failed is not None:
         return failed
     w0 = np.ones(n) / n
@@ -294,12 +296,12 @@ def max_sharpe(
             options={"ftol": 1e-12, "maxiter": 1000},
         )
     except Exception as e:
-        return _failure(n, mu_arr, cov_arr, rf, f"Max-Sharpe optimisation failed: {e}")
+        return _failure(n, f"Max-Sharpe optimisation failed: {e}")
 
     w = np.asarray(res.x, dtype=float)
     if not res.success or not np.all(np.isfinite(w)):
         msg = res.message if isinstance(res.message, str) else str(res.message)
-        return _failure(n, mu_arr, cov_arr, rf, f"Max-Sharpe did not converge: {msg}")
+        return _failure(n, f"Max-Sharpe did not converge: {msg}")
 
     ret = _port_ret(w, mu_arr)
     vol = _port_vol(w, cov_arr)
@@ -335,15 +337,15 @@ def target_return(
         OptimResult with optimal weights.
     """
     mu_arr, cov_arr, n = _check_inputs(mu, cov)
-    failed = _validate_bounds_or_failure(n, mu_arr, cov_arr, rf, min_weight, max_weight)
+    failed = _validate_bounds_or_failure(n, min_weight, max_weight)
     if failed is not None:
         return failed
     if not np.isfinite(target):
-        return _failure(n, mu_arr, cov_arr, rf, f"Target return {target!r} is not finite.")
+        return _failure(n, f"Target return {target!r} is not finite.")
     lo, hi = feasible_return_range(mu_arr, min_weight, max_weight)
     if not lo - 1e-9 <= target <= hi + 1e-9:
         return _failure(
-            n, mu_arr, cov_arr, rf,
+            n,
             f"Target return {target:.2%} is outside the feasible range "
             f"[{lo:.2%}, {hi:.2%}] under the current weight bounds.",
         )
@@ -363,12 +365,12 @@ def target_return(
             options={"ftol": 1e-12, "maxiter": 1000},
         )
     except Exception as e:
-        return _failure(n, mu_arr, cov_arr, rf, f"Target-return optimisation failed: {e}")
+        return _failure(n, f"Target-return optimisation failed: {e}")
 
     w = np.asarray(res.x, dtype=float)
     if not res.success or not np.all(np.isfinite(w)):
         msg = res.message if isinstance(res.message, str) else str(res.message)
-        return _failure(n, mu_arr, cov_arr, rf, f"Target-return did not converge: {msg}")
+        return _failure(n, f"Target-return did not converge: {msg}")
 
     ret = _port_ret(w, mu_arr)
     vol = _port_vol(w, cov_arr)
@@ -402,18 +404,18 @@ def target_volatility(
         OptimResult with optimal weights.
     """
     mu_arr, cov_arr, n = _check_inputs(mu, cov)
-    failed = _validate_bounds_or_failure(n, mu_arr, cov_arr, rf, min_weight, max_weight)
+    failed = _validate_bounds_or_failure(n, min_weight, max_weight)
     if failed is not None:
         return failed
     if not np.isfinite(target_vol) or target_vol <= 0:
         return _failure(
-            n, mu_arr, cov_arr, rf,
+            n,
             f"Target volatility must be a positive finite number, got {target_vol!r}.",
         )
     lo, hi = feasible_volatility_range(mu_arr, cov_arr, min_weight, max_weight)
     if not lo - 1e-9 <= target_vol <= hi + 1e-9:
         return _failure(
-            n, mu_arr, cov_arr, rf,
+            n,
             f"Target volatility {target_vol:.2%} is outside the feasible range "
             f"[{lo:.2%}, {hi:.2%}] under the current weight bounds.",
         )
@@ -433,12 +435,12 @@ def target_volatility(
             options={"ftol": 1e-12, "maxiter": 1000},
         )
     except Exception as e:
-        return _failure(n, mu_arr, cov_arr, rf, f"Target-volatility optimisation failed: {e}")
+        return _failure(n, f"Target-volatility optimisation failed: {e}")
 
     w = np.asarray(res.x, dtype=float)
     if not res.success or not np.all(np.isfinite(w)):
         msg = res.message if isinstance(res.message, str) else str(res.message)
-        return _failure(n, mu_arr, cov_arr, rf, f"Target-volatility did not converge: {msg}")
+        return _failure(n, f"Target-volatility did not converge: {msg}")
 
     ret = _port_ret(w, mu_arr)
     vol = _port_vol(w, cov_arr)

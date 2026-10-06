@@ -50,7 +50,7 @@ def test_target_return_feasible_and_infeasible():
     bad = target_return(MU, COV, hi + 0.50, RF, 0.0, 1.0)
     assert not bad.success
     assert "outside the feasible range" in bad.message
-    assert np.all(np.isfinite(bad.weights))
+    assert bad.weights is None  # no fallback weights on failure
 
 
 def test_target_volatility_feasible_and_infeasible():
@@ -62,7 +62,7 @@ def test_target_volatility_feasible_and_infeasible():
     assert res.volatility == pytest.approx(mid, abs=1e-3)
     bad = target_volatility(MU, COV, hi + 0.50, RF, 0.0, 1.0)
     assert not bad.success
-    assert np.all(np.isfinite(bad.weights))
+    assert bad.weights is None  # no fallback weights on failure
 
 
 def test_infeasible_weight_bounds_short_circuit():
@@ -77,7 +77,28 @@ def test_infeasible_weight_bounds_short_circuit():
     # Malformed ordering.
     r3 = min_variance(MU, COV, RF, 0.5, 0.2)
     assert not r3.success
-    assert np.all(np.isfinite(r3.weights)) and r3.weights.sum() == pytest.approx(1.0)
+    assert r3.weights is None
+
+
+def test_failure_result_contract_no_fake_weights():
+    """Every failure mode: success=False, weights=None, non-empty message."""
+    failures = [
+        min_variance(np.ones(3) * 0.05, np.eye(3) * 0.04, RF, 0.0, 0.20),
+        max_sharpe(np.ones(10) * 0.05, np.eye(10) * 0.04, RF, 0.20, 1.0),
+        target_return(MU, COV, 5.0, RF, 0.0, 1.0),
+        target_volatility(MU, COV, 5.0, RF, 0.0, 1.0),
+        target_return(MU, COV, float("nan"), RF, 0.0, 1.0),
+        target_volatility(MU, COV, -0.1, RF, 0.0, 1.0),
+        min_variance(MU, COV, RF, 0.6, 0.4),
+    ]
+    for res in failures:
+        assert res.success is False
+        assert res.weights is None
+        assert isinstance(res.message, str) and res.message
+    # Success case still carries real weights summing to 1.
+    good = min_variance(MU, COV, RF, 0.0, 1.0)
+    assert good.success and good.weights is not None
+    assert good.weights.sum() == pytest.approx(1.0)
 
 
 def test_efficient_frontier_and_rebalance():

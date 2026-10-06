@@ -5,9 +5,10 @@ Portfolio Analytics & Risk Dashboard — Streamlit entry point.
 
 Tabs:
   1. 📈 Overview      — positions, returns, correlation/covariance
-  2. ⚠️  Risk          — VaR (parametric, historical, Monte Carlo)
+  2. ⚠️  Risk          — VaR (parametric, historical, Monte Carlo) + CVaR
   3. 🎯 Optimise      — efficient frontier, max Sharpe, min variance, target constraints
   4. 📊 Scenario      — Monte Carlo forward simulation with stress scenarios
+  5. 📉 Performance   — benchmark comparison, drawdowns, downside risk, rolling stats
 
 Run locally:
     streamlit run app.py
@@ -32,6 +33,7 @@ import streamlit as st
 
 from data.market_data import (
     fetch_price_history,
+    fetch_benchmark_history,
     fetch_current_prices,
     fetch_risk_free_rate,
 )
@@ -75,6 +77,23 @@ from analytics.scenario import (
     plot_final_distribution,
     plot_confidence_bands,
     SCENARIO_DEFINITIONS,
+)
+from analytics.performance import (
+    align_return_series,
+    best_worst_periods,
+    drawdown_series,
+    growth_of_capital,
+    historical_cvar,
+    log_returns_from_prices,
+    monthly_returns,
+    plot_drawdown,
+    plot_growth_comparison,
+    rolling_annualised_return,
+    rolling_sharpe,
+    rolling_volatility,
+    sharpe_from_log,
+    summarise_performance,
+    underwater_episodes,
 )
 from analytics.validation import (
     align_market_data,
@@ -399,6 +418,12 @@ def load_market_data(tickers: list[str], period: str):
     return prices, current, rf
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_benchmark_data(benchmark_ticker: str, period: str):
+    """Cached benchmark history for the same period as the portfolio."""
+    return fetch_benchmark_history(benchmark_ticker, period=period)
+
+
 try:
     tickers = canonical_tickers(list(st.session_state.portfolio.keys()))
 except ValueError as e:
@@ -452,11 +477,12 @@ rc = core["rc"]
 # Main tabs
 # ---------------------------------------------------------------------------
 
-tab_overview, tab_risk, tab_optimise, tab_scenario = st.tabs([
+tab_overview, tab_risk, tab_optimise, tab_scenario, tab_perf = st.tabs([
     "📈 Overview",
     "⚠️  Risk",
     "🎯 Optimise",
     "📊 Scenario Analysis",
+    "📉 Performance",
 ])
 
 
@@ -679,6 +705,42 @@ with tab_risk:
             "Captures correlation structure."
         )
 
+    # Historical CVaR (Expected Shortfall) at the same horizon
+    st.markdown("---")
+    st.markdown("### Historical CVaR (Expected Shortfall)")
+    try:
+        cvar_out = historical_cvar(
+            port_daily_returns, portfolio_value, 0.95, int(var_horizon)
+        )
+    except ValueError as e:
+        cvar_out = None
+        st.warning(f"Historical CVaR unavailable: {e}")
+
+    if cvar_out is not None:
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.metric(
+                f"95% Historical VaR ({int(var_horizon)}d)",
+                fmt_usd(cvar_out["var_currency"]),
+                help="Loss threshold exceeded in the worst 5% of historical periods.",
+            )
+            st.caption(f"Cutoff return: {cvar_out['var_pct']:.2%}")
+        with cc2:
+            st.metric(
+                f"95% Historical CVaR ({int(var_horizon)}d)",
+                fmt_usd(cvar_out["cvar_currency"]),
+                help="Average loss once the VaR threshold has been exceeded.",
+            )
+            st.caption(
+                f"Average tail loss: {cvar_out['cvar_pct']:.2%} "
+                f"over {cvar_out['n_tail']:,} of {cvar_out['n_windows']:,} "
+                "genuine rolling windows."
+            )
+        st.caption(
+            "VaR estimates the loss threshold exceeded in the worst 5% of periods. "
+            "CVaR estimates the average loss once that threshold has been exceeded."
+        )
+
     st.markdown("---")
 
     # Return distribution
@@ -758,12 +820,10 @@ with tab_optimise:
     if not bounds_ok:
         st.warning("Fix the weight bounds above to run optimisations.")
     else:
-        # Run optimisations
+        # Run optimisations (failures render as errors in their result cards;
+        # failed results carry no weights and are never shown as solutions).
         res_mv = min_variance(mu_arr, cov_arr, rf_rate, min_w, max_w)
         res_ms = max_sharpe(mu_arr, cov_arr, rf_rate, min_w, max_w)
-        for _res, _name in ((res_mv, "Min Variance"), (res_ms, "Max Sharpe")):
-            if not _res.success:
-                st.warning(f"{_name} optimisation issue: {_res.message}")
 
         # Target return slider — bounded by the feasible return range.
         try:
@@ -793,8 +853,6 @@ with tab_optimise:
                 key="target_r_val",
             )
             res_tr = target_return(mu_arr, cov_arr, target_r_val, rf_rate, min_w, max_w)
-            if not res_tr.success:
-                st.warning(f"Target-return optimisation issue: {res_tr.message}")
 
         # Target volatility slider — bounded by feasible portfolio volatility
         # (from the covariance structure), NOT by return dispersion.
@@ -828,25 +886,27 @@ with tab_optimise:
                 key="target_v_val",
             )
             res_tv = target_volatility(mu_arr, cov_arr, target_v_val, rf_rate, min_w, max_w)
-            if not res_tv.success:
-                st.warning(f"Target-volatility optimisation issue: {res_tv.message}")
 
         st.markdown("---")
         st.markdown("### Optimisation Results")
 
         def _result_card(label: str, res, tickers: list[str]) -> None:
-            if res is None:
-                st.warning(f"{label}: unavailable under current constraints.")
+            if res is None or not res.success or res.weights is None:
+                reason = ""
+                if res is not None and res.message:
+                    reason = f": {res.message}"
+                st.error(f"❌ {label} — optimisation failed{reason}")
+                st.caption(
+                    "Your current portfolio is unchanged; no fallback weights "
+                    "are shown as a solution."
+                )
                 return
-            status = "✅" if res.success else "⚠️"
             cols = st.columns(4)
-            cols[0].metric(f"{status} {label} — Return", fmt_pct(res.expected_return))
+            cols[0].metric(f"✅ {label} — Return", fmt_pct(res.expected_return))
             cols[1].metric("Volatility", fmt_pct(res.volatility))
             cols[2].metric("Sharpe", f"{res.sharpe:.2f}")
             w_df = pd.DataFrame({"Ticker": tickers, "Weight": res.weights}).set_index("Ticker")
             cols[3].dataframe(w_df.style.format({"Weight": "{:.1%}"}), height=160)
-            if not res.success:
-                st.caption(f"{label} note: {res.message}")
 
         _result_card("Min Variance", res_mv, tickers)
         st.markdown("---")
@@ -887,7 +947,8 @@ with tab_optimise:
                 marker=dict(color="#f85149", size=12, symbol="star"),
             ))
             # Mark max Sharpe
-            if res_ms.success and np.isfinite(res_ms.volatility) and res_ms.volatility > 0:
+            if (res_ms.success and res_ms.weights is not None
+                    and np.isfinite(res_ms.volatility) and res_ms.volatility > 0):
                 fig_ef.add_trace(go.Scatter(
                     x=[res_ms.volatility], y=[res_ms.expected_return],
                     mode="markers", name="Max Sharpe",
@@ -926,7 +987,9 @@ with tab_optimise:
         }
         chosen = target_map[target_choice]
 
-        if chosen is not None and chosen.success and np.all(np.isfinite(chosen.weights)):
+        if (chosen is not None and chosen.success
+                and chosen.weights is not None
+                and np.all(np.isfinite(chosen.weights))):
             try:
                 trades_df = rebalance_trades(weights, chosen.weights, tickers, portfolio_value)
             except ValueError as e:
@@ -1173,4 +1236,296 @@ with tab_scenario:
                 "Avg Max Drawdown": "{:.1%}",
             }),
             use_container_width=True,
+        )
+
+
+# ============================================================
+# TAB 5 — PERFORMANCE vs BENCHMARK
+# ============================================================
+with tab_perf:
+    st.markdown("## Performance vs Benchmark")
+
+    if "bench_ticker" not in st.session_state:
+        st.session_state.bench_ticker = "SPY"
+
+    set1, set2, set3 = st.columns([2, 2, 3])
+    with set1:
+        st.text_input("Benchmark ticker", key="bench_ticker",
+                      help="Any Yahoo Finance ticker, e.g. SPY, QQQ, ^GSPC, ^FTSE.")
+    with set2:
+        roll_win = st.selectbox(
+            "Rolling window (trading days)",
+            [21, 63, 126, 252], index=1, key="perf_rollwin",
+            help="21d ≈ 1 month, 63d ≈ 1 quarter, 126d ≈ half year, 252d ≈ 1 year.",
+        )
+    with set3:
+        bench_period = st.session_state.get("hist_period_tab1", "2y")
+        st.caption(
+            f"Benchmark is loaded over the same **{bench_period}** history period "
+            "as the portfolio and all comparisons use only common trading dates."
+        )
+
+    try:
+        bench_sym = validate_ticker_symbol(st.session_state.bench_ticker)
+    except ValueError as e:
+        st.error(f"Invalid benchmark ticker: {e}")
+        bench_sym = None
+
+    if bench_sym is not None:
+        with st.spinner(f"Loading benchmark {bench_sym}…"):
+            try:
+                bench_prices = load_benchmark_data(bench_sym, bench_period)
+            except ValueError as e:
+                st.error(f"Benchmark error: {e}")
+                bench_prices = None
+            except Exception:
+                st.error(
+                    "Could not load benchmark data (network or API error). "
+                    "Check the ticker and your connection."
+                )
+                bench_prices = None
+
+        if bench_prices is not None:
+            try:
+                bench_rets_full = log_returns_from_prices(bench_prices)
+                p_al, b_al = align_return_series(port_daily_returns, bench_rets_full)
+            except ValueError as e:
+                st.error(f"Benchmark comparison unavailable: {e}")
+                p_al = None
+            else:
+                try:
+                    perf = summarise_performance(
+                        port_daily_returns, bench_rets_full, rf_rate)
+                except ValueError as e:
+                    st.warning(f"Relative metrics unavailable: {e}")
+                    perf = summarise_performance(
+                        port_daily_returns, None, rf_rate)
+                perf_p = perf["portfolio"]
+                perf_b = perf["benchmark"]
+                perf_r = perf["relative"]
+
+                # ---- Growth of $10,000 ----
+                st.markdown("---")
+                st.markdown("### Growth of $10,000")
+                g_p = growth_of_capital(p_al, 10_000.0)
+                g_b = growth_of_capital(b_al, 10_000.0)
+                gh1, gh2 = st.columns(2)
+                gh1.metric("Portfolio", fmt_usd(float(g_p.iloc[-1])),
+                           help="Final value of $10,000 in the portfolio.")
+                gh2.metric(bench_sym, fmt_usd(float(g_b.iloc[-1])),
+                           help=f"Final value of $10,000 in {bench_sym}.")
+                st.plotly_chart(
+                    plot_growth_comparison(g_p, g_b, 10_000.0, bench_sym),
+                    use_container_width=True,
+                )
+                st.caption(
+                    f"Both series start at $10,000 on {g_p.index[0].date()} "
+                    f"({len(p_al):,} common trading dates)."
+                )
+
+                # ---- Performance summary panel ----
+                st.markdown("---")
+                st.markdown("### Performance Summary")
+                s1, s2, s3 = st.columns(3)
+                with s1:
+                    st.markdown("#### PORTFOLIO PERFORMANCE")
+                    st.metric("Annualised Return", fmt_pct(perf_p["ann_return"]),
+                              help="Mean daily log return × 252.")
+                    st.metric("Annualised Volatility", fmt_pct(perf_p["ann_vol"]),
+                              help="Daily std × √252.")
+                    st.metric("Sharpe", f"{perf_p['sharpe']:.2f}",
+                              help="Excess return over cash per unit of total volatility.")
+                    st.metric("Sortino", f"{perf_p['sortino']:.2f}",
+                              help="Excess return per unit of downside volatility (losses only).")
+                    st.metric("Calmar", f"{perf_p['calmar']:.2f}",
+                              help="Annualised return per unit of maximum drawdown.")
+                    st.metric("Maximum Drawdown", fmt_pct(perf_p["max_drawdown"]),
+                              help="Worst peak-to-trough fall on the aligned history.")
+                with s2:
+                    st.markdown("#### BENCHMARK")
+                    if perf_b is not None:
+                        st.metric("Annualised Return", fmt_pct(perf_b["ann_return"]))
+                        st.metric("Annualised Volatility", fmt_pct(perf_b["ann_vol"]))
+                        st.metric("Sharpe", f"{perf_b['sharpe']:.2f}")
+                        st.metric("Maximum Drawdown", fmt_pct(perf_b["max_drawdown"]))
+                    else:
+                        st.caption("Benchmark metrics unavailable.")
+                with s3:
+                    st.markdown("#### RELATIVE PERFORMANCE")
+                    if perf_r["beta"] is not None:
+                        beta = perf_r["beta"]
+                        st.metric("Beta", f"{beta:.2f}",
+                                  help="Portfolio sensitivity to benchmark moves.")
+                        gap = (beta - 1.0) * 100
+                        direction = "more" if gap >= 0 else "less"
+                        st.caption(
+                            f"Beta {beta:.2f}: the portfolio has historically moved "
+                            f"≈{abs(gap):.0f}% {direction} than {bench_sym}. "
+                            "Association, not causality."
+                        )
+                        st.metric(
+                            "Historical Alpha", f"{perf_r['historical_alpha']:+.2%}",
+                            help="Past CAPM-style excess return. Historical and "
+                                 "model-dependent — not expected future alpha.",
+                        )
+                        st.metric("Tracking Error", fmt_pct(perf_r["tracking_error"]),
+                                  help="Annualised std of portfolio-minus-benchmark returns.")
+                        st.metric("Information Ratio", f"{perf_r['information_ratio']:.2f}",
+                                  help="Annualised active return per unit of tracking error.")
+                    else:
+                        st.caption("Relative metrics unavailable for this benchmark.")
+
+                # ---- Portfolio vs benchmark table ----
+                st.markdown("---")
+                st.markdown("### Portfolio vs Benchmark")
+                p_simple = np.exp(p_al) - 1
+                b_simple = np.exp(b_al) - 1
+
+                def _fmt_cell(metric: str, v: float) -> str:
+                    if v is None or not np.isfinite(v):
+                        return "n/a"
+                    if metric == "Sharpe":
+                        return f"{v:.2f}"
+                    if "Day" in metric:
+                        return f"{v:+.2%}"
+                    return f"{v:.2%}"
+
+                _metrics = ["Annualised Return", "Volatility", "Sharpe",
+                            "Max Drawdown", "Best Day", "Worst Day"]
+                _p_vals = [perf_p["ann_return"], perf_p["ann_vol"],
+                           perf_p["sharpe"], perf_p["max_drawdown"],
+                           p_simple.max(), p_simple.min()]
+                _b_vals = ([perf_b["ann_return"], perf_b["ann_vol"],
+                            perf_b["sharpe"], perf_b["max_drawdown"],
+                            b_simple.max(), b_simple.min()]
+                           if perf_b is not None else [np.nan] * 6)
+                perf_table = pd.DataFrame(
+                    {
+                        "Portfolio": [_fmt_cell(m, v) for m, v in zip(_metrics, _p_vals)],
+                        bench_sym: [_fmt_cell(m, v) for m, v in zip(_metrics, _b_vals)],
+                    },
+                    index=_metrics,
+                )
+                st.dataframe(perf_table, use_container_width=True)
+                st.caption(
+                    f"Best day: portfolio {p_simple.idxmax().date()} "
+                    f"({p_simple.max():.2%}) vs {bench_sym} {b_simple.idxmax().date()} "
+                    f"({b_simple.max():.2%}). Worst day: portfolio "
+                    f"{p_simple.idxmin().date()} ({p_simple.min():.2%}) vs "
+                    f"{bench_sym} {b_simple.idxmin().date()} ({b_simple.min():.2%})."
+                )
+
+                # ---- Drawdown chart + underwater episodes ----
+                st.markdown("---")
+                st.markdown("### Drawdowns")
+                dd_p = drawdown_series(g_p)
+                dd_b = drawdown_series(g_b)
+                st.plotly_chart(
+                    plot_drawdown(dd_p, dd_b, bench_sym, perf_p["max_drawdown"]),
+                    use_container_width=True,
+                )
+                st.markdown("#### Five Largest Drawdowns (Portfolio, Full History)")
+                wealth_full = growth_of_capital(port_daily_returns, 1.0)
+                try:
+                    uw = underwater_episodes(wealth_full, top_n=5)
+                except ValueError as e:
+                    st.warning(f"Underwater analysis unavailable: {e}")
+                    uw = None
+                if uw is not None and not uw.empty:
+                    disp = uw.copy()
+                    for col in ("Peak", "Trough"):
+                        disp[col] = pd.to_datetime(disp[col]).strftime("%Y-%m-%d")
+                    disp["Recovery"] = disp["Recovery"].apply(
+                        lambda d: "Not yet recovered"
+                        if pd.isna(d) else pd.Timestamp(d).strftime("%Y-%m-%d")
+                    )
+                    st.dataframe(
+                        disp.style.format({
+                            "Drawdown %": "{:.2%}",
+                            "Duration (days)": "{:.0f}",
+                        }),
+                        use_container_width=True,
+                    )
+                else:
+                    st.caption("No drawdown episodes found.")
+
+                # ---- Rolling analytics ----
+                st.markdown("---")
+                st.markdown(f"### Rolling Analytics ({int(roll_win)}-Day Window)")
+                if len(p_al) < int(roll_win):
+                    st.warning(
+                        f"Only {len(p_al)} common observations — need at least "
+                        f"{int(roll_win)} for the selected rolling window. "
+                        "Choose a shorter window or load a longer history."
+                    )
+                else:
+                    try:
+                        rr_p = rolling_annualised_return(p_al, int(roll_win))
+                        rr_b = rolling_annualised_return(b_al, int(roll_win))
+                        rv_p = rolling_volatility(p_al, int(roll_win))
+                        rv_b = rolling_volatility(b_al, int(roll_win))
+                        rs_p = rolling_sharpe(p_al, rf_rate, int(roll_win))
+                        rs_b = rolling_sharpe(b_al, rf_rate, int(roll_win))
+                    except ValueError as e:
+                        st.warning(f"Rolling analytics unavailable: {e}")
+                    else:
+                        def _roll_fig(p_s, b_s, title, ytitle, fmt):
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=p_s.index, y=p_s.values, mode="lines",
+                                name="Portfolio", line=dict(color="#58a6ff", width=2)))
+                            fig.add_trace(go.Scatter(
+                                x=b_s.index, y=b_s.values, mode="lines",
+                                name=bench_sym, line=dict(color="#f0883e", width=1.5)))
+                            fig.update_layout(**CHART_THEME, title=title,
+                                              xaxis_title="Date", yaxis_title=ytitle,
+                                              yaxis_tickformat=fmt)
+                            return fig
+
+                        st.plotly_chart(_roll_fig(
+                            rr_p, rr_b, "Rolling Annualised Return",
+                            "Return", ".0%"), use_container_width=True)
+                        st.plotly_chart(_roll_fig(
+                            rv_p, rv_b, "Rolling Annualised Volatility",
+                            "Volatility (σ)", ".0%"), use_container_width=True)
+                        st.plotly_chart(_roll_fig(
+                            rs_p, rs_b, "Rolling Sharpe Ratio",
+                            "Sharpe", ".1f"), use_container_width=True)
+
+                # ---- Best / worst periods ----
+                st.markdown("---")
+                st.markdown("### Best / Worst Periods (Portfolio)")
+                try:
+                    bw = best_worst_periods(port_daily_returns)
+                except ValueError as e:
+                    st.warning(f"Best/worst periods unavailable: {e}")
+                else:
+                    b1, b2, b3, b4 = st.columns(4)
+                    b1.metric("Best Day",
+                              f"{bw['best_day'][1]:+.2%} — {bw['best_day'][0].date()}")
+                    b2.metric("Worst Day",
+                              f"{bw['worst_day'][1]:+.2%} — {bw['worst_day'][0].date()}")
+                    b3.metric("Best Month", f"{bw['best_month'][1]:+.2%} — {bw['best_month'][0]}")
+                    b4.metric("Worst Month",
+                              f"{bw['worst_month'][1]:+.2%} — {bw['worst_month'][0]}")
+                    st.caption(
+                        "Monthly returns compound daily log returns "
+                        "(exp of summed logs − 1), never simple averages."
+                    )
+
+    # ---- Metric glossary ----
+    with st.expander("Metric glossary"):
+        st.markdown(
+            """
+            **Sharpe** — excess return over cash per unit of total volatility. Higher is better.
+            **Sortino** — like Sharpe but only downside volatility counts; upside swings are not penalised.
+            **Calmar** — annualised return divided by the worst peak-to-trough drawdown.
+            **Beta** — how strongly the portfolio has historically moved with the benchmark (1.0 = in step).
+            **Alpha (historical)** — past return left over after accounting for beta; model-dependent, not a forecast.
+            **Tracking Error** — annualised volatility of portfolio-minus-benchmark returns.
+            **Information Ratio** — active return per unit of tracking error.
+            **VaR** — loss threshold crossed only in the worst 5% of periods.
+            **CVaR / Expected Shortfall** — average loss once the VaR threshold is crossed.
+            **Maximum Drawdown** — largest observed peak-to-trough fall; 0 means a prior peak.
+            """
         )

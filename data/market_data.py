@@ -12,7 +12,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-from analytics.validation import canonical_tickers
+from analytics.validation import canonical_tickers, validate_ticker_symbol
 
 
 def _normalise_requested(tickers: list[str]) -> list[str]:
@@ -86,6 +86,26 @@ def fetch_price_history(tickers: list[str], period: str = "1y") -> pd.DataFrame:
         ].tolist()
         raise ValueError(f"Invalid (zero/negative/NaN) prices for: {', '.join(bad)}.")
     return prices
+
+
+def fetch_benchmark_history(ticker: str, period: str = "2y") -> pd.Series:
+    """
+    Download adjusted-close history for a single benchmark ticker.
+
+    Args:
+        ticker: Benchmark symbol (e.g. 'SPY', 'QQQ', '^GSPC').
+        period:  yfinance period string — callers must pass the exact same
+            period used for the portfolio so date ranges never diverge.
+
+    Returns:
+        Series of daily adjusted close prices named after the ticker.
+
+    Raises:
+        ValueError: if the ticker is invalid or no history is available.
+    """
+    sym = validate_ticker_symbol(ticker)
+    df = fetch_price_history([sym], period=period)
+    return df[sym].copy()
 
 
 def fetch_current_prices(tickers: list[str]) -> dict[str, float]:
