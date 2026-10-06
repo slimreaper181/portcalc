@@ -86,3 +86,31 @@ def test_malicious_input_cannot_escape_config():
     assert "</script>" not in payload and "<script" not in payload
     # Payload is still valid JSON decoding to the requested config.
     assert json.loads(payload)["symbol"] == "NASDAQ:AAPL"
+
+
+def test_chart_height_defaults_large():
+    html = tradingview_widget_html("NASDAQ:AAPL")
+    assert "height:900px" in html  # terminal-scale default
+    assert tradingview_widget_html("NASDAQ:AAPL", height=950).count(
+        "height:950px") == 1
+    assert tradingview_widget_html("NASDAQ:AAPL", height=700).count(
+        "height:700px") == 1
+    with pytest.raises(ValueError):
+        tradingview_widget_html("NASDAQ:AAPL", height=200)
+
+
+def test_chart_full_width_autosize_config():
+    html = tradingview_widget_html("NASDAQ:AAPL", ["NYSE:JPM"])
+    payload = html.split("async>", 1)[1].rsplit("</script>", 1)[0]
+    config = json.loads(payload)
+    assert config["autosize"] is True
+    assert "width:100%" in html  # fluid container, no fixed pixel width
+    assert "width:680" not in html and "width:900px" not in html
+    # Chart controls preserved.
+    assert config["theme"] == "dark" and config["style"] == "1"
+    assert config["interval"] == "D" and config["timezone"] == "exchange"
+    assert config["withdateranges"] is True
+    assert config["hide_side_toolbar"] is False
+    assert config["allow_symbol_change"] is True
+    assert config["watchlist"][0] == "NASDAQ:AAPL"
+    assert "support_host" in config  # TradingView attribution intact

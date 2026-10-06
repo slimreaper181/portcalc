@@ -181,7 +181,7 @@ def tradingview_widget_html(
     watchlist: list[str] | tuple[str, ...] = (),
     interval: str = "D",
     theme: str = "dark",
-    height: int = 680,
+    height: int = 900,
 ) -> str:
     """Build the official Advanced Chart embed HTML for a symbol.
 
@@ -194,6 +194,8 @@ def tradingview_widget_html(
 
     Returns:
         Self-contained HTML string for ``streamlit.components.v1.html``.
+        The container is fluid (``width:100%``) with ``autosize`` enabled so
+        the widget always spans the full Streamlit content width.
     """
     sym = validate_tradingview_symbol(symbol)
     clean_watchlist: list[str] = []
@@ -243,9 +245,9 @@ def render_tradingview_chart(
     watchlist: list[str] | tuple[str, ...] = (),
     interval: str = "D",
     theme: str = "dark",
-    height: int = 680,
+    height: int = 900,
 ) -> None:
-    """Render the Advanced Chart widget inside Streamlit."""
+    """Render the Advanced Chart widget inside Streamlit (full width)."""
     from streamlit.components.v1 import html as _html
 
     _html(tradingview_widget_html(symbol, watchlist, interval, theme, height),

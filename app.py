@@ -106,6 +106,13 @@ from components.tradingview import (
     render_tradingview_chart,
     resolve_tradingview_symbol,
 )
+from data.alpaca import (
+    AlpacaError,
+    build_price_view,
+    fetch_latest_trades,
+    get_alpaca_credentials,
+    is_alpaca_supported_symbol,
+)
 from analytics.validation import (
     align_market_data,
     aligned_portfolio_returns,
@@ -444,6 +451,55 @@ def load_exchange_hint(ticker: str):
         return None
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def load_alpaca_trades(symbols):
+    """Cached Alpaca latest trades (short 10s TTL — live data).
+
+    Never raises: returns ``(trades, status)`` where ``status`` is ``None``
+    on success, ``"disabled"`` when credentials are absent, or a short
+    error message otherwise. Callers fall back per symbol to Yahoo.
+    """
+    try:
+        creds = get_alpaca_credentials()
+    except Exception:
+        return {}, "disabled"
+    try:
+        trades = fetch_latest_trades(list(symbols), credentials=creds)
+    except AlpacaError as e:
+        return {}, str(e)
+    except Exception as e:
+        return {}, f"Live-price request failed ({e})."
+    return trades, None
+
+
+def resolve_valuation_prices(tickers, yahoo_current):
+    """Blend Alpaca live trades over Yahoo current prices (valuation only).
+
+    Returns ``(valuation_dict, price_view, alpaca_status)``. Historical
+    ``prices`` series are never touched — live data is used solely for
+    current prices, market value and P&L display.
+    """
+    supported = sorted(t for t in tickers if is_alpaca_supported_symbol(t))
+    trades, status = load_alpaca_trades(tuple(supported)) if supported else ({}, None)
+    view = build_price_view(tickers, yahoo_current, trades)
+    return {t: view[t].price for t in tickers}, view, status
+
+
+def format_trade_time(ts):
+    """Format an Alpaca trade timestamp as ET (UTC fallback). Never raises."""
+    if ts is None:
+        return "time unknown"
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ts.astimezone(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET")
+    except Exception:
+        try:
+            return ts.strftime("%H:%M:%S UTC")
+        except Exception:
+            return "time unknown"
+
+
 try:
     tickers = canonical_tickers(list(st.session_state.portfolio.keys()))
 except ValueError as e:
@@ -472,8 +528,13 @@ with st.spinner("Loading market data…"):
         )
         st.stop()
 
+# Current valuation prices: Alpaca latest trade for supported US equities,
+# Yahoo fallback otherwise. Historical `prices` series are untouched.
+valuation_prices, price_view, alpaca_status = resolve_valuation_prices(
+    tickers, current_prices)
+
 try:
-    core = build_core_analytics(tickers, prices, current_prices, rf_rate)
+    core = build_core_analytics(tickers, prices, valuation_prices, rf_rate)
 except ValueError as e:
     st.error(f"Data error: {e}")
     st.stop()
@@ -527,7 +588,9 @@ with tab_overview:
         with st.spinner("Fetching data…"):
             try:
                 prices, current_prices, rf_rate = load_market_data(tickers, hist_period)
-                core = build_core_analytics(tickers, prices, current_prices, rf_rate)
+                valuation_prices, price_view, alpaca_status = resolve_valuation_prices(
+                    tickers, current_prices)
+                core = build_core_analytics(tickers, prices, valuation_prices, rf_rate)
             except ValueError as e:
                 st.error(f"Data error: {e}")
                 st.stop()
@@ -559,8 +622,16 @@ with tab_overview:
 
     st.markdown("---")
 
-    # Positions table
-    st.markdown("### Positions")
+    # Positions table (valuation uses the resolved live/Yahoo price view)
+    pos_head, pos_refresh = st.columns([4, 1])
+    with pos_head:
+        st.markdown("### Positions")
+    with pos_refresh:
+        if st.button("↻ Refresh live prices", key="refresh_live",
+                     help="Clear the 10-second live-price cache and fetch fresh "
+                          "Alpaca trades."):
+            load_alpaca_trades.clear()
+            st.rerun()
     rows = []
     for t in tickers:
         price = current_prices.get(t, 0.0)
@@ -573,6 +644,8 @@ with tab_overview:
             "Shares": sh,
             "Avg Cost": cost,
             "Current Price": price,
+            "Price Source": price_view.get(t).source
+            if price_view.get(t) else "Yahoo",
             "Market Value ($)": val,
             "P&L ($)": pnl,
             "P&L (%)": pnl / (sh * cost) * 100 if cost > 0 else 0.0,
@@ -591,6 +664,15 @@ with tab_overview:
                   subset=["P&L ($)", "P&L (%)"]),
         use_container_width=True,
     )
+    if alpaca_status is None:
+        st.caption("Live US equity prices: Alpaca IEX. Historical portfolio "
+                   "analytics: Yahoo Finance. TradingView: charting only.")
+    elif alpaca_status == "disabled":
+        st.caption("Alpaca credentials not configured — current prices use "
+                   "Yahoo Finance. Historical analytics: Yahoo Finance.")
+    else:
+        st.warning(f"Live prices unavailable ({alpaca_status}) — current "
+                   "prices use Yahoo Finance. Historical analytics unaffected.")
 
     st.markdown("---")
 
@@ -1568,7 +1650,21 @@ with tab_security:
     sel_idx = tickers.index(sel)
 
     # ---- Top security summary (position facts, not performance) ----
-    sel_price = float(current_prices[sel])
+    # Same resolved price as the Positions table (Alpaca live or Yahoo).
+    sel_quote = price_view.get(sel)
+    sel_price = float(sel_quote.price) if sel_quote else float(current_prices[sel])
+    sel_price_label = "Current Price"
+    sel_price_note = None
+    if sel_quote is not None and sel_quote.source.startswith("Alpaca"):
+        if sel_quote.live:
+            sel_price_label = "Live Price"
+            sel_price_note = (f"Source: {sel_quote.source} · last trade "
+                              f"{format_trade_time(sel_quote.timestamp)}.")
+        else:
+            sel_price_label = "Latest Trade"
+            sel_price_note = (f"Source: {sel_quote.source} · last trade "
+                              f"{format_trade_time(sel_quote.timestamp)} "
+                              f"(not live).")
     sel_shares = float(st.session_state.portfolio[sel]["shares"])
     sel_value = sel_price * sel_shares
     sel_weight = float(weights[sel_idx])
@@ -1576,11 +1672,14 @@ with tab_security:
 
     st.markdown(f"### {sel}")
     h1, h2, h3, h4 = st.columns(4)
-    h1.metric("Current Price", fmt_usd(sel_price))
+    h1.metric(sel_price_label, fmt_usd(sel_price),
+              help="Same price source as the Positions table.")
     h2.metric("Position Value", fmt_usd(sel_value))
     h3.metric("Portfolio Weight", fmt_pct(sel_weight),
               help="Share of total portfolio market value.")
     h4.metric("Shares", f"{sel_shares:g}")
+    if sel_price_note:
+        st.caption(sel_price_note)
     # Unrealised P&L only — cost basis is captured per position. Omit it
     # entirely when no valid cost basis exists rather than inventing one.
     if sel_cost is not None and np.isfinite(sel_cost) and sel_cost > 0:
@@ -1661,7 +1760,15 @@ with tab_security:
     st.markdown("---")
 
     # ---- TradingView advanced chart (visual analysis only) ----
+    # Full-width terminal chart: metrics above, performance below.
     st.markdown("### Interactive Chart")
+    size_col, _ = st.columns([1, 3])
+    with size_col:
+        chart_size = st.selectbox(
+            "Chart Size", ["Standard", "Large"], index=1, key="tv_chart_size",
+            help="Standard ≈ 700px tall, Large ≈ 950px tall.",
+        )
+    tv_height = 950 if chart_size == "Large" else 700
     hints = {}
     for t in tickers:
         try:
@@ -1698,7 +1805,7 @@ with tab_security:
         if not resolved.resolved:
             st.caption(f"ℹ️ {resolved.note}")
         try:
-            render_tradingview_chart(resolved.symbol, watchlist, height=680)
+            render_tradingview_chart(resolved.symbol, watchlist, height=tv_height)
         except Exception:
             st.warning(
                 "The TradingView widget could not display this symbol. "

@@ -79,3 +79,40 @@ from analytics.scenario import simulate_portfolio_paths, run_predefined_scenario
 | Bull Market | +40% | 0.85x |
 | High Volatility | 0% | 2.0x |
 | Custom | User-defined | User-defined |
+
+## Alpaca live prices (optional)
+
+Current US equity prices can come from the Alpaca Market Data API
+(latest trade, IEX feed). Historical analytics always stay on Yahoo
+Finance; TradingView remains charting-only.
+
+PowerShell (applies to that session only, unless persisted):
+
+```powershell
+$env:APCA_API_KEY_ID="..."
+$env:APCA_API_SECRET_KEY="..."
+
+python -m streamlit run app.py
+```
+
+To persist for future sessions instead, set them as user environment
+variables (e.g. via System Properties → Environment Variables).
+
+macOS/Linux:
+
+```bash
+export APCA_API_KEY_ID="..."
+export APCA_API_SECRET_KEY="..."
+```
+
+Alternatively, Streamlit secrets are supported as a fallback
+(`.streamlit/secrets.toml`, never committed):
+
+```toml
+APCA_API_KEY_ID = "..."
+APCA_API_SECRET_KEY = "..."
+```
+
+Without credentials the app runs normally on Yahoo Finance prices and
+labels them as such. Non-US symbols (e.g. `BARC.L`, `^FTSE`) always use
+Yahoo Finance.
