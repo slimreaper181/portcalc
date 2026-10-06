@@ -14,6 +14,11 @@ Run locally:
 
 The app is designed to be modular so the analytics modules can be imported
 and used independently of Streamlit (e.g. in a desktop GUI or CLI).
+
+Numerical conventions:
+  * Market-data returns are daily LOG returns (see analytics.returns).
+  * Weight vectors, mu vectors and covariance matrices always share the
+    canonical (sorted) ticker order defined in analytics.validation.
 """
 
 import os
@@ -35,6 +40,7 @@ from analytics.returns import (
     annualised_mean_returns,
     annualised_cov_matrix,
     correlation_matrix,
+    cumulative_growth_from_log_returns,
 )
 from analytics.portfolio import (
     portfolio_expected_return,
@@ -56,6 +62,8 @@ from analytics.optimisation import (
     target_return,
     target_volatility,
     efficient_frontier,
+    feasible_return_range,
+    feasible_volatility_range,
     rebalance_trades,
 )
 from analytics.scenario import (
@@ -67,6 +75,19 @@ from analytics.scenario import (
     plot_final_distribution,
     plot_confidence_bands,
     SCENARIO_DEFINITIONS,
+)
+from analytics.validation import (
+    align_market_data,
+    aligned_portfolio_returns,
+    canonical_tickers,
+    sanitize_prices,
+    validate_horizon_years,
+    validate_monthly_contrib,
+    validate_risk_free_rate,
+    validate_shares,
+    validate_simulation_count,
+    validate_ticker_symbol,
+    validate_weight_bounds,
 )
 
 # ---------------------------------------------------------------------------
@@ -151,7 +172,17 @@ def load_portfolio() -> dict:
     if os.path.exists(PORTFOLIO_FILE):
         try:
             with open(PORTFOLIO_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+            # Normalise keys on load (upper-case, stripped).
+            cleaned = {}
+            for k, v in data.items():
+                try:
+                    sym = validate_ticker_symbol(k)
+                except ValueError:
+                    continue
+                cleaned[sym] = v
+            if cleaned:
+                return cleaned
         except (json.JSONDecodeError, IOError):
             pass
     return DEFAULT_PORTFOLIO.copy()
@@ -198,6 +229,110 @@ def fmt_pct(value: float) -> str:
     return f"{value:.2%}"
 
 
+def build_core_analytics(
+    tickers: list[str],
+    prices: pd.DataFrame,
+    current_prices: dict,
+    rf_rate: float,
+) -> dict:
+    """Sanitise market data, align to canonical ticker order, compute core stats.
+
+    Raises:
+        ValueError: with a user-facing message if data is unusable.
+    """
+    tickers = canonical_tickers(tickers)
+    clean_prices = sanitize_prices(prices, tickers)
+    if len(clean_prices) < 30:
+        st.warning(
+            f"Only {len(clean_prices)} trading days of overlapping history — "
+            "statistics and VaR estimates will be noisy. "
+            "Consider a longer history period or fewer tickers."
+        )
+
+    # Current prices must be present and positive for every ticker.
+    bad = [t for t in tickers
+           if not np.isfinite(float(current_prices.get(t, np.nan)))
+           or float(current_prices.get(t, 0.0)) <= 0]
+    if bad:
+        raise ValueError(
+            f"No usable current price for: {', '.join(bad)}. "
+            "Check the ticker symbols."
+        )
+
+    shares_dict = {t: st.session_state.portfolio[t]["shares"] for t in tickers}
+    for t, sh in shares_dict.items():
+        if not np.isfinite(sh) or sh <= 0:
+            raise ValueError(
+                f"Position {t} has invalid shares ({sh!r}); "
+                "shares must be positive."
+            )
+    weights, w_tickers = weights_from_shares(shares_dict, current_prices)
+    if list(w_tickers) != list(tickers) or len(weights) != len(tickers):
+        raise ValueError("Internal error: weight/ticker ordering mismatch.")
+
+    portfolio_value = float(sum(
+        st.session_state.portfolio[t]["shares"] * float(current_prices[t])
+        for t in tickers
+    ))
+    if not np.isfinite(portfolio_value) or portfolio_value <= 0:
+        raise ValueError(
+            "Portfolio value is zero — check share counts and prices."
+        )
+
+    try:
+        rf_rate = validate_risk_free_rate(rf_rate)
+    except ValueError:
+        rf_rate = 0.05
+
+    rets = daily_returns(clean_prices)
+    rets = rets.dropna(how="any")
+    if rets.empty or len(rets) < 2:
+        raise ValueError("Not enough return observations to compute statistics.")
+    aligned = align_market_data(tickers, returns=rets)
+    rets = aligned["returns"]
+
+    mu = annualised_mean_returns(rets)
+    cov = annualised_cov_matrix(rets)
+    corr = correlation_matrix(rets)
+    # Defensive reindex: mu/cov/corr rows/cols follow the canonical order.
+    mu = align_market_data(tickers, mu=mu)["mu"]
+    cov = align_market_data(tickers, cov=cov)["cov"]
+    corr = corr.reindex(index=tickers, columns=tickers)
+
+    if not np.all(np.isfinite(mu.values)):
+        raise ValueError("Expected returns contain non-finite values.")
+    if not np.all(np.isfinite(cov.values)):
+        raise ValueError("Covariance matrix contains non-finite values.")
+
+    port_return = portfolio_expected_return(weights, mu.values)
+    port_vol = portfolio_std(weights, cov.values)
+    port_sharpe = sharpe_ratio(port_return, port_vol, rf_rate)
+    port_daily_returns = aligned_portfolio_returns(rets, weights, tickers)
+    rc = risk_contributions(weights, cov.values)
+
+    for name, val in (("expected return", port_return), ("volatility", port_vol)):
+        if not np.isfinite(val):
+            raise ValueError(f"Portfolio {name} is not finite — check market data.")
+
+    return {
+        "tickers": tickers,
+        "prices": clean_prices,
+        "current_prices": {t: float(current_prices[t]) for t in tickers},
+        "rf_rate": rf_rate,
+        "weights": weights,
+        "portfolio_value": portfolio_value,
+        "rets": rets,
+        "mu": mu,
+        "cov": cov,
+        "corr": corr,
+        "port_return": port_return,
+        "port_vol": port_vol,
+        "port_sharpe": port_sharpe,
+        "port_daily_returns": port_daily_returns,
+        "rc": rc,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Sidebar — Portfolio Editor
 # ---------------------------------------------------------------------------
@@ -213,14 +348,21 @@ with st.sidebar:
         new_cost   = st.number_input("Avg Cost ($)", min_value=0.0, step=1.0, value=100.0)
 
         if st.button("Add Position"):
-            if new_ticker:
-                st.session_state.portfolio[new_ticker] = {
-                    "shares": new_shares,
-                    "avg_cost": new_cost,
+            try:
+                sym = validate_ticker_symbol(new_ticker)
+                sh = validate_shares(float(new_shares))
+                if not np.isfinite(new_cost) or new_cost < 0:
+                    raise ValueError(f"Avg cost must be >= 0, got {new_cost!r}.")
+            except ValueError as e:
+                st.error(str(e))
+            else:
+                st.session_state.portfolio[sym] = {
+                    "shares": sh,
+                    "avg_cost": float(new_cost),
                 }
                 save_portfolio(st.session_state.portfolio)
                 st.session_state.data_loaded = False
-                st.success(f"Added {new_ticker}")
+                st.success(f"Added {sym}")
                 st.rerun()
 
     # --- Current positions ---
@@ -257,36 +399,54 @@ def load_market_data(tickers: list[str], period: str):
     return prices, current, rf
 
 
-tickers = sorted(st.session_state.portfolio.keys())
+try:
+    tickers = canonical_tickers(list(st.session_state.portfolio.keys()))
+except ValueError as e:
+    st.warning(f"Portfolio problem: {e} Add at least one valid position in the sidebar.")
+    st.stop()
 
 if not tickers:
     st.warning("Add at least one position in the sidebar to get started.")
     st.stop()
 
+# De-duplicated tickers are canonicalised; warn if the raw keys differed.
+if len(tickers) != len(st.session_state.portfolio):
+    st.info("Duplicate tickers were merged (symbols are case-insensitive).")
+
 with st.spinner("Loading market data…"):
     # Default history period — can be overridden per-tab
-    prices, current_prices, rf_rate = load_market_data(tickers, "2y")
+    try:
+        prices, current_prices, rf_rate = load_market_data(tickers, "2y")
+    except ValueError as e:
+        st.error(f"Market data error: {e}")
+        st.stop()
+    except Exception:
+        st.error(
+            "Could not load market data (network or API error). "
+            "Check your connection and click Refresh Market Data to retry."
+        )
+        st.stop()
 
-# Compute core analytics
-shares_dict = {t: st.session_state.portfolio[t]["shares"] for t in tickers}
-weights, _ = weights_from_shares(shares_dict, current_prices)
+try:
+    core = build_core_analytics(tickers, prices, current_prices, rf_rate)
+except ValueError as e:
+    st.error(f"Data error: {e}")
+    st.stop()
 
-portfolio_value = sum(
-    st.session_state.portfolio[t]["shares"] * current_prices.get(t, 0.0)
-    for t in tickers
-)
-
-rets   = daily_returns(prices)
-mu     = annualised_mean_returns(rets)
-cov    = annualised_cov_matrix(rets)
-corr   = correlation_matrix(rets)
-
-port_return  = portfolio_expected_return(weights, mu.values)
-port_vol     = portfolio_std(weights, cov.values)
-port_sharpe  = sharpe_ratio(port_return, port_vol, rf_rate)
-port_daily_returns = (rets * weights).sum(axis=1)
-
-rc = risk_contributions(weights, cov.values)
+prices = core["prices"]
+current_prices = core["current_prices"]
+rf_rate = core["rf_rate"]
+weights = core["weights"]
+portfolio_value = core["portfolio_value"]
+rets = core["rets"]
+mu = core["mu"]
+cov = core["cov"]
+corr = core["corr"]
+port_return = core["port_return"]
+port_vol = core["port_vol"]
+port_sharpe = core["port_sharpe"]
+port_daily_returns = core["port_daily_returns"]
+rc = core["rc"]
 
 # ---------------------------------------------------------------------------
 # Main tabs
@@ -318,16 +478,29 @@ with tab_overview:
 
     if hist_period != "2y":
         with st.spinner("Fetching data…"):
-            prices, current_prices, rf_rate = load_market_data(tickers, hist_period)
-            rets = daily_returns(prices)
-            mu   = annualised_mean_returns(rets)
-            cov  = annualised_cov_matrix(rets)
-            corr = correlation_matrix(rets)
-            port_return = portfolio_expected_return(weights, mu.values)
-            port_vol    = portfolio_std(weights, cov.values)
-            port_sharpe = sharpe_ratio(port_return, port_vol, rf_rate)
-            rc = risk_contributions(weights, cov.values)
-            port_daily_returns = (rets * weights).sum(axis=1)
+            try:
+                prices, current_prices, rf_rate = load_market_data(tickers, hist_period)
+                core = build_core_analytics(tickers, prices, current_prices, rf_rate)
+            except ValueError as e:
+                st.error(f"Data error: {e}")
+                st.stop()
+            except Exception:
+                st.error("Could not load market data for the selected period.")
+                st.stop()
+            prices = core["prices"]
+            current_prices = core["current_prices"]
+            rf_rate = core["rf_rate"]
+            weights = core["weights"]
+            portfolio_value = core["portfolio_value"]
+            rets = core["rets"]
+            mu = core["mu"]
+            cov = core["cov"]
+            corr = core["corr"]
+            port_return = core["port_return"]
+            port_vol = core["port_vol"]
+            port_sharpe = core["port_sharpe"]
+            rc = core["rc"]
+            port_daily_returns = core["port_daily_returns"]
 
     # Top metrics
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -416,11 +589,11 @@ with tab_overview:
         st.markdown("### Correlation Matrix")
         st.dataframe(style_matrix(corr, ".4f"), use_container_width=True)
 
-    # Cumulative returns chart
+    # Cumulative returns chart (log returns -> exp(cumsum), NOT (1+r).cumprod())
     st.markdown("---")
     st.markdown("### Cumulative Returns")
 
-    cum_ret = (1 + rets).cumprod()
+    cum_ret = cumulative_growth_from_log_returns(rets)
     fig_cum = go.Figure()
     for col in tickers:
         fig_cum.add_trace(go.Scatter(
@@ -429,7 +602,7 @@ with tab_overview:
         ))
     fig_cum.update_layout(
         **CHART_THEME,
-        title="Cumulative Return (base = 1)",
+        title="Cumulative Return (base = 1, from log returns)",
         xaxis_title="Date", yaxis_title="Growth of $1",
     )
     st.plotly_chart(fig_cum, use_container_width=True)
@@ -451,37 +624,58 @@ with tab_risk:
 
     st.markdown("---")
 
-    # Daily parameters
+    # Daily parameters (log-return space)
     port_std_daily  = to_daily(port_vol)
     mu_daily        = mean_to_daily(mu.values)
     cov_daily       = cov.values / 252
 
-    var_param = parametric_var(port_std_daily, portfolio_value, 0.95, var_horizon)
-    var_hist  = historical_var(port_daily_returns, portfolio_value, 0.95, var_horizon)
-    var_mc, mc_sim_rets = monte_carlo_var(
-        weights, mu_daily, cov_daily, portfolio_value, 0.95, var_horizon, 10_000
-    )
+    try:
+        var_param = parametric_var(port_std_daily, portfolio_value, 0.95, int(var_horizon))
+    except ValueError as e:
+        var_param = None
+        st.error(f"Parametric VaR error: {e}")
+    try:
+        var_hist = historical_var(
+            port_daily_returns, portfolio_value, 0.95, int(var_horizon)
+        )
+    except ValueError as e:
+        var_hist = None
+        hist_err = str(e)
+    try:
+        var_mc, mc_sim_rets = monte_carlo_var(
+            weights, mu_daily, cov_daily, portfolio_value, 0.95, int(var_horizon), 10_000
+        )
+    except ValueError as e:
+        var_mc, mc_sim_rets = None, None
+        st.error(f"Monte Carlo VaR error: {e}")
 
     v1, v2, v3 = st.columns(3)
     with v1:
         st.markdown("#### Parametric VaR")
-        st.metric("95% VaR", fmt_usd(var_param))
+        st.metric("95% VaR", fmt_usd(var_param) if var_param is not None else "n/a")
         st.caption(
             "Assumes normally distributed returns. "
-            f"At 95% confidence over {var_horizon}d, potential loss ≤ {fmt_usd(var_param)}."
+            f"At 95% confidence over {int(var_horizon)}d, potential loss ≤ "
+            f"{fmt_usd(var_param) if var_param is not None else 'n/a'}."
         )
     with v2:
         st.markdown("#### Historical VaR")
-        st.metric("95% VaR", fmt_usd(var_hist))
-        st.caption(
-            "Uses the actual empirical return distribution from historical data. "
-            "No normality assumption."
-        )
+        st.metric("95% VaR", fmt_usd(var_hist) if var_hist is not None else "n/a")
+        if var_hist is None:
+            st.caption(f"Historical VaR unavailable: {hist_err}")
+        else:
+            n_win = len(port_daily_returns) - int(var_horizon) + 1
+            st.caption(
+                "Uses genuine rolling "
+                f"{int(var_horizon)}-day historical returns ({n_win:,} overlapping "
+                "windows). No normality or √T-scaling assumption."
+            )
     with v3:
         st.markdown("#### Monte Carlo VaR")
-        st.metric("95% VaR", fmt_usd(var_mc))
+        st.metric("95% VaR", fmt_usd(var_mc) if var_mc is not None else "n/a")
         st.caption(
             "10,000 simulated return paths using multivariate normal. "
+            "Log returns are converted to simple P&L via exp(r)−1. "
             "Captures correlation structure."
         )
 
@@ -500,7 +694,7 @@ with tab_risk:
     var_pct_5 = np.percentile(port_daily_returns, 5)
     fig_dist.add_vline(x=var_pct_5, line=dict(color="#f85149", dash="dash", width=2))
     fig_dist.add_annotation(
-        x=var_pct_5, y=0, text="5th pct",
+        x=var_pct_5, text="5th pct",
         showarrow=True, arrowcolor="#f85149",
         font=dict(color="#f85149"), yref="paper", y=0.9,
     )
@@ -512,26 +706,27 @@ with tab_risk:
     st.plotly_chart(fig_dist, use_container_width=True)
 
     # MC simulation return histogram
-    st.markdown("### Monte Carlo Simulated Returns")
-    fig_mc = go.Figure(go.Histogram(
-        x=mc_sim_rets,
-        nbinsx=60,
-        marker_color="rgba(240, 136, 62, 0.6)",
-        marker_line=dict(color="rgba(240,136,62,0.9)", width=0.5),
-    ))
-    var_mc_pct = np.percentile(mc_sim_rets, 5)
-    fig_mc.add_vline(x=var_mc_pct, line=dict(color="#f85149", dash="dash", width=2))
-    fig_mc.add_annotation(
-        x=var_mc_pct, y=0, text="VaR 5th pct",
-        showarrow=True, arrowcolor="#f85149",
-        font=dict(color="#f85149"), yref="paper", y=0.9,
-    )
-    fig_mc.update_layout(
-        **CHART_THEME,
-        title=f"MC Simulated {var_horizon}-Day Portfolio Returns",
-        xaxis_title="Portfolio Return", yaxis_title="Count",
-    )
-    st.plotly_chart(fig_mc, use_container_width=True)
+    if mc_sim_rets is not None:
+        st.markdown("### Monte Carlo Simulated Returns")
+        fig_mc = go.Figure(go.Histogram(
+            x=mc_sim_rets,
+            nbinsx=60,
+            marker_color="rgba(240, 136, 62, 0.6)",
+            marker_line=dict(color="rgba(240,136,62,0.9)", width=0.5),
+        ))
+        var_mc_pct = np.percentile(mc_sim_rets, 5)
+        fig_mc.add_vline(x=var_mc_pct, line=dict(color="#f85149", dash="dash", width=2))
+        fig_mc.add_annotation(
+            x=var_mc_pct, text="VaR 5th pct",
+            showarrow=True, arrowcolor="#f85149",
+            font=dict(color="#f85149"), yref="paper", y=0.9,
+        )
+        fig_mc.update_layout(
+            **CHART_THEME,
+            title=f"MC Simulated {int(var_horizon)}-Day Portfolio Returns (simple returns)",
+            xaxis_title="Portfolio Return", yaxis_title="Count",
+        )
+        st.plotly_chart(fig_mc, use_container_width=True)
 
 
 # ============================================================
@@ -551,145 +746,213 @@ with tab_optimise:
     with oc2:
         max_w = st.slider("Max weight per asset", 0.20, 1.0, 1.0, 0.01, format="%.2f")
 
-    st.markdown("---")
-
-    # Run optimisations
-    res_mv = min_variance(mu_arr, cov_arr, rf_rate, min_w, max_w)
-    res_ms = max_sharpe(mu_arr, cov_arr, rf_rate, min_w, max_w)
-
-    # Target return slider
-    display_return = port_return
-    r_min_bound = float(np.clip(mu_arr.min(), -0.30, 0.50))
-    r_max_bound = float(np.clip(mu_arr.max(), r_min_bound + 0.01, 1.0))
-
-    if "target_r_val" not in st.session_state:
-        st.session_state.target_r_val = float(np.clip(display_return, r_min_bound, r_max_bound))
-    target_r_val = st.slider(
-        "Target annual return",
-        r_min_bound, r_max_bound,
-        st.session_state.target_r_val,
-        0.005,
-        format="%.1f%%",
-        key="target_r_val",
-    )
-    res_tr = target_return(mu_arr, cov_arr, target_r_val, rf_rate, min_w, max_w)
-
-    # Target volatility slider
-    v_min_bound = float(np.clip(res_mv.volatility, 0.01, 0.99))
-    v_max_bound = float(np.clip(mu_arr.std() * 5, v_min_bound + 0.01, 1.0))
-    if "target_v_val" not in st.session_state:
-        st.session_state.target_v_val = float(np.clip(port_vol, v_min_bound, v_max_bound))
-    target_v_val = st.slider(
-        "Target annual volatility",
-        v_min_bound, v_max_bound,
-        st.session_state.target_v_val,
-        0.005,
-        format="%.1f%%",
-        key="target_v_val",
-    )
-    res_tv = target_volatility(mu_arr, cov_arr, target_v_val, rf_rate, min_w, max_w)
-
-    st.markdown("---")
-    st.markdown("### Optimisation Results")
-
-    def _result_card(label: str, res, tickers: list[str]) -> None:
-        status = "✅" if res.success else "⚠️"
-        cols = st.columns(4)
-        cols[0].metric(f"{status} {label} — Return", fmt_pct(res.expected_return))
-        cols[1].metric("Volatility", fmt_pct(res.volatility))
-        cols[2].metric("Sharpe", f"{res.sharpe:.2f}")
-        w_df = pd.DataFrame({"Ticker": tickers, "Weight": res.weights}).set_index("Ticker")
-        cols[3].dataframe(w_df.style.format({"Weight": "{:.1%}"}), height=160)
-
-    _result_card("Min Variance", res_mv, tickers)
-    st.markdown("---")
-    _result_card("Max Sharpe", res_ms, tickers)
-    st.markdown("---")
-    _result_card(f"Target Return {target_r_val:.1%}", res_tr, tickers)
-    st.markdown("---")
-    _result_card(f"Target Vol {target_v_val:.1%}", res_tv, tickers)
+    try:
+        validate_weight_bounds(len(tickers), float(min_w), float(max_w))
+        bounds_ok = True
+    except ValueError as e:
+        bounds_ok = False
+        st.error(f"Invalid weight bounds: {e}")
 
     st.markdown("---")
 
-    # Efficient frontier
-    st.markdown("### Efficient Frontier")
-    with st.spinner("Tracing efficient frontier…"):
-        ef_df = efficient_frontier(mu_arr, cov_arr, rf_rate, 60, min_w, max_w)
-
-    if not ef_df.empty:
-        fig_ef = go.Figure()
-        fig_ef.add_trace(go.Scatter(
-            x=ef_df["volatility"], y=ef_df["return"],
-            mode="lines",
-            name="Efficient Frontier",
-            line=dict(color="#58a6ff", width=2),
-        ))
-        # Mark current portfolio
-        fig_ef.add_trace(go.Scatter(
-            x=[port_vol], y=[port_return],
-            mode="markers", name="Current",
-            marker=dict(color="#f85149", size=12, symbol="star"),
-        ))
-        # Mark max Sharpe
-        fig_ef.add_trace(go.Scatter(
-            x=[res_ms.volatility], y=[res_ms.expected_return],
-            mode="markers", name="Max Sharpe",
-            marker=dict(color="#3fb950", size=12, symbol="diamond"),
-        ))
-        # CML
-        cml_vol = np.linspace(0, ef_df["volatility"].max() * 1.2, 50)
-        cml_ret = rf_rate + (res_ms.expected_return - rf_rate) / res_ms.volatility * cml_vol
-        fig_ef.add_trace(go.Scatter(
-            x=cml_vol, y=cml_ret,
-            mode="lines", name="Capital Market Line",
-            line=dict(color="#f0883e", width=1.5, dash="dash"),
-        ))
-        fig_ef.update_layout(
-            **CHART_THEME,
-            title="Efficient Frontier with CML",
-            xaxis_title="Volatility (σ)", yaxis_title="Expected Return",
-            xaxis_tickformat=".0%", yaxis_tickformat=".0%",
-        )
-        st.plotly_chart(fig_ef, use_container_width=True)
-
-    # Rebalancing trades
-    st.markdown("---")
-    st.markdown("### Rebalancing Trades")
-
-    target_choice = st.selectbox(
-        "Rebalance to",
-        ["Max Sharpe", "Min Variance", "Target Return", "Target Volatility"],
-        key="rebalance_target",
-    )
-    target_map = {
-        "Max Sharpe": res_ms,
-        "Min Variance": res_mv,
-        "Target Return": res_tr,
-        "Target Volatility": res_tv,
-    }
-    chosen = target_map[target_choice]
-
-    if chosen.success:
-        trades_df = rebalance_trades(weights, chosen.weights, tickers, portfolio_value)
-
-        def _colour_action(val):
-            if val == "BUY":
-                return "color: #3fb950; font-weight: bold"
-            if val == "SELL":
-                return "color: #f85149; font-weight: bold"
-            return "color: #8b949e"
-
-        st.dataframe(
-            trades_df.style
-            .format({
-                "Current Weight": "{:.1%}", "Target Weight": "{:.1%}",
-                "Δ Weight": "{:+.1%}", "Trade ($)": "${:+,.2f}",
-            })
-            .applymap(_colour_action, subset=["Action"]),
-            use_container_width=True,
-        )
+    if not bounds_ok:
+        st.warning("Fix the weight bounds above to run optimisations.")
     else:
-        st.warning("Optimisation did not converge for selected target.")
+        # Run optimisations
+        res_mv = min_variance(mu_arr, cov_arr, rf_rate, min_w, max_w)
+        res_ms = max_sharpe(mu_arr, cov_arr, rf_rate, min_w, max_w)
+        for _res, _name in ((res_mv, "Min Variance"), (res_ms, "Max Sharpe")):
+            if not _res.success:
+                st.warning(f"{_name} optimisation issue: {_res.message}")
+
+        # Target return slider — bounded by the feasible return range.
+        try:
+            r_lo, r_hi = feasible_return_range(mu_arr, min_w, max_w)
+        except ValueError as e:
+            st.error(f"Cannot determine feasible returns: {e}")
+            r_lo, r_hi = None, None
+
+        if r_lo is None:
+            res_tr = None
+            target_r_val = None
+        else:
+            r_min_bound = float(np.clip(r_lo, -0.30, 0.50))
+            r_max_bound = float(np.clip(r_hi, r_lo + 0.01, 1.0))
+            if "target_r_val" not in st.session_state:
+                st.session_state.target_r_val = float(
+                    np.clip(port_return, r_min_bound, r_max_bound))
+            # Clamp a stale session value into the current bounds.
+            st.session_state.target_r_val = float(
+                np.clip(st.session_state.target_r_val, r_min_bound, r_max_bound))
+            target_r_val = st.slider(
+                "Target annual return",
+                r_min_bound, r_max_bound,
+                st.session_state.target_r_val,
+                0.005,
+                format="%.1f%%",
+                key="target_r_val",
+            )
+            res_tr = target_return(mu_arr, cov_arr, target_r_val, rf_rate, min_w, max_w)
+            if not res_tr.success:
+                st.warning(f"Target-return optimisation issue: {res_tr.message}")
+
+        # Target volatility slider — bounded by feasible portfolio volatility
+        # (from the covariance structure), NOT by return dispersion.
+        try:
+            v_lo, v_hi = feasible_volatility_range(mu_arr, cov_arr, min_w, max_w)
+        except ValueError as e:
+            st.error(f"Cannot determine feasible volatility range: {e}")
+            v_lo, v_hi = None, None
+
+        if v_lo is None:
+            res_tv = None
+            target_v_val = None
+        else:
+            v_min_bound = float(max(v_lo, 0.005))
+            v_max_bound = float(max(v_hi, v_min_bound + 0.005))
+            if "target_v_val" not in st.session_state:
+                st.session_state.target_v_val = float(
+                    np.clip(port_vol, v_min_bound, v_max_bound))
+            st.session_state.target_v_val = float(
+                np.clip(st.session_state.target_v_val, v_min_bound, v_max_bound))
+            st.caption(
+                f"Feasible volatility under current bounds: "
+                f"{v_lo:.1%} – {v_hi:.1%}."
+            )
+            target_v_val = st.slider(
+                "Target annual volatility",
+                v_min_bound, v_max_bound,
+                st.session_state.target_v_val,
+                0.005,
+                format="%.1f%%",
+                key="target_v_val",
+            )
+            res_tv = target_volatility(mu_arr, cov_arr, target_v_val, rf_rate, min_w, max_w)
+            if not res_tv.success:
+                st.warning(f"Target-volatility optimisation issue: {res_tv.message}")
+
+        st.markdown("---")
+        st.markdown("### Optimisation Results")
+
+        def _result_card(label: str, res, tickers: list[str]) -> None:
+            if res is None:
+                st.warning(f"{label}: unavailable under current constraints.")
+                return
+            status = "✅" if res.success else "⚠️"
+            cols = st.columns(4)
+            cols[0].metric(f"{status} {label} — Return", fmt_pct(res.expected_return))
+            cols[1].metric("Volatility", fmt_pct(res.volatility))
+            cols[2].metric("Sharpe", f"{res.sharpe:.2f}")
+            w_df = pd.DataFrame({"Ticker": tickers, "Weight": res.weights}).set_index("Ticker")
+            cols[3].dataframe(w_df.style.format({"Weight": "{:.1%}"}), height=160)
+            if not res.success:
+                st.caption(f"{label} note: {res.message}")
+
+        _result_card("Min Variance", res_mv, tickers)
+        st.markdown("---")
+        _result_card("Max Sharpe", res_ms, tickers)
+        st.markdown("---")
+        _result_card(
+            f"Target Return {target_r_val:.1%}" if target_r_val is not None else "Target Return",
+            res_tr, tickers)
+        st.markdown("---")
+        _result_card(
+            f"Target Vol {target_v_val:.1%}" if target_v_val is not None else "Target Vol",
+            res_tv, tickers)
+
+        st.markdown("---")
+
+        # Efficient frontier
+        st.markdown("### Efficient Frontier")
+        with st.spinner("Tracing efficient frontier…"):
+            ef_df = efficient_frontier(mu_arr, cov_arr, rf_rate, 60, min_w, max_w)
+
+        if ef_df.empty:
+            st.warning(
+                "Efficient frontier could not be traced under the current "
+                "constraints (no target-return point converged)."
+            )
+        else:
+            fig_ef = go.Figure()
+            fig_ef.add_trace(go.Scatter(
+                x=ef_df["volatility"], y=ef_df["return"],
+                mode="lines",
+                name="Efficient Frontier",
+                line=dict(color="#58a6ff", width=2),
+            ))
+            # Mark current portfolio
+            fig_ef.add_trace(go.Scatter(
+                x=[port_vol], y=[port_return],
+                mode="markers", name="Current",
+                marker=dict(color="#f85149", size=12, symbol="star"),
+            ))
+            # Mark max Sharpe
+            if res_ms.success and np.isfinite(res_ms.volatility) and res_ms.volatility > 0:
+                fig_ef.add_trace(go.Scatter(
+                    x=[res_ms.volatility], y=[res_ms.expected_return],
+                    mode="markers", name="Max Sharpe",
+                    marker=dict(color="#3fb950", size=12, symbol="diamond"),
+                ))
+                # CML
+                cml_vol = np.linspace(0, ef_df["volatility"].max() * 1.2, 50)
+                cml_ret = rf_rate + (res_ms.expected_return - rf_rate) / res_ms.volatility * cml_vol
+                fig_ef.add_trace(go.Scatter(
+                    x=cml_vol, y=cml_ret,
+                    mode="lines", name="Capital Market Line",
+                    line=dict(color="#f0883e", width=1.5, dash="dash"),
+                ))
+            fig_ef.update_layout(
+                **CHART_THEME,
+                title="Efficient Frontier with CML",
+                xaxis_title="Volatility (σ)", yaxis_title="Expected Return",
+                xaxis_tickformat=".0%", yaxis_tickformat=".0%",
+            )
+            st.plotly_chart(fig_ef, use_container_width=True)
+
+        # Rebalancing trades
+        st.markdown("---")
+        st.markdown("### Rebalancing Trades")
+
+        target_choice = st.selectbox(
+            "Rebalance to",
+            ["Max Sharpe", "Min Variance", "Target Return", "Target Volatility"],
+            key="rebalance_target",
+        )
+        target_map = {
+            "Max Sharpe": res_ms,
+            "Min Variance": res_mv,
+            "Target Return": res_tr,
+            "Target Volatility": res_tv,
+        }
+        chosen = target_map[target_choice]
+
+        if chosen is not None and chosen.success and np.all(np.isfinite(chosen.weights)):
+            try:
+                trades_df = rebalance_trades(weights, chosen.weights, tickers, portfolio_value)
+            except ValueError as e:
+                st.warning(f"Could not compute rebalancing trades: {e}")
+            else:
+                def _colour_action(val):
+                    if val == "BUY":
+                        return "color: #3fb950; font-weight: bold"
+                    if val == "SELL":
+                        return "color: #f85149; font-weight: bold"
+                    return "color: #8b949e"
+
+                st.dataframe(
+                    trades_df.style
+                    .format({
+                        "Current Weight": "{:.1%}", "Target Weight": "{:.1%}",
+                        "Δ Weight": "{:+.1%}", "Trade ($)": "${:+,.2f}",
+                    })
+                    .applymap(_colour_action, subset=["Action"]),
+                    use_container_width=True,
+                )
+        else:
+            detail = ""
+            if chosen is not None and not chosen.success:
+                detail = f" ({chosen.message})"
+            st.warning(f"Optimisation did not converge for selected target.{detail}")
 
 
 # ============================================================
@@ -747,27 +1010,51 @@ with tab_scenario:
         if run_btn or st.session_state.get("sc_ran"):
             st.session_state.sc_ran = True
 
-            with st.spinner(f"Running {n_simulations:,} simulations…"):
-                mu_s, cov_s, sc_info = run_predefined_scenario(
-                    mu.values, cov.values,
-                    scenario=scenario_choice,
-                    return_shock=custom_shock,
-                    vol_multiplier=custom_vol,
-                )
+            # Validate simulation inputs before running.
+            try:
+                _years = validate_horizon_years(float(horizon_years))
+                _n_sims = validate_simulation_count(int(n_simulations))
+                _monthly = validate_monthly_contrib(float(monthly_contrib))
+                if not np.isfinite(initial_investment) or initial_investment <= 0:
+                    raise ValueError("Initial investment must be positive.")
+                if scenario_choice == "Custom" and custom_vol <= 0:
+                    raise ValueError("Volatility multiplier must be positive.")
+            except ValueError as e:
+                st.error(f"Invalid simulation settings: {e}")
+                st.stop()
 
-                paths = simulate_portfolio_paths(
-                    weights=weights,
-                    mu_annual=mu_s,
-                    cov_annual=cov_s,
-                    initial_value=initial_investment,
-                    years=horizon_years,
-                    n_sims=n_simulations,
-                    monthly_contrib=monthly_contrib,
-                )
+            with st.spinner(f"Running {_n_sims:,} simulations…"):
+                try:
+                    mu_s, cov_s, sc_info = run_predefined_scenario(
+                        mu.values, cov.values,
+                        scenario=scenario_choice,
+                        return_shock=custom_shock,
+                        vol_multiplier=custom_vol,
+                    )
 
-                metrics, pct_df = summarise_future_metrics(
-                    paths, initial_investment, horizon_years
-                )
+                    paths = simulate_portfolio_paths(
+                        weights=weights,
+                        mu_annual=mu_s,
+                        cov_annual=cov_s,
+                        initial_value=float(initial_investment),
+                        years=_years,
+                        n_sims=_n_sims,
+                        monthly_contrib=_monthly,
+                    )
+
+                    metrics, pct_df = summarise_future_metrics(
+                        paths, float(initial_investment), _years,
+                        monthly_contrib=_monthly,
+                    )
+                except ValueError as e:
+                    st.error(f"Simulation error: {e}")
+                    st.stop()
+                except Exception:
+                    st.error(
+                        "The simulation failed unexpectedly. Try fewer "
+                        "simulations or a shorter horizon."
+                    )
+                    st.stop()
 
             # Key metrics
             m1, m2, m3, m4 = st.columns(4)
@@ -775,24 +1062,39 @@ with tab_scenario:
             m2.metric("Median Outcome",           fmt_usd(metrics["median_value"]))
             m3.metric("Worst 5% Outcome",         fmt_usd(metrics["worst_5pct"]))
             m4.metric("Probability of Loss",      fmt_pct(metrics["prob_loss"]))
+            if metrics.get("contributions", 0) > 0:
+                st.caption(
+                    f"Total invested: {fmt_usd(metrics['total_contributed'])} "
+                    f"(${metrics['initial_capital']:,.0f} initial + "
+                    f"${metrics['contributions']:,.0f} contributions). "
+                    f"Expected P&L vs invested: "
+                    f"${metrics['expected_profit_loss']:+,.0f} "
+                    f"({metrics['return_on_invested']:+.1%})."
+                )
 
             st.markdown("---")
 
             # Explainability
-            explanation = explain_scenario_results(metrics, sc_info, initial_investment)
+            explanation = explain_scenario_results(
+                metrics, sc_info, float(initial_investment),
+                monthly_contrib=_monthly, years=_years,
+            )
             st.info(explanation)
 
             # Charts
             st.plotly_chart(
-                plot_simulation_paths(paths, pct_df, initial_investment, sc_info["label"]),
+                plot_simulation_paths(
+                    paths, pct_df, float(initial_investment), sc_info["label"],
+                    total_contributed=metrics["total_contributed"],
+                ),
                 use_container_width=True,
             )
             st.plotly_chart(
-                plot_confidence_bands(pct_df, initial_investment, sc_info["label"]),
+                plot_confidence_bands(pct_df, float(initial_investment), sc_info["label"]),
                 use_container_width=True,
             )
             st.plotly_chart(
-                plot_final_distribution(paths, metrics, initial_investment, sc_info["label"]),
+                plot_final_distribution(paths, metrics, float(initial_investment), sc_info["label"]),
                 use_container_width=True,
             )
 
@@ -815,27 +1117,52 @@ with tab_scenario:
     st.markdown("### Scenario Comparison")
 
     if st.button("Compare All Scenarios", key="sc_compare"):
+        try:
+            _years_c = validate_horizon_years(float(horizon_years))
+            _monthly_c = validate_monthly_contrib(float(monthly_contrib))
+            if not np.isfinite(initial_investment) or initial_investment <= 0:
+                raise ValueError("Initial investment must be positive.")
+        except ValueError as e:
+            st.error(f"Invalid comparison settings: {e}")
+            st.stop()
+
         comp_rows = []
         compare_sims = 2_000  # lighter weight for comparison
 
-        for sc_name in ["Normal", "Market Crash", "Bull Market", "High Volatility"]:
-            mu_c, cov_c, info_c = run_predefined_scenario(mu.values, cov.values, sc_name)
-            p = simulate_portfolio_paths(
-                weights, mu_c, cov_c, initial_investment,
-                years=horizon_years, n_sims=compare_sims,
-            )
-            m, _ = summarise_future_metrics(p, initial_investment, horizon_years)
-            comp_rows.append({
-                "Scenario": info_c["label"],
-                "Expected Value": m["expected_value"],
-                "Median": m["median_value"],
-                "Worst 5%": m["worst_5pct"],
-                "Best 5%": m["best_5pct"],
-                "P(Loss)": m["prob_loss"],
-                "Avg Max Drawdown": m["mean_max_drawdown"],
-            })
+        try:
+            for sc_name in ["Normal", "Market Crash", "Bull Market", "High Volatility"]:
+                mu_c, cov_c, info_c = run_predefined_scenario(mu.values, cov.values, sc_name)
+                p = simulate_portfolio_paths(
+                    weights, mu_c, cov_c, float(initial_investment),
+                    years=_years_c, n_sims=compare_sims,
+                    monthly_contrib=_monthly_c,
+                )
+                m, _ = summarise_future_metrics(
+                    p, float(initial_investment), _years_c,
+                    monthly_contrib=_monthly_c,
+                )
+                comp_rows.append({
+                    "Scenario": info_c["label"],
+                    "Expected Value": m["expected_value"],
+                    "Median": m["median_value"],
+                    "Worst 5%": m["worst_5pct"],
+                    "Best 5%": m["best_5pct"],
+                    "P(Loss)": m["prob_loss"],
+                    "Avg Max Drawdown": m["mean_max_drawdown"],
+                })
+        except ValueError as e:
+            st.error(f"Comparison failed: {e}")
+            st.stop()
+        except Exception:
+            st.error("Scenario comparison failed unexpectedly.")
+            st.stop()
 
         comp_df = pd.DataFrame(comp_rows).set_index("Scenario")
+        if _monthly_c > 0:
+            st.caption(
+                f"Comparison includes monthly contributions of ${float(_monthly_c):,.0f} "
+                f"(loss probabilities vs total invested capital)."
+            )
         st.dataframe(
             comp_df.style.format({
                 "Expected Value": "${:,.0f}",
