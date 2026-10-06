@@ -195,7 +195,21 @@ st.markdown("""
     font-weight: 600;
   }
   .stButton>button:hover { background-color: #2ea043; }
-  div[data-testid="stMetricValue"] { color: #58a6ff; font-family: 'IBM Plex Mono', monospace; }
+  div[data-testid="stMetricValue"] {
+    color: #58a6ff;
+    font-family: 'IBM Plex Mono', monospace;
+    /* Never ellipsise financial values: allow wrapping instead of clipping.
+       Layouts below keep large currency metrics to 2-3 cards per row so
+       wrapping is a last resort, not the norm. */
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+  }
+  div[data-testid="stMetricValue"] > div {
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -612,13 +626,16 @@ with tab_overview:
             rc = core["rc"]
             port_daily_returns = core["port_daily_returns"]
 
-    # Top metrics
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Portfolio Value", fmt_usd(portfolio_value))
-    c2.metric("Expected Return", fmt_pct(port_return))
-    c3.metric("Volatility (σ)", fmt_pct(port_vol))
-    c4.metric("Sharpe Ratio", f"{port_sharpe:.2f}")
-    c5.metric("Risk-Free Rate", fmt_pct(rf_rate))
+    # Headline portfolio value on its own row: full width, never truncated.
+    st.metric("Portfolio Value", fmt_usd(portfolio_value),
+              help="Total current market value across all positions.")
+
+    # Small metrics (percentages / ratios): up to 4-5 per row is fine.
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Expected Return", fmt_pct(port_return))
+    c2.metric("Volatility (σ)", fmt_pct(port_vol))
+    c3.metric("Sharpe Ratio", f"{port_sharpe:.2f}")
+    c4.metric("Risk-Free Rate", fmt_pct(rf_rate))
 
     st.markdown("---")
 
@@ -1222,12 +1239,14 @@ with tab_scenario:
                     )
                     st.stop()
 
-            # Key metrics
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Expected Final Value",     fmt_usd(metrics["expected_value"]))
-            m2.metric("Median Outcome",           fmt_usd(metrics["median_value"]))
-            m3.metric("Worst 5% Outcome",         fmt_usd(metrics["worst_5pct"]))
-            m4.metric("Probability of Loss",      fmt_pct(metrics["prob_loss"]))
+            # Key metrics: large currency values get 2 columns x 2 rows
+            # so full "$6,589.31"-style values always fit.
+            r1a, r1b = st.columns(2)
+            r1a.metric("Expected Final Value", fmt_usd(metrics["expected_value"]))
+            r1b.metric("Median Outcome",        fmt_usd(metrics["median_value"]))
+            r2a, r2b = st.columns(2)
+            r2a.metric("Worst 5% Outcome",     fmt_usd(metrics["worst_5pct"]))
+            r2b.metric("Probability of Loss",  fmt_pct(metrics["prob_loss"]))
             if metrics.get("contributions", 0) > 0:
                 st.caption(
                     f"Total invested: {fmt_usd(metrics['total_contributed'])} "
@@ -1603,14 +1622,17 @@ with tab_perf:
                 except ValueError as e:
                     st.warning(f"Best/worst periods unavailable: {e}")
                 else:
-                    b1, b2, b3, b4 = st.columns(4)
-                    b1.metric("Best Day",
-                              f"{bw['best_day'][1]:+.2%} — {bw['best_day'][0].date()}")
-                    b2.metric("Worst Day",
-                              f"{bw['worst_day'][1]:+.2%} — {bw['worst_day'][0].date()}")
-                    b3.metric("Best Month", f"{bw['best_month'][1]:+.2%} — {bw['best_month'][0]}")
-                    b4.metric("Worst Month",
-                              f"{bw['worst_month'][1]:+.2%} — {bw['worst_month'][0]}")
+                    # Day/month values carry a date suffix ("% — date"), so
+                    # use 2 columns x 2 rows instead of one tight row of 4.
+                    bw1, bw2 = st.columns(2)
+                    bw1.metric("Best Day",
+                               f"{bw['best_day'][1]:+.2%} — {bw['best_day'][0].date()}")
+                    bw2.metric("Worst Day",
+                               f"{bw['worst_day'][1]:+.2%} — {bw['worst_day'][0].date()}")
+                    bw3, bw4 = st.columns(2)
+                    bw3.metric("Best Month", f"{bw['best_month'][1]:+.2%} — {bw['best_month'][0]}")
+                    bw4.metric("Worst Month",
+                               f"{bw['worst_month'][1]:+.2%} — {bw['worst_month'][0]}")
                     st.caption(
                         "Monthly returns compound daily log returns "
                         "(exp of summed logs − 1), never simple averages."
@@ -1671,10 +1693,13 @@ with tab_security:
     sel_cost = st.session_state.portfolio[sel].get("avg_cost")
 
     st.markdown(f"### {sel}")
-    h1, h2, h3, h4 = st.columns(4)
+    # Position facts: price/value on one row, weight/shares on the next,
+    # so large currency values always have room.
+    h1, h2 = st.columns(2)
     h1.metric(sel_price_label, fmt_usd(sel_price),
               help="Same price source as the Positions table.")
     h2.metric("Position Value", fmt_usd(sel_value))
+    h3, h4 = st.columns(2)
     h3.metric("Portfolio Weight", fmt_pct(sel_weight),
               help="Share of total portfolio market value.")
     h4.metric("Shares", f"{sel_shares:g}")
