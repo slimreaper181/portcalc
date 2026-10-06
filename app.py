@@ -9,6 +9,7 @@ Tabs:
   3. 🎯 Optimise      — efficient frontier, max Sharpe, min variance, target constraints
   4. 📊 Scenario      — Monte Carlo forward simulation with stress scenarios
   5. 📉 Performance   — benchmark comparison, drawdowns, downside risk, rolling stats
+  6. 🔍 Security Detail — single-holding analytics + TradingView chart
 
 Run locally:
     streamlit run app.py
@@ -27,6 +28,7 @@ import json
 
 import numpy as np
 import pandas as pd
+from pandas.io.formats.style import Styler
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
@@ -35,6 +37,7 @@ from data.market_data import (
     fetch_price_history,
     fetch_benchmark_history,
     fetch_current_prices,
+    fetch_exchange_code,
     fetch_risk_free_rate,
 )
 from analytics.returns import (
@@ -94,6 +97,14 @@ from analytics.performance import (
     sharpe_from_log,
     summarise_performance,
     underwater_episodes,
+)
+from analytics.security import (
+    period_returns,
+    security_summary,
+)
+from components.tradingview import (
+    render_tradingview_chart,
+    resolve_tradingview_symbol,
 )
 from analytics.validation import (
     align_market_data,
@@ -231,7 +242,7 @@ if "data_loaded" not in st.session_state:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def style_matrix(df: pd.DataFrame, fmt: str = ".4f") -> pd.io.formats.style.Styler:
+def style_matrix(df: pd.DataFrame, fmt: str = ".4f") -> Styler:
     """Apply background gradient styling to a numeric DataFrame."""
     return (
         df.style
@@ -424,6 +435,15 @@ def load_benchmark_data(benchmark_ticker: str, period: str):
     return fetch_benchmark_history(benchmark_ticker, period=period)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_exchange_hint(ticker: str):
+    """Cached yfinance exchange code (TradingView resolution hint only)."""
+    try:
+        return fetch_exchange_code(ticker)
+    except Exception:
+        return None
+
+
 try:
     tickers = canonical_tickers(list(st.session_state.portfolio.keys()))
 except ValueError as e:
@@ -477,12 +497,13 @@ rc = core["rc"]
 # Main tabs
 # ---------------------------------------------------------------------------
 
-tab_overview, tab_risk, tab_optimise, tab_scenario, tab_perf = st.tabs([
+tab_overview, tab_risk, tab_optimise, tab_scenario, tab_perf, tab_security = st.tabs([
     "📈 Overview",
     "⚠️  Risk",
     "🎯 Optimise",
     "📊 Scenario Analysis",
     "📉 Performance",
+    "🔍 Security Detail",
 ])
 
 
@@ -565,7 +586,7 @@ with tab_overview:
             "Market Value ($)": "${:,.2f}", "P&L ($)": "${:+,.2f}",
             "P&L (%)": "{:+.2f}%", "Weight": "{:.1%}",
         })
-        .applymap(lambda v: "color: #3fb950" if isinstance(v, (int, float)) and v > 0
+        .map(lambda v: "color: #3fb950" if isinstance(v, (int, float)) and v > 0
                   else ("color: #f85149" if isinstance(v, (int, float)) and v < 0 else ""),
                   subset=["P&L ($)", "P&L (%)"]),
         use_container_width=True,
@@ -1008,7 +1029,7 @@ with tab_optimise:
                         "Current Weight": "{:.1%}", "Target Weight": "{:.1%}",
                         "Δ Weight": "{:+.1%}", "Trade ($)": "${:+,.2f}",
                     })
-                    .applymap(_colour_action, subset=["Action"]),
+                    .map(_colour_action, subset=["Action"]),
                     use_container_width=True,
                 )
         else:
@@ -1434,7 +1455,7 @@ with tab_perf:
                 if uw is not None and not uw.empty:
                     disp = uw.copy()
                     for col in ("Peak", "Trough"):
-                        disp[col] = pd.to_datetime(disp[col]).strftime("%Y-%m-%d")
+                        disp[col] = pd.to_datetime(disp[col]).dt.strftime("%Y-%m-%d")
                     disp["Recovery"] = disp["Recovery"].apply(
                         lambda d: "Not yet recovered"
                         if pd.isna(d) else pd.Timestamp(d).strftime("%Y-%m-%d")
@@ -1529,3 +1550,196 @@ with tab_perf:
             **Maximum Drawdown** — largest observed peak-to-trough fall; 0 means a prior peak.
             """
         )
+
+
+# ============================================================
+# TAB 6 — SECURITY DETAIL
+# ============================================================
+with tab_security:
+    st.markdown("## Security Detail")
+
+    if st.session_state.get("security_ticker") not in tickers:
+        st.session_state.security_ticker = tickers[0]
+    sel = st.selectbox(
+        "Security", tickers, key="security_ticker",
+        help="Holdings come from your current portfolio. Analytics below "
+             "follow this selection.",
+    )
+    sel_idx = tickers.index(sel)
+
+    # ---- Top security summary (position facts, not performance) ----
+    sel_price = float(current_prices[sel])
+    sel_shares = float(st.session_state.portfolio[sel]["shares"])
+    sel_value = sel_price * sel_shares
+    sel_weight = float(weights[sel_idx])
+    sel_cost = st.session_state.portfolio[sel].get("avg_cost")
+
+    st.markdown(f"### {sel}")
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Current Price", fmt_usd(sel_price))
+    h2.metric("Position Value", fmt_usd(sel_value))
+    h3.metric("Portfolio Weight", fmt_pct(sel_weight),
+              help="Share of total portfolio market value.")
+    h4.metric("Shares", f"{sel_shares:g}")
+    # Unrealised P&L only — cost basis is captured per position. Omit it
+    # entirely when no valid cost basis exists rather than inventing one.
+    if sel_cost is not None and np.isfinite(sel_cost) and sel_cost > 0:
+        upl = sel_value - sel_shares * float(sel_cost)
+        upl_pct = upl / (sel_shares * float(sel_cost))
+        st.caption(f"Unrealised P&L (vs avg cost ${float(sel_cost):,.2f}): "
+                   f"${upl:+,.2f} ({upl_pct:+.2%}).")
+
+    st.markdown("---")
+
+    # ---- Holding analytics (project's own data pipeline only) ----
+    st.markdown("### Holding Analytics")
+    sec_rets = rets[sel].dropna()
+
+    # Benchmark leg for beta: reuse the Performance tab benchmark (SPY
+    # default) through the same cached loader — no extra request.
+    bench_period = st.session_state.get("hist_period_tab1", "2y")
+    bench_rets_sec = None
+    sec_bench_sym = None
+    try:
+        sec_bench_sym = validate_ticker_symbol(
+            st.session_state.get("bench_ticker", "SPY"))
+    except ValueError:
+        sec_bench_sym = None
+    if sec_bench_sym is not None and sec_bench_sym != sel:
+        try:
+            _bp = load_benchmark_data(sec_bench_sym, bench_period)
+            bench_rets_sec = log_returns_from_prices(_bp)
+        except Exception:
+            bench_rets_sec = None  # beta shows as unavailable, tab continues
+
+    try:
+        sec = security_summary(
+            sec_rets, weights, cov.values, sel_idx, rf_rate,
+            portfolio_log_returns=port_daily_returns,
+            benchmark_log_returns=bench_rets_sec,
+        )
+    except ValueError as e:
+        st.error(f"Holding analytics unavailable: {e}")
+        sec = None
+
+    if sec is not None:
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Annualised Return", fmt_pct(sec["annualised_return"]),
+                  help="Mean daily log return × 252, this holding only.")
+        a2.metric("Annualised Volatility", fmt_pct(sec["annualised_volatility"]),
+                  help="Daily std × √252, this holding only.")
+        a3.metric("Sharpe Ratio", f"{sec['sharpe']:.2f}",
+                  help="Holding excess return per unit of its own volatility.")
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            if sec["beta_vs_benchmark"] is not None:
+                st.metric(
+                    f"Beta vs {sec_bench_sym}", f"{sec['beta_vs_benchmark']:.2f}",
+                    help="Historical sensitivity to the benchmark. "
+                         "Association, not causality.")
+            else:
+                st.metric("Beta", "n/a")
+                st.caption(sec.get("beta_error")
+                           or "Benchmark unavailable for beta.")
+        with b2:
+            st.metric("Contribution to Portfolio Risk",
+                      fmt_pct(sec["risk_contribution"]),
+                      help="This holding's share of portfolio volatility "
+                           "(same model as the Overview risk breakdown).")
+        with b3:
+            if sec["correlation_to_portfolio"] is not None:
+                st.metric("Correlation to Portfolio",
+                          f"{sec['correlation_to_portfolio']:.2f}",
+                          help="Co-movement with the portfolio return series. "
+                               "Association, not causality.")
+                st.caption(sec["correlation_note"])
+            else:
+                st.metric("Correlation to Portfolio", "n/a")
+                st.caption(sec.get("correlation_error")
+                           or "Correlation unavailable.")
+
+    st.markdown("---")
+
+    # ---- TradingView advanced chart (visual analysis only) ----
+    st.markdown("### Interactive Chart")
+    hints = {}
+    for t in tickers:
+        try:
+            hints[t] = load_exchange_hint(t)
+        except Exception:
+            hints[t] = None
+    watchlist = []
+    for t in tickers:
+        try:
+            watchlist.append(resolve_tradingview_symbol(t, hints.get(t)).symbol)
+        except ValueError:
+            continue
+
+    override_key = f"tv_override_{sel}"
+    with st.expander("TradingView symbol override (advanced)"):
+        st.text_input(
+            "TradingView symbol", key=override_key, placeholder="e.g. NASDAQ:AAPL",
+            help="Chart display only. Never affects portfolio data or analytics.",
+        )
+        st.caption(f"Yahoo ticker: {sel}")
+    override_val = (st.session_state.get(override_key) or "").strip() or None
+
+    tv_failed = False
+    try:
+        resolved = resolve_tradingview_symbol(sel, hints.get(sel), override_val)
+    except ValueError as e:
+        tv_failed = True
+        st.warning(f"TradingView chart unavailable for {sel}: {e} "
+                   "Portfolio Calc analytics above are unaffected; you can "
+                   "change the symbol inside the widget once it loads.")
+        resolved = None
+
+    if not tv_failed and resolved is not None:
+        if not resolved.resolved:
+            st.caption(f"ℹ️ {resolved.note}")
+        try:
+            render_tradingview_chart(resolved.symbol, watchlist, height=680)
+        except Exception:
+            st.warning(
+                "The TradingView widget could not display this symbol. "
+                "Portfolio Calc analytics above are unaffected — try the "
+                "widget's symbol search or the override above.")
+        st.caption(
+            "Streamlit selector drives Portfolio Calc analytics; the widget "
+            "watchlist switches only the embedded chart. Chart data is "
+            "TradingView's own and is never used in calculations.")
+
+    # ---- Reproducible internal price chart (project data) ----
+    with st.expander("Portfolio data chart (reproducible)"):
+        st.caption("Plotted from Portfolio Calc's own yfinance history — "
+                   "the reproducible application data, unlike the widget above.")
+        fig_sec = go.Figure()
+        fig_sec.add_trace(go.Scatter(
+            x=prices.index, y=prices[sel],
+            mode="lines", name=sel, line=dict(color="#58a6ff", width=2),
+        ))
+        fig_sec.update_layout(**CHART_THEME, title=f"{sel} Price History",
+                              xaxis_title="Date", yaxis_title="Price ($)")
+        st.plotly_chart(fig_sec, use_container_width=True)
+
+    # ---- Performance snapshot (project's own prices) ----
+    st.markdown("---")
+    st.markdown("### Performance Snapshot")
+    try:
+        snap = period_returns(prices[sel])
+    except ValueError as e:
+        st.warning(f"Performance snapshot unavailable: {e}")
+        snap = None
+    if snap is not None:
+        cols = st.columns(5)
+        for col, label in zip(cols, ["1M", "3M", "6M", "YTD", "1Y"]):
+            entry = snap[label]
+            if entry["return"] is None:
+                col.metric(f"{label} Return", "n/a",
+                           help="Not enough history for this window.")
+            else:
+                col.metric(
+                    f"{label} Return", f"{entry['return']:+.2%}",
+                    help=f"{entry['start']} → {entry['end']}, from actual prices.")
+        st.caption("Window returns use date-based ranges on Portfolio Calc "
+                   "price history — never scraped from TradingView.")

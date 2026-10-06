@@ -145,6 +145,26 @@ def fetch_current_prices(tickers: list[str]) -> dict[str, float]:
     return prices
 
 
+def fetch_exchange_code(ticker: str) -> str | None:
+    """
+    Best-effort yfinance exchange code for a ticker (e.g. ``NMS``, ``NYQ``).
+
+    Used only as a hint for TradingView symbol resolution. Returns ``None``
+    when the lookup fails or yields nothing usable — callers must fall back
+    gracefully. Never raises for network/API problems (only for invalid
+    ticker strings).
+    """
+    sym = validate_ticker_symbol(ticker)
+    try:
+        code = yf.Ticker(sym).fast_info.exchange
+    except Exception:
+        return None
+    if not code or not isinstance(code, str):
+        return None
+    code = code.strip().upper()
+    return code or None
+
+
 def fetch_risk_free_rate() -> float:
     """
     Approximate the annualised risk-free rate using the 13-week US T-Bill (^IRX).
