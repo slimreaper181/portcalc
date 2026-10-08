@@ -27,10 +27,17 @@ Core conventions (project-wide, see analytics.returns)
   time and is kept separate from annualised mean return.
 * Rebalance convention: on the first available trading day **on or after**
   each scheduled calendar date (month/quarter/half-year/year start),
-  executed at that day's close using only prices known then.
-* Transaction cost: ``|trade_notional| * bps / 10_000`` per traded leg,
-  summed per event; untouched holdings incur no cost. Costs are deducted
-  pro-rata so ``value_before - costs == value_after`` exactly.
+  executed at that day's close using only prices known then. This is an
+  **end-of-day execution approximation**: each rebalance is modelled as a
+  single closing-price transaction, with no intraday prices and no market
+  impact beyond the explicit bps cost.
+* Transaction cost: ``|trade_notional| × bps / 10,000`` per traded leg,
+  summed per event; untouched holdings incur no cost. Because post-cost
+  capital funds the final targets, cost and final trades are circular
+  (``c = rate·Σ|w(1−c) − cw|``); the engine solves this scalar equation
+  exactly by fixed-point iteration (tolerance 1e-12), so the reported cost
+  always equals ``rate × Σ|final executed trades|`` and
+  ``value_before - cost == value_after`` holds by construction.
 * Turnover per event: ``sum(|trade|) / value_before``.
 * Fractional shares are assumed (deterministic, no cash drag); any
   residual is fully deployed, so no separate cash balance exists.
@@ -321,7 +328,11 @@ def apply_transaction_costs(trade_values: np.ndarray, cost_bps: float) -> float:
 
 
 def calculate_turnover(trade_values: np.ndarray, portfolio_value_before: float) -> float:
-    """Event turnover: ``sum(|trade|) / value_before`` (fraction, >= 0)."""
+    """Event turnover: ``sum(|trade|) / value_before`` (fraction, >= 0).
+
+    Callers pass the **final executed** trade notionals (post-cost), so
+    turnover, costs and residual capital all describe the same execution.
+    """
     if not np.isfinite(portfolio_value_before) or portfolio_value_before <= 0:
         raise ValueError(
             f"Portfolio value before rebalance must be positive, "
@@ -331,6 +342,46 @@ def calculate_turnover(trade_values: np.ndarray, portfolio_value_before: float) 
     if not np.all(np.isfinite(trades)):
         raise ValueError("Trade values must be finite.")
     return float(np.abs(trades).sum() / portfolio_value_before)
+
+
+def _solve_cost_fraction(
+    current_weights: np.ndarray,
+    target_weights: np.ndarray,
+    cost_bps: float,
+    tol: float = 1e-12,
+    max_iter: int = 10_000,
+) -> float:
+    """Solve the cost/target circularity for the cost fraction of value.
+
+    Final post-cost allocations are ``Vb·w·(1−c)``, so final executed trades
+    are ``Vb·w·(1−c) − current`` while the cost itself is
+    ``rate·Σ|final trades|`` — i.e. ``c`` must satisfy the scalar equation
+    ``c = rate·Σ|w·(1−c) − cw|``. The right-hand side is 1-Lipschitz in ``c``,
+    and ``rate ≤ 0.1`` (MAX_COST_BPS), so fixed-point iteration contracts
+    geometrically (≥10× per step) to the unique solution.
+
+    Returns:
+        Cost as a fraction of pre-rebalance value, converged to ``tol``.
+
+    Raises:
+        ValueError: on invalid inputs or (unreachable in practice)
+            non-convergence.
+    """
+    rate = validate_transaction_cost_bps(cost_bps) / 10_000.0
+    cw = np.asarray(current_weights, dtype=float)
+    w = np.asarray(target_weights, dtype=float)
+    if cw.shape != w.shape or not np.all(np.isfinite(cw)):
+        raise ValueError("Current weights must be finite and match targets.")
+    c = rate * float(np.abs(w - cw).sum())
+    for _ in range(max_iter):
+        c_new = rate * float(np.abs(w * (1.0 - c) - cw).sum())
+        if abs(c_new - c) <= tol * max(c_new, 1e-300):
+            return float(c_new)
+        c = c_new
+    raise ValueError(
+        "Transaction-cost fixed point failed to converge; "
+        "check cost/weight inputs."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -382,8 +433,15 @@ def _run_share_simulation(
         if is_rebalance:
             value_before = float(seg_values.iloc[-1])
             current = holdings.iloc[-1].values
-            target = value_before * w
-            trade = target - current
+            current_w = current / value_before
+            # Exact circularity: final targets are funded from post-cost
+            # capital, so solve c = rate·Σ|w(1−c) − cw| for the cost fraction
+            # rather than costing the pre-cost trades.
+            cost_frac = _solve_cost_fraction(current_w, w, cost_bps)
+            scale = 1.0 - cost_frac
+            target_alloc = value_before * w * scale
+            trade = target_alloc - current  # final executed trades
+            # Reported cost from FINAL executed notionals (not pre-cost).
             cost = apply_transaction_costs(trade, cost_bps)
             turnover = calculate_turnover(trade, value_before)
             value_after = value_before - cost
@@ -397,7 +455,7 @@ def _run_share_simulation(
                 "Transaction Cost": cost,
                 "Portfolio Value After": value_after,
             })
-            before_w = current / value_before
+            before_w = current_w
             leg_costs = np.abs(trade) * cost_bps / 10_000.0
             for j, t in enumerate(tickers):
                 trade_rows.append({
@@ -408,9 +466,9 @@ def _run_share_simulation(
                     "Trade Value": float(trade[j]),
                     "Transaction Cost": float(leg_costs[j]),
                 })
-            # Restore exact targets pro-rata so accounting reconciles.
-            scale = value_after / value_before if value_before > 0 else 0.0
-            shares = (target * scale) / P.iloc[hi].values
+            # Post-cost allocations fund the new share counts, so the stored
+            # value, the event row and the forward holdings all reconcile.
+            shares = target_alloc / P.iloc[hi].values
         value_parts.append(seg_values)
         # Drift weights for every simulated day. At a rebalance date the
         # stored row is the post-rebalance allocation (exactly the targets);
@@ -535,8 +593,10 @@ def backtest_rebalanced(
 
     At each scheduled date (first trading day on/after the calendar mark):
     value the holdings, trade back to ``target_weights``, deduct
-    ``|trade| * bps / 10_000`` pro-rata. ``frequency="never"`` behaves
-    exactly like :func:`backtest_buy_and_hold` with zero costs.
+    ``|trade| * bps / 10_000`` pro-rata. Modelled as a single end-of-day
+    execution at that day's close (approximation — no intraday pricing).
+    ``frequency="never"`` behaves exactly like :func:`backtest_buy_and_hold`
+    with zero costs.
     """
     frequency = validate_frequency(frequency)
     tickers = list(prices.columns)

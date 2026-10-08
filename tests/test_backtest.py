@@ -67,19 +67,21 @@ def test_manual_rebalance_drift_and_restore():
         pd.Timestamp("2020-02-03")]
     res = backtest_rebalanced(px, W2, 100.0, "monthly", cost_bps=10.0,
                               risk_free_annual=0.0)
-    # Pre-rebalance value 150 (5*20 + 5*10); trades ∓25; cost 50*10/1e4.
+    # Pre-rebalance value 150 (5*20 + 5*10). Exact circular solve:
+    # c* = rate/3 → cost 0.05; final executed trades ∓25.025 (funded
+    # from post-cost capital), NOT the naive pre-cost ∓25.
     assert res.values.loc["2020-02-03"] == pytest.approx(150.0 - 0.05)
     assert res.costs.loc["2020-02-03"] == pytest.approx(0.05)
     assert res.turnover.loc["2020-02-03"] == pytest.approx(50.0 / 150.0)
     # Weights restored to exactly 50/50 at the rebalance date.
     assert res.weights.loc["2020-02-03", "A"] == pytest.approx(0.5)
     assert res.weights.loc["2020-02-03", "B"] == pytest.approx(0.5)
-    # Trade legs: A sold 25 (cost 0.025), B bought 25 (cost 0.025).
+    # Trade legs: A sold 25.025 (cost 0.025025), B bought 24.975.
     tr = res.trades
     assert len(tr) == 2
     a = tr[tr.Ticker == "A"].iloc[0]
-    assert a["Trade Value"] == pytest.approx(-25.0)
-    assert a["Transaction Cost"] == pytest.approx(0.025)
+    assert a["Trade Value"] == pytest.approx(-25.025)
+    assert a["Transaction Cost"] == pytest.approx(0.025025)
     assert a["Before Weight"] == pytest.approx(100 / 150)
     assert tr["Transaction Cost"].sum() == pytest.approx(0.05)
     # Accounting identity: before − cost == after == stored value.
@@ -115,6 +117,40 @@ def test_never_frequency_equals_buy_and_hold():
     a = backtest_rebalanced(px, W2, 1000.0, "never", name="X")
     b = backtest_buy_and_hold(px, W2, 1000.0, name="X")
     pd.testing.assert_series_equal(a.values, b.values)
+
+
+def test_large_costs_use_final_executed_notionals():
+    # Asymmetric 80/20 target, drifted 50/50-ish holdings, deliberately
+    # heavy 500 bps: A flat @10, B triples to 30 → Vb = 8*10 + 2*30 = 140.
+    # Naive pre-cost estimate (3.20) is measurably wrong; the exact solve
+    # gives c ≈ 0.02219 → cost ≈ 3.107.
+    idx = pd.DatetimeIndex(["2020-01-06", "2020-02-03", "2020-02-04"])
+    px = make_prices(idx, [10.0, 10.0, 10.0], [10.0, 30.0, 30.0])
+    w = np.array([0.8, 0.2])
+    res = backtest_rebalanced(px, w, 100.0, "monthly", cost_bps=500.0,
+                              risk_free_annual=0.0)
+    d = pd.Timestamp("2020-02-03")
+    ev = res.rebalance_events.iloc[0]
+    assert ev["Portfolio Value Before"] == pytest.approx(140.0)
+    reported = float(ev["Transaction Cost"])
+    final_trades = res.trades["Trade Value"].to_numpy(dtype=float)
+    # (1) reported cost == rate × Σ|final executed trades| (tight).
+    assert reported == pytest.approx(
+        0.05 * np.abs(final_trades).sum(), rel=1e-9)
+    # (2) accounting identity on reported figures.
+    assert ev["Portfolio Value After"] == pytest.approx(
+        ev["Portfolio Value Before"] - reported, abs=1e-9)
+    assert ev["Portfolio Value After"] == pytest.approx(
+        res.values.loc[d], abs=1e-9)
+    assert res.costs.loc[d] == pytest.approx(reported, rel=1e-12)
+    # (3) naive pre-cost estimate (0.05 × (|112−80| + |28−60|) = 3.20) is
+    # measurably different from the exact cost.
+    naive = 0.05 * (abs(140 * 0.8 - 80.0) + abs(140 * 0.2 - 60.0))
+    assert naive == pytest.approx(3.2)
+    assert abs(reported - naive) > 0.01
+    # Post-rebalance weights are exactly the 80/20 targets.
+    assert res.weights.loc[d, "A"] == pytest.approx(0.8)
+    assert res.weights.loc[d, "B"] == pytest.approx(0.2)
 
 
 # ---------------------------------------------------------------------------

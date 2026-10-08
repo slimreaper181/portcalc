@@ -1915,7 +1915,10 @@ with tab_backtest:
         "Reconstructs this portfolio from historical **adjusted** Yahoo Finance "
         "prices only — no live/Alpaca prices, no look-ahead. Adjusted closes "
         "reflect splits/dividends only to the extent Yahoo's adjusted data "
-        "provides them. Fractional shares assumed; target weights are static."
+        "provides them. Fractional shares assumed; target weights are static. "
+        "Scheduled rebalances are modelled at the closing price of the first "
+        "eligible trading day on/after each calendar date (end-of-day "
+        "execution approximation)."
     )
 
     # ---- Long-history data through the same cached yfinance pipeline ----
@@ -1969,15 +1972,21 @@ with tab_backtest:
             ["Monthly", "Quarterly", "Semi-annual", "Annual"],
             index=1, key="bt_freq",
             help="Rebalance on the first trading day on or after each "
-                 "calendar period start, at that day's close.")
+                 "calendar period start, at that day's close "
+                 "(end-of-day execution approximation).")
 
     st.markdown("#### Strategies")
+    _retro_help = (
+        "Today's portfolio weights are frozen as the fixed historical "
+        "target. This is a retrospective hypothetical — not proof those "
+        "weights would have been selected at the historical start date."
+    )
     bs1, bs2, bs3 = st.columns(3)
     with bs1:
-        show_cwbh = st.checkbox("Current Weights — Buy & Hold", value=False,
-                                key="bt_s_cwbh")
-        show_cwr = st.checkbox("Current Weights — Rebalanced", value=True,
-                               key="bt_s_cwr")
+        show_cwbh = st.checkbox("Current Weights — Retrospective (Buy & Hold)",
+                                value=False, key="bt_s_cwbh", help=_retro_help)
+        show_cwr = st.checkbox("Current Weights — Retrospective (Rebalanced)",
+                               value=True, key="bt_s_cwr", help=_retro_help)
     with bs2:
         show_ewbh = st.checkbox("Equal Weight — Buy & Hold", value=False,
                                 key="bt_s_ewbh")
@@ -1985,6 +1994,12 @@ with tab_backtest:
                                key="bt_s_ewr")
     with bs3:
         show_bench = st.checkbox("Benchmark", value=True, key="bt_s_bench")
+    st.caption(
+        "“Current Weights — Retrospective” applies today's chosen portfolio "
+        "weights across the whole historical window. The result shows what "
+        "those weights *would have* earned — not that they would have been "
+        "chosen back then."
+    )
 
     # ---- Prepare the common-date window (real data only) ----
     try:
@@ -2021,11 +2036,11 @@ with tab_backtest:
     _results: dict = {}
     try:
         if show_cwbh:
-            _results["Current Weights — Buy & Hold"] = backtest_buy_and_hold(
+            _results["Current Weights — Retrospective (Buy & Hold)"] = backtest_buy_and_hold(
                 bt_prices, weights, float(bt_capital), rf_rate,
-                name="Current Weights — Buy & Hold")
+                name="Current Weights — Retrospective (Buy & Hold)")
         if show_cwr:
-            _name = f"Current Weights — {freq_label}"
+            _name = f"Current Weights — Retrospective ({freq_label})"
             _results[_name] = backtest_rebalanced(
                 bt_prices, weights, float(bt_capital), _freq, float(bt_costs),
                 rf_rate, name=_name)
