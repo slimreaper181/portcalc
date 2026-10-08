@@ -35,6 +35,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from .validation import check_history_length
+from .currency import currency_symbol
 
 
 # ---------------------------------------------------------------------------
@@ -700,8 +701,10 @@ def plot_growth_comparison(
     benchmark_growth: pd.Series | None = None,
     initial: float = 10_000.0,
     benchmark_label: str = "Benchmark",
+    currency: str = "USD",
 ) -> go.Figure:
     """Growth-of-capital chart: portfolio (and benchmark) in currency units."""
+    sym = currency_symbol(currency)
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=portfolio_growth.index, y=portfolio_growth.values,
@@ -716,9 +719,9 @@ def plot_growth_comparison(
         ))
     fig.update_layout(
         **_DARK_LAYOUT,
-        title=dict(text=f"Growth of ${initial:,.0f} — Portfolio vs {benchmark_label}",
+        title=dict(text=f"Growth of {sym}{initial:,.0f} - Portfolio vs {benchmark_label}",
                    font=dict(size=16)),
-        xaxis_title="Date", yaxis_title="Portfolio Value ($)",
+        xaxis_title="Date", yaxis_title=f"Portfolio Value ({currency})",
         legend=dict(bgcolor="rgba(0,0,0,0)"),
     )
     return fig

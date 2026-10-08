@@ -66,6 +66,7 @@ from .performance import (
     sortino_ratio,
 )
 from .validation import align_market_data, canonical_tickers
+from .currency import currency_symbol
 
 TRADING_DAYS = 252
 MIN_BACKTEST_ROWS = 30
@@ -788,9 +789,11 @@ def compare_backtests(results: dict[str, BacktestResult]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def plot_backtest_growth(
-    results: dict[str, BacktestResult], initial: float
+    results: dict[str, BacktestResult], initial: float,
+    currency: str = "USD",
 ) -> go.Figure:
     """Historical growth chart: actual wealth paths, one line per strategy."""
+    sym = currency_symbol(currency)
     palette = ["#58a6ff", "#3fb950", "#f0883e", "#bc8cff", "#f85149", "#79c0ff"]
     fig = go.Figure()
     for i, (name, res) in enumerate(results.items()):
@@ -801,9 +804,9 @@ def plot_backtest_growth(
         ))
     fig.update_layout(
         **_DARK_LAYOUT,
-        title=dict(text=f"Historical Growth of ${initial:,.0f} — Backtest",
+        title=dict(text=f"Historical Growth of {sym}{initial:,.0f} - Backtest",
                    font=dict(size=16)),
-        xaxis_title="Date", yaxis_title="Portfolio Value ($)",
+        xaxis_title="Date", yaxis_title=f"Portfolio Value ({currency})",
         legend=dict(bgcolor="rgba(0,0,0,0)"),
     )
     return fig

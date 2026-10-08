@@ -165,6 +165,78 @@ def fetch_exchange_code(ticker: str) -> str | None:
     return code or None
 
 
+def _naive_utc_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Normalise an index to tz-naive UTC for cross-source alignment."""
+    idx = pd.DatetimeIndex(index)
+    if idx.tz is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    return idx
+
+
+def fetch_raw_closes(ticker: str) -> pd.Series:
+    """
+    Raw (unadjusted) daily closes — actual traded prices including splits.
+
+    Unlike adjusted closes, these reflect what a broker fill would have
+    been (up to intraday timing). Index is tz-naive UTC, ascending, unique.
+    """
+    sym = validate_ticker_symbol(ticker)
+    try:
+        hist = yf.Ticker(sym).history(period="max", auto_adjust=False)
+    except Exception as e:
+        raise ValueError(
+            f"Could not download raw history for {sym} "
+            f"(network/API error: {e})."
+        )
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        raise ValueError(f"No raw price history available for {sym}.")
+    closes = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+    if closes.empty:
+        raise ValueError(f"No raw price history available for {sym}.")
+    closes.index = _naive_utc_index(closes.index)
+    closes = closes.sort_index()
+    closes = closes[~closes.index.duplicated(keep="last")]
+    return closes.rename(sym)
+
+
+def fetch_splits(ticker: str) -> pd.Series:
+    """Stock-split series (e.g. 4.0 = 4-for-1); empty when none occurred."""
+    sym = validate_ticker_symbol(ticker)
+    try:
+        splits = yf.Ticker(sym).splits
+    except Exception as e:
+        raise ValueError(f"Could not download split history for {sym} ({e}).")
+    if splits is None or len(splits) == 0:
+        return pd.Series(dtype=float)
+    s = pd.to_numeric(splits, errors="coerce").dropna()
+    s = s[s > 0]
+    try:
+        s.index = _naive_utc_index(s.index)
+    except Exception:
+        pass
+    return s.sort_index()
+
+
+def fetch_dividends(ticker: str) -> pd.Series:
+    """Cash dividends per share by date; empty when none paid."""
+    sym = validate_ticker_symbol(ticker)
+    try:
+        divs = yf.Ticker(sym).dividends
+    except Exception as e:
+        raise ValueError(
+            f"Could not download dividend history for {sym} ({e})."
+        )
+    if divs is None or len(divs) == 0:
+        return pd.Series(dtype=float)
+    d = pd.to_numeric(divs, errors="coerce").dropna()
+    d = d[d > 0]
+    try:
+        d.index = _naive_utc_index(d.index)
+    except Exception:
+        pass
+    return d.sort_index()
+
+
 def fetch_risk_free_rate() -> float:
     """
     Approximate the annualised risk-free rate using the 13-week US T-Bill (^IRX).

@@ -116,3 +116,57 @@ APCA_API_SECRET_KEY = "..."
 Without credentials the app runs normally on Yahoo Finance prices and
 labels them as such. Non-US symbols (e.g. `BARC.L`, `^FTSE`) always use
 Yahoo Finance.
+
+## Purchase dates & cost basis
+
+Each position records **Ticker / Shares / Purchase Date**. The app looks
+up the raw market close on that date (split-adjusted to current shares)
+as the **Estimated Purchase Price** — your actual broker fill may have
+differed. Non-trading dates offer the previous/next close explicitly
+(never silently substituted). An **actual execution price override** is
+available per position; old `avg_cost` entries are preserved as
+legacy/manual cost basis. One aggregate purchase per position is
+supported (no tax lots yet).
+
+## Base currency & multi-currency
+
+Pick a portfolio **Base Currency** (USD/GBP/EUR) in the sidebar. Pipeline:
+
+```text
+Security native price
+  ↓ × quote scale (÷100 for GBp pence)
+Current/historical FX translation (date-matched, Yahoo Finance)
+  ↓
+Portfolio base-currency value
+```
+
+```text
+Purchase-date native price
+  ↓ × purchase-date FX
+Historical base-currency cost basis
+```
+
+Current values use current FX; historical analytics/backtests use
+date-matched historical FX, so currency movement is part of
+base-currency returns. LSE pence quotes (e.g. `BARC.L` 320 GBp = £3.20)
+are normalised — no 100× errors. Unrealised P&L is price/FX P&L;
+dividends are reported separately as estimated income, never merged
+into backtest wealth paths (which use adjusted prices).
+
+## Methodology & limitations
+
+- Market-data delays: Yahoo daily closes; Alpaca IEX latest trade
+  (10s cache) where configured.
+- Estimated purchase close: raw close on the selected trading date,
+  split-adjusted to current shares; execution-time/fills excluded.
+- Single acquisition date per position; FIFO/LIFO not modelled.
+- Dividend estimates: cash amounts × shares × payment-date FX, only for
+  payments after purchase; broker-exact entitlement not claimed.
+- Currency conversion via Yahoo FX (`GBPUSD=X`, `EURUSD=X`), USD-routed;
+  FX gaps beyond 5 trading days raise instead of inventing data.
+- Factor data lags the portfolio (French library updates periodically);
+  US factors stay in USD — non-USD bases carry an explicit warning.
+- Backtests use currently-held securities only (survivorship/selection
+  bias); rebalances execute at the next eligible close (approximation);
+  static out-of-sample weights are never re-estimated in-test.
+- TradingView charts show native market quotation, display only.
