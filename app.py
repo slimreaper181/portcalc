@@ -113,6 +113,16 @@ from data.alpaca import (
     get_alpaca_credentials,
     is_alpaca_supported_symbol,
 )
+from analytics.backtest import (
+    backtest_benchmark,
+    backtest_buy_and_hold,
+    backtest_rebalanced,
+    compare_backtests,
+    detect_mixed_markets,
+    plot_backtest_growth,
+    plot_weight_drift,
+    prepare_backtest_data,
+)
 from analytics.validation import (
     align_market_data,
     aligned_portfolio_returns,
@@ -457,6 +467,12 @@ def load_benchmark_data(benchmark_ticker: str, period: str):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_backtest_data(tickers: list[str]):
+    """Cached full-length history for backtesting (same yfinance pipeline)."""
+    return fetch_price_history(list(tickers), period="max")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_exchange_hint(ticker: str):
     """Cached yfinance exchange code (TradingView resolution hint only)."""
     try:
@@ -572,13 +588,14 @@ rc = core["rc"]
 # Main tabs
 # ---------------------------------------------------------------------------
 
-tab_overview, tab_risk, tab_optimise, tab_scenario, tab_perf, tab_security = st.tabs([
+tab_overview, tab_risk, tab_optimise, tab_scenario, tab_perf, tab_security, tab_backtest = st.tabs([
     "📈 Overview",
     "⚠️  Risk",
     "🎯 Optimise",
     "📊 Scenario Analysis",
     "📉 Performance",
     "🔍 Security Detail",
+    "🧪 Backtest",
 ])
 
 
@@ -1876,3 +1893,344 @@ with tab_security:
                     help=f"{entry['start']} → {entry['end']}, from actual prices.")
         st.caption("Window returns use date-based ranges on Portfolio Calc "
                    "price history — never scraped from TradingView.")
+
+
+# ============================================================
+# TAB 7 — BACKTEST
+# ============================================================
+def _fmt_bt_date(d) -> str:
+    """Format a drawdown date for display (NaT → 'not yet recovered')."""
+    try:
+        ts = pd.Timestamp(d)
+        if pd.isna(ts):
+            return "not yet recovered"
+        return ts.strftime("%Y-%m-%d")
+    except Exception:
+        return "n/a"
+
+
+with tab_backtest:
+    st.markdown("## Historical Backtest")
+    st.caption(
+        "Reconstructs this portfolio from historical **adjusted** Yahoo Finance "
+        "prices only — no live/Alpaca prices, no look-ahead. Adjusted closes "
+        "reflect splits/dividends only to the extent Yahoo's adjusted data "
+        "provides them. Fractional shares assumed; target weights are static."
+    )
+
+    # ---- Long-history data through the same cached yfinance pipeline ----
+    try:
+        bt_full = load_backtest_data(tickers)
+    except ValueError as e:
+        st.error(f"Backtest data error: {e}")
+        st.stop()
+    except Exception:
+        st.error("Could not load backtest history (network or API error). "
+                 "Check your connection and try again.")
+        st.stop()
+
+    bt_common = bt_full.dropna(how="any")
+    if len(bt_common) < 2:
+        st.error("No overlapping history available for backtesting.")
+        st.stop()
+    bt_min_date = bt_common.index[0].date()
+    bt_max_date = bt_common.index[-1].date()
+
+    # ---- Backtest Controls ----
+    st.markdown("### Backtest Controls")
+    bc1, bc2, bc3, bc4 = st.columns(4)
+    with bc1:
+        bt_start = st.date_input(
+            "Start Date", value=bt_min_date,
+            min_value=bt_min_date, max_value=bt_max_date, key="bt_start")
+    with bc2:
+        bt_end = st.date_input(
+            "End Date", value=bt_max_date,
+            min_value=bt_min_date, max_value=bt_max_date, key="bt_end")
+    with bc3:
+        bt_capital = st.number_input(
+            "Initial Capital ($)", min_value=100.0, max_value=100_000_000.0,
+            value=10_000.0, step=1_000.0, key="bt_capital")
+    with bc4:
+        bt_costs = st.number_input(
+            "Transaction Cost (bps)", min_value=0.0, max_value=1000.0,
+            value=10.0, step=1.0, key="bt_costs",
+            help="10 bps = 0.10% of traded notional at each rebalance.")
+    bc5, bc6 = st.columns(2)
+    with bc5:
+        if "bt_benchmark" not in st.session_state:
+            st.session_state.bt_benchmark = "SPY"
+        st.text_input(
+            "Benchmark", key="bt_benchmark",
+            help="Any Yahoo Finance ticker, e.g. SPY, QQQ, ^GSPC.")
+    with bc6:
+        freq_label = st.selectbox(
+            "Rebalancing Frequency",
+            ["Monthly", "Quarterly", "Semi-annual", "Annual"],
+            index=1, key="bt_freq",
+            help="Rebalance on the first trading day on or after each "
+                 "calendar period start, at that day's close.")
+
+    st.markdown("#### Strategies")
+    bs1, bs2, bs3 = st.columns(3)
+    with bs1:
+        show_cwbh = st.checkbox("Current Weights — Buy & Hold", value=False,
+                                key="bt_s_cwbh")
+        show_cwr = st.checkbox("Current Weights — Rebalanced", value=True,
+                               key="bt_s_cwr")
+    with bs2:
+        show_ewbh = st.checkbox("Equal Weight — Buy & Hold", value=False,
+                                key="bt_s_ewbh")
+        show_ewr = st.checkbox("Equal Weight — Rebalanced", value=True,
+                               key="bt_s_ewr")
+    with bs3:
+        show_bench = st.checkbox("Benchmark", value=True, key="bt_s_bench")
+
+    # ---- Prepare the common-date window (real data only) ----
+    try:
+        bt_prices, bt_notes = prepare_backtest_data(
+            bt_full, tickers, pd.Timestamp(bt_start), pd.Timestamp(bt_end))
+    except ValueError as e:
+        st.error(f"Backtest setup: {e}")
+        st.stop()
+    for _note in bt_notes:
+        st.warning(_note)
+    _mixed = detect_mixed_markets(tickers)
+    if _mixed:
+        st.warning(_mixed)
+
+    try:
+        bench_sym_bt = validate_ticker_symbol(st.session_state.bt_benchmark)
+    except ValueError as e:
+        st.error(f"Invalid benchmark ticker: {e}")
+        bench_sym_bt = None
+
+    bench_full = None
+    if bench_sym_bt is not None and show_bench:
+        try:
+            bench_full = load_benchmark_data(bench_sym_bt, "max")
+        except ValueError as e:
+            st.warning(f"Benchmark unavailable: {e}")
+        except Exception:
+            st.warning("Could not load benchmark data (network or API error).")
+
+    # ---- Run the selected strategies (pure historical engine) ----
+    _freq = {"Monthly": "monthly", "Quarterly": "quarterly",
+             "Semi-annual": "semi-annual", "Annual": "annual"}[freq_label]
+    _eq_w = np.ones(len(tickers)) / len(tickers)
+    _results: dict = {}
+    try:
+        if show_cwbh:
+            _results["Current Weights — Buy & Hold"] = backtest_buy_and_hold(
+                bt_prices, weights, float(bt_capital), rf_rate,
+                name="Current Weights — Buy & Hold")
+        if show_cwr:
+            _name = f"Current Weights — {freq_label}"
+            _results[_name] = backtest_rebalanced(
+                bt_prices, weights, float(bt_capital), _freq, float(bt_costs),
+                rf_rate, name=_name)
+        if show_ewbh:
+            _results["Equal Weight — Buy & Hold"] = backtest_buy_and_hold(
+                bt_prices, _eq_w, float(bt_capital), rf_rate,
+                name="Equal Weight — Buy & Hold")
+        if show_ewr:
+            _name = f"Equal Weight — {freq_label}"
+            _results[_name] = backtest_rebalanced(
+                bt_prices, _eq_w, float(bt_capital), _freq, float(bt_costs),
+                rf_rate, name=_name)
+        if bench_full is not None:
+            try:
+                _results[bench_sym_bt] = backtest_benchmark(
+                    bench_full, bt_prices.index, float(bt_capital), rf_rate,
+                    name=bench_sym_bt)
+            except ValueError as e:
+                st.warning(f"Benchmark skipped: {e}")
+    except ValueError as e:
+        st.error(f"Backtest failed: {e}")
+        st.stop()
+    if not _results:
+        st.info("Select at least one strategy to run the backtest.")
+        st.stop()
+
+    # ---- Growth of Initial Capital (actual wealth paths) ----
+    st.markdown("---")
+    st.markdown(f"### Growth of {fmt_usd(float(bt_capital))}")
+    st.plotly_chart(plot_backtest_growth(_results, float(bt_capital)),
+                    use_container_width=True)
+    st.caption(
+        f"{len(bt_prices)} common trading days "
+        f"({bt_prices.index[0].date()} to {bt_prices.index[-1].date()}); "
+        "one line per selected strategy."
+    )
+
+    # ---- Strategy Comparison ----
+    st.markdown("---")
+    st.markdown("### Strategy Comparison")
+    _table = compare_backtests(_results)
+    _disp = pd.DataFrame(index=_table.index)
+    for _col in _table.columns:
+        _is_bench = _results[_col].is_benchmark
+        _cells = []
+        for _metric in _table.index:
+            _v = _table.loc[_metric, _col]
+            if _metric == "Total Costs" and _is_bench:
+                _cells.append("N/A")
+            elif _metric in ("Final Value", "Total Costs"):
+                _cells.append(fmt_usd(_v))
+            elif _metric in ("Total Return", "CAGR", "Annualised Return",
+                             "Volatility", "Max Drawdown", "Best Day",
+                             "Worst Day"):
+                _cells.append(fmt_pct(_v))
+            elif _metric in ("Sharpe", "Sortino", "Calmar"):
+                _cells.append(f"{_v:.2f}")
+            elif _metric == "Rebalances":
+                _cells.append(f"{int(_v)}")
+            else:
+                _cells.append(str(_v))
+        _disp[_col] = _cells
+    st.dataframe(_disp, use_container_width=True)
+    st.caption(
+        "Benchmark Total Costs show as N/A (the passive leg is not "
+        "cost-modelled). CAGR uses actual calendar elapsed time; "
+        "Annualised Return is the log-space mean and is kept separate."
+    )
+
+    # ---- Drawdown (selected strategy vs benchmark) ----
+    st.markdown("---")
+    st.markdown("### Drawdown")
+    _dd_default = next(
+        (n for n, r in _results.items() if not r.is_benchmark),
+        next(iter(_results)))
+    _dd_choice = st.selectbox(
+        "Drawdown strategy", list(_results.keys()),
+        index=list(_results.keys()).index(_dd_default), key="bt_dd_choice")
+    _bench_dd_name = (bench_sym_bt if bench_sym_bt in _results
+                      and bench_sym_bt != _dd_choice else None)
+    _sel_dd = _results[_dd_choice].drawdowns
+    _b_dd = _results[_bench_dd_name].drawdowns if _bench_dd_name else None
+    st.plotly_chart(
+        plot_drawdown(_sel_dd, _b_dd, _bench_dd_name or "Benchmark",
+                      _results[_dd_choice].metrics["max_drawdown"]),
+        use_container_width=True,
+    )
+    _dm = _results[_dd_choice].metrics
+    dd1, dd2, dd3 = st.columns(3)
+    dd1.metric("Current Drawdown", fmt_pct(_dm["current_drawdown"]))
+    dd2.metric("Maximum Drawdown", fmt_pct(_dm["max_drawdown"]))
+    dd3.metric("Duration (days)", f"{_dm['duration_days']}")
+    st.caption(
+        f"Peak {_fmt_bt_date(_dm['peak_date'])} → "
+        f"Trough {_fmt_bt_date(_dm['trough_date'])} → "
+        f"Recovery {_fmt_bt_date(_dm['recovery_date'])}."
+    )
+
+    # ---- Rebalance Statistics (currency values stay 2-per-row) ----
+    st.markdown("---")
+    st.markdown("### Rebalance Statistics")
+    _rb_names = [n for n, r in _results.items() if not r.is_benchmark]
+    if not _rb_names:
+        st.caption("Rebalance statistics apply to portfolio strategies — "
+                   "select one above.")
+        _rb_choice = None
+    else:
+        _rb_choice = st.selectbox(
+            "Statistics for", _rb_names,
+            index=0, key="bt_rb_choice") if len(_rb_names) > 1 else _rb_names[0]
+        if len(_rb_names) == 1:
+            st.caption(f"Showing statistics for {_rb_choice}.")
+        _rm = _results[_rb_choice].metrics
+        t1, t2 = st.columns(2)
+        t1.metric("Average Turnover", fmt_pct(_rm["avg_turnover"]),
+                  help="Mean per-event traded notional ÷ value before.")
+        t2.metric("Total Turnover", fmt_pct(_rm["total_turnover"]),
+                  help="Sum of per-event turnover across all rebalances.")
+        t3, t4 = st.columns(2)
+        t3.metric("Rebalances", f"{_rm['n_rebalances']}")
+        t4.metric("Total Transaction Costs", fmt_usd(_rm["total_costs"]))
+
+    # ---- Advanced Details ----
+    st.markdown("---")
+    st.markdown("### Advanced Details")
+    if _rb_names:
+        with st.expander("Rebalance Events"):
+            _ev = _results[_rb_choice].rebalance_events
+            if _ev is None or _ev.empty:
+                st.caption("No rebalance events (buy-and-hold, or the window "
+                           "covers a single schedule period).")
+            else:
+                _evd = _ev.copy()
+                _evd["Date"] = pd.to_datetime(_evd["Date"]).dt.strftime("%Y-%m-%d")
+                _evd["Portfolio Value Before"] = _evd["Portfolio Value Before"].map(fmt_usd)
+                _evd["Turnover"] = _evd["Turnover"].map(fmt_pct)
+                _evd["Transaction Cost"] = _evd["Transaction Cost"].map(fmt_usd)
+                _evd["Portfolio Value After"] = _evd["Portfolio Value After"].map(fmt_usd)
+                st.dataframe(_evd, use_container_width=True)
+            st.caption("Every event reconciles: value before − costs = value after.")
+        with st.expander("Trade Detail"):
+            _tr = _results[_rb_choice].trades
+            if _tr is None or _tr.empty:
+                st.caption("No individual trades (buy-and-hold).")
+            else:
+                _trd = _tr.copy()
+                _trd["Date"] = pd.to_datetime(_trd["Date"]).dt.strftime("%Y-%m-%d")
+                _trd["Before Weight"] = _trd["Before Weight"].map(fmt_pct)
+                _trd["Target Weight"] = _trd["Target Weight"].map(fmt_pct)
+                _trd["Trade Value"] = _trd["Trade Value"].map(
+                    lambda v: fmt_usd(v) if v >= 0 else f"-{fmt_usd(-v)}")
+                _trd["Transaction Cost"] = _trd["Transaction Cost"].map(fmt_usd)
+                st.dataframe(_trd, use_container_width=True)
+        with st.expander("Rolling Metrics (12M)"):
+            _lr = _results[_rb_choice].log_returns
+            if len(_lr) < 252:
+                st.warning(
+                    f"Only {len(_lr)} daily returns — need at least 252 for "
+                    "12-month rolling metrics. Widen the date range.")
+            else:
+                try:
+                    _specs = [
+                        ("Rolling 12M Return",
+                         lambda s: rolling_annualised_return(s, 252),
+                         "Return", ".0%"),
+                        ("Rolling Volatility",
+                         lambda s: rolling_volatility(s, 252),
+                         "Volatility (σ)", ".0%"),
+                        ("Rolling Sharpe",
+                         lambda s: rolling_sharpe(s, rf_rate, 252),
+                         "Sharpe", ".1f"),
+                    ]
+                    _broll = _results[bench_sym_bt].log_returns \
+                        if bench_sym_bt in _results else None
+                    _roll_series = [(_t, _fn(_lr),
+                                     _fn(_broll) if _broll is not None else None,
+                                     _y, _f)
+                                    for _t, _fn, _y, _f in _specs]
+                except ValueError as e:
+                    st.warning(f"Rolling metrics unavailable: {e}")
+                    _roll_series = []
+                for _t, _ps, _bs, _y, _f in _roll_series:
+                    _fig = go.Figure()
+                    _fig.add_trace(go.Scatter(
+                        x=_ps.index, y=_ps.values, mode="lines",
+                        name=_rb_choice,
+                        line=dict(color="#58a6ff", width=2)))
+                    if _bs is not None:
+                        _fig.add_trace(go.Scatter(
+                            x=_bs.index, y=_bs.values, mode="lines",
+                            name=bench_sym_bt,
+                            line=dict(color="#f0883e", width=1.5)))
+                    _fig.update_layout(**CHART_THEME, title=_t,
+                                        xaxis_title="Date", yaxis_title=_y,
+                                        yaxis_tickformat=_f)
+                    st.plotly_chart(_fig, use_container_width=True)
+        with st.expander("Weight Drift"):
+            _wdf = _results[_rb_choice].weights
+            if _wdf is None or _wdf.empty:
+                st.caption("No weight history for this strategy.")
+            else:
+                st.plotly_chart(
+                    plot_weight_drift(_wdf, f"Weight Drift — {_rb_choice}"),
+                    use_container_width=True)
+                st.caption("Buy-and-hold weights drift with prices; "
+                           "rebalanced weights snap back to targets.")
+    else:
+        st.caption("Advanced details need a portfolio strategy selected above.")
