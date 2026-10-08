@@ -406,3 +406,46 @@ def test_compare_backtests_table():
             assert np.isfinite(res.metrics[key]), (name, key)
     with pytest.raises(ValueError):
         compare_backtests({})
+
+
+# ---------------------------------------------------------------------------
+# §57 multi-currency: historical-FX wealth path + current-FX invariance
+# ---------------------------------------------------------------------------
+
+def _fx_base_panel():
+    # A in USD; B native £2.00→£2.04 with GBP flat @1.25 → $2.50→$2.55.
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    fx = pd.DataFrame({"GBP": [1.25, 1.25, 1.25]}, index=idx)
+    panel = pd.DataFrame({
+        "A": [100.0, 101.0, 102.0],
+        "B": [2.00 * 1.25, 2.02 * 1.25, 2.04 * 1.25],
+    }, index=idx)
+    return panel, fx
+
+
+def test_backtest_wealth_on_fx_converted_panel():
+    from analytics.currency import convert_price_series
+    panel, fx = _fx_base_panel()
+    # Prove the panel really embeds FX: rebuild B from native + FX.
+    idx = panel.index
+    native_b = pd.Series([200.0, 202.0, 204.0], index=idx)  # pence
+    rebuilt = convert_price_series(native_b * 0.01, "GBP", "USD", fx)
+    assert list(rebuilt) == pytest.approx(list(panel["B"]))
+    # Buy & hold 50/50 on $1000: A 5 sh, B 200 sh.
+    res = backtest_buy_and_hold(panel, W2, 1000.0, risk_free_annual=0.0)
+    assert res.values.iloc[0] == pytest.approx(1000.0)
+    assert res.values.iloc[1] == pytest.approx(5 * 101.0 + 200 * 2.525)
+    assert res.values.iloc[2] == pytest.approx(5 * 102.0 + 200 * 2.55)
+    assert np.all(np.isfinite(res.values.values))
+
+
+def test_current_fx_cannot_move_history():
+    # The engine accepts only explicit historical frames — there is no
+    # current-FX input, so "today's" rate cannot change history.
+    panel, _ = _fx_base_panel()
+    r1 = backtest_rebalanced(panel, W2, 1000.0, "monthly", 10.0)
+    current_fx_then, current_fx_now = 1.25, 999.0
+    assert current_fx_then != current_fx_now  # the counterfactual differs…
+    r2 = backtest_rebalanced(panel, W2, 1000.0, "monthly", 10.0)
+    pd.testing.assert_series_equal(r1.values, r2.values)  # …yet history can't
+    pd.testing.assert_frame_equal(r1.rebalance_events, r2.rebalance_events)

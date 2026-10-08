@@ -88,6 +88,21 @@ def test_split_adjustment_semantics():
     assert out["price"] == pytest.approx(25.0)  # per current share
 
 
+def test_reverse_split_semantics():
+    # 1-for-10 reverse split on 2024-01-04: $10 raw close on Jan 2 is
+    # $100/share now (10 current shares for every old one).
+    closes = _closes([10.0, 10.5, 105.0, 107.0])
+    splits = pd.Series([0.1], index=pd.DatetimeIndex([date(2024, 1, 4)]))
+    assert cumulative_split_factor(splits, date(2024, 1, 2)) == pytest.approx(0.1)
+    out = resolve_purchase_price(closes, splits, date(2024, 1, 2), TODAY)
+    assert out["status"] == "ok"
+    assert out["raw_close"] == pytest.approx(10.0)
+    assert out["price"] == pytest.approx(100.0)  # 10 / 0.1
+    # Cost basis is economically unchanged: 10 old shares @ $10
+    # == 1 current share @ $100.
+    assert 10.0 * 10.0 == pytest.approx(1.0 * out["price"])
+
+
 # ---------------------------------------------------------------------------
 # Position parsing / legacy migration
 # ---------------------------------------------------------------------------
@@ -175,6 +190,29 @@ def test_gbp_pence_end_to_end():
                        1.0, 1.0, "GBP")
     assert v.native_market_value == pytest.approx(320.0)
     assert v.base_market_value == pytest.approx(320.0)
+
+
+def test_gbp_purchase_price_from_raw_pence_close():
+    # Full purchase path in pence: raw close 300 GBp on the purchase date,
+    # no splits → £3.00/share cost; 100 shares → £300 cost basis.
+    closes = _closes([295.0, 300.0, 310.0, 305.0])
+    out = resolve_purchase_price(
+        closes, pd.Series(dtype=float), date(2024, 1, 3), TODAY)
+    assert out["status"] == "ok"
+    assert out["raw_close"] == pytest.approx(300.0)
+    native_cost_each = normalise_quote(out["price"], 0.01)
+    assert native_cost_each == pytest.approx(3.00)
+    pos = Position(ticker="BARC.L", shares=100.0,
+                   purchase_date=date(2024, 1, 3),
+                   purchase_price_native=native_cost_each,
+                   purchase_price_source="estimate",
+                   manual_purchase_price=False, native_currency="GBP",
+                   quote_unit="GBp", quote_scale=0.01)
+    v = value_position(pos, normalise_quote(320.0, 0.01), "Yahoo", None,
+                       1.0, 1.0, "GBP")
+    assert v.native_cost_basis == pytest.approx(300.0)  # not 30,000
+    assert v.native_market_value == pytest.approx(320.0)
+    assert v.unrealised_pnl == pytest.approx(20.0)
 
 
 def test_missing_cost_basis_omits_pnl():
