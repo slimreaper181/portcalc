@@ -514,7 +514,8 @@ def plot_factor_attribution(contributions: dict[str, float]) -> go.Figure:
     """Horizontal bar chart of annualised arithmetic attribution."""
     items = [(k, v) for k, v in contributions.items()
              if k not in ("Fitted (linear, ann.)", "Realised mean (ann.)")]
-    labels = [FACTOR_LABELS.get(k, k) if k != "Alpha" else "Alpha (residual)"
+    labels = [FACTOR_LABELS.get(k, k) if k != "Alpha"
+              else "Alpha Contribution (Arithmetic)"
               for k, _ in items]
     values = [v for _, v in items]
     colors = ["#3fb950" if v >= 0 else "#f85149" for v in values]

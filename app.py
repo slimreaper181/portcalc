@@ -143,6 +143,19 @@ from analytics.backtest import (
     plot_weight_drift,
     prepare_backtest_data,
 )
+from analytics.allocation import (
+    AllocationResult,
+    allocation_summary,
+    annualised_covariance_simple,
+    annualised_mean_returns_simple,
+    black_litterman_allocation,
+    black_litterman_posterior,
+    equal_risk_contribution,
+    estimate_risk_aversion_from_benchmark,
+    estimation_window,
+    maximum_diversification,
+    simple_returns_from_prices,
+)
 from analytics.validation import (
     align_market_data,
     aligned_portfolio_returns,
@@ -554,6 +567,157 @@ def format_trade_time(ts):
             return ts.strftime("%H:%M:%S UTC")
         except Exception:
             return "time unknown"
+
+
+# ---------------------------------------------------------------------------
+# Institutional allocation helpers (Optimise + Backtest tabs share these)
+# ---------------------------------------------------------------------------
+
+def _optim_to_alloc(method, res, tickers, mu_s, cov_df, rf):
+    """Convert an OptimResult to AllocationResult form for comparison."""
+    nan = float("nan")
+    if res is None or not res.success or res.weights is None:
+        reason = res.message if res is not None and res.message else "Unavailable"
+        return AllocationResult(
+            method=method, success=False, weights=None,
+            expected_return=nan, volatility=nan, sharpe=nan,
+            diversification_ratio=nan, risk_contributions=None,
+            message=str(reason))
+    try:
+        summary = allocation_summary(res.weights, mu_s, cov_df, rf, tickers)
+    except ValueError as e:
+        return AllocationResult(
+            method=method, success=False, weights=None,
+            expected_return=nan, volatility=nan, sharpe=nan,
+            diversification_ratio=nan, risk_contributions=None, message=str(e))
+    return AllocationResult(
+        method=method, success=True,
+        weights=pd.Series(np.asarray(res.weights, dtype=float), index=tickers),
+        expected_return=summary["expected_return"],
+        volatility=summary["volatility"],
+        sharpe=summary["sharpe"],
+        diversification_ratio=summary["diversification_ratio"],
+        risk_contributions=summary["risk_contributions"],
+        message="Converged")
+
+
+def _snapshot_alloc(method, w, tickers, mu_s, cov_df, rf, message):
+    """Wrap fixed weights (Current / Equal) in AllocationResult form."""
+    nan = float("nan")
+    try:
+        summary = allocation_summary(w, mu_s, cov_df, rf, tickers)
+    except ValueError as e:
+        return AllocationResult(
+            method=method, success=False, weights=None,
+            expected_return=nan, volatility=nan, sharpe=nan,
+            diversification_ratio=nan, risk_contributions=None, message=str(e))
+    return AllocationResult(
+        method=method, success=True,
+        weights=pd.Series(np.asarray(w, dtype=float), index=tickers),
+        expected_return=summary["expected_return"],
+        volatility=summary["volatility"],
+        sharpe=summary["sharpe"],
+        diversification_ratio=summary["diversification_ratio"],
+        risk_contributions=summary["risk_contributions"],
+        message=message)
+
+
+def _bl_views_editor(prefix: str, tickers: list[str]):
+    """Render Black-Litterman reference/delta/tau/views inputs.
+
+    Returns ``(config, error)`` where config is None when inputs are
+    invalid. Config: ``{"ref", "delta", "tau", "views"}``.
+    """
+    ref_choice = st.selectbox(
+        "Reference weights (prior)",
+        ["Current Portfolio — proxy prior", "Equal Weights — proxy prior"],
+        key=f"{prefix}_ref",
+        help="Used to reverse-engineer implied equilibrium returns.",
+    )
+    st.caption(
+        "These weights are used to reverse-engineer implied equilibrium "
+        "returns. They are not necessarily true market-cap equilibrium weights."
+    )
+    delta = st.slider(
+        "Risk aversion (δ)", 0.5, 10.0, 2.5, 0.1, format="%.1f",
+        key=f"{prefix}_delta",
+        help="Higher δ means more risk-averse posterior portfolios.",
+    )
+    with st.expander("Advanced: prior uncertainty (τ)", expanded=False):
+        tau = st.slider(
+            "Tau (τ)", 0.01, 0.30, 0.05, 0.005, format="%.3f",
+            key=f"{prefix}_tau",
+            help="τ controls uncertainty in the prior expected returns.",
+        )
+        st.caption("τ controls uncertainty in the prior expected returns.")
+    n_views_raw = st.number_input(
+        "Number of views", min_value=0, max_value=4, value=0, step=1,
+        key=f"{prefix}_nviews",
+        help="Absolute and/or relative views, each with its own confidence.",
+    )
+    n_views = int(n_views_raw)
+    views = []
+    for i in range(n_views):
+        with st.expander(f"View {i + 1}", expanded=(i == 0)):
+            vtype = st.selectbox("Type", ["Absolute", "Relative"],
+                                 key=f"{prefix}_vtype_{i}")
+            conf_pct = st.slider(
+                "Confidence (%)", 5, 95, 70, 5,
+                key=f"{prefix}_conf_{i}",
+                help="Higher confidence pulls the posterior harder toward "
+                     "the view.")
+            conf = float(conf_pct) / 100.0
+            if vtype == "Absolute":
+                tick = st.selectbox("Asset", tickers,
+                                    key=f"{prefix}_tick_{i}")
+                ret_pct = st.number_input(
+                    "Expected annual return (%)", value=10.0, step=0.5,
+                    key=f"{prefix}_ret_{i}")
+                views.append({"type": "absolute", "ticker": tick,
+                              "return": float(ret_pct) / 100.0,
+                              "confidence": conf})
+            else:
+                if len(tickers) < 2:
+                    return None, "Relative views need at least two holdings."
+                long = st.selectbox("Outperform (long)", tickers,
+                                    key=f"{prefix}_long_{i}")
+                short = st.selectbox(
+                    "Underperform (short)", tickers,
+                    index=1 if len(tickers) > 1 else 0,
+                    key=f"{prefix}_short_{i}")
+                spread = st.number_input(
+                    "Expected outperformance, annual (%)", value=3.0, step=0.5,
+                    key=f"{prefix}_spread_{i}")
+                views.append({"type": "relative", "long": long,
+                              "short": short,
+                              "return": float(spread) / 100.0,
+                              "confidence": conf})
+    return ({"ref": ref_choice, "delta": float(delta), "tau": float(tau),
+             "views": views}, None)
+
+
+def _bl_reference_weights(ref_choice: str, live_weights, tickers):
+    """Resolve Current/Equal reference weights for Black-Litterman."""
+    if ref_choice.startswith("Current"):
+        return np.asarray(live_weights, dtype=float)
+    return np.ones(len(tickers)) / len(tickers)
+
+
+def _run_bl_pipeline(tickers, cov_df, ref_choice, live_weights, delta, tau,
+                     views, rf_rate, min_w, max_w):
+    """Run BL posterior + utility allocation. Returns (posterior, alloc)."""
+    ref_w = _bl_reference_weights(ref_choice, live_weights, tickers)
+    post = black_litterman_posterior(tickers, cov_df, ref_w, delta, tau, views)
+    if not post.success or post.posterior is None:
+        alloc = AllocationResult(
+            method="Black-Litterman", success=False, weights=None,
+            expected_return=float("nan"), volatility=float("nan"),
+            sharpe=float("nan"), diversification_ratio=float("nan"),
+            risk_contributions=None, message=post.message)
+        return post, alloc
+    alloc = black_litterman_allocation(
+        tickers, post.posterior, cov_df, delta, rf_rate, min_w, max_w)
+    return post, alloc
 
 
 try:
@@ -1180,6 +1344,191 @@ with tab_optimise:
             if chosen is not None and not chosen.success:
                 detail = f" ({chosen.message})"
             st.warning(f"Optimisation did not converge for selected target.{detail}")
+
+        st.markdown("---")
+        st.markdown("### Institutional Allocation")
+        st.caption(
+            "Risk parity, maximum diversification and Black-Litterman on "
+            "**simple-return** statistics (mean × 252, covariance × 252) so "
+            "all methods are comparable. Minimum Variance / Maximum Sharpe "
+            "are re-solved here on the same simple basis (their cards above "
+            "use log-return inputs)."
+        )
+        try:
+            simp_rets = simple_returns_from_prices(prices, tickers)
+            mu_simp = annualised_mean_returns_simple(simp_rets)
+            cov_simp = annualised_covariance_simple(simp_rets)
+        except ValueError as e:
+            st.error(f"Cannot build simple-return statistics: {e}")
+            simp_ok = False
+        else:
+            simp_ok = True
+
+        if simp_ok:
+            inst_methods = st.multiselect(
+                "Allocation methods",
+                ["Current", "Equal Weight", "Min Variance", "Max Sharpe",
+                 "Risk Parity", "Max Diversification", "Black-Litterman"],
+                default=["Current", "Equal Weight", "Risk Parity",
+                         "Max Diversification"],
+                key="inst_methods",
+                help="Methods to compare side by side.")
+            bl_cfg, bl_err = None, None
+            if "Black-Litterman" in inst_methods:
+                with st.expander("Black-Litterman inputs", expanded=True):
+                    bl_cfg, bl_err = _bl_views_editor("inst_bl", tickers)
+                if bl_err:
+                    st.error(f"Black-Litterman inputs: {bl_err}")
+
+            inst_allocs: dict[str, AllocationResult] = {}
+            if "Current" in inst_methods:
+                inst_allocs["Current"] = _snapshot_alloc(
+                    "Current", weights, tickers, mu_simp.values, cov_simp,
+                    rf_rate, "Current portfolio mix.")
+            if "Equal Weight" in inst_methods:
+                inst_allocs["Equal Weight"] = _snapshot_alloc(
+                    "Equal Weight", np.ones(len(tickers)) / len(tickers),
+                    tickers, mu_simp.values, cov_simp, rf_rate,
+                    "Equal weights (1/N).")
+            if "Min Variance" in inst_methods:
+                inst_allocs["Min Variance"] = _optim_to_alloc(
+                    "Min Variance",
+                    min_variance(mu_simp.values, cov_simp.values, rf_rate,
+                                 min_w, max_w),
+                    tickers, mu_simp.values, cov_simp, rf_rate)
+            if "Max Sharpe" in inst_methods:
+                inst_allocs["Max Sharpe"] = _optim_to_alloc(
+                    "Max Sharpe",
+                    max_sharpe(mu_simp.values, cov_simp.values, rf_rate,
+                               min_w, max_w),
+                    tickers, mu_simp.values, cov_simp, rf_rate)
+            if "Risk Parity" in inst_methods:
+                inst_allocs["Risk Parity"] = equal_risk_contribution(
+                    tickers, mu_simp.values, cov_simp, rf_rate,
+                    min_w, max_w)
+            if "Max Diversification" in inst_methods:
+                inst_allocs["Max Diversification"] = maximum_diversification(
+                    tickers, mu_simp.values, cov_simp, rf_rate,
+                    min_w, max_w)
+            bl_post = None
+            if "Black-Litterman" in inst_methods:
+                if bl_err or bl_cfg is None:
+                    inst_allocs["Black-Litterman"] = AllocationResult(
+                        method="Black-Litterman", success=False, weights=None,
+                        expected_return=float("nan"), volatility=float("nan"),
+                        sharpe=float("nan"),
+                        diversification_ratio=float("nan"),
+                        risk_contributions=None,
+                        message=bl_err or "Black-Litterman inputs unavailable.")
+                else:
+                    bl_post, bl_alloc = _run_bl_pipeline(
+                        tickers, cov_simp, bl_cfg["ref"], weights,
+                        bl_cfg["delta"], bl_cfg["tau"], bl_cfg["views"],
+                        rf_rate, min_w, max_w)
+                    inst_allocs["Black-Litterman"] = bl_alloc
+
+            for _m, _a in inst_allocs.items():
+                if not _a.success:
+                    st.error(f"❌ {_m} — {_a.message}")
+            ok_allocs = {m: a for m, a in inst_allocs.items() if a.success}
+            if ok_allocs:
+                st.markdown("#### Weight Comparison")
+                wtab = pd.DataFrame(
+                    {m: a.weights for m, a in ok_allocs.items()})
+                st.dataframe(wtab.style.format("{:.1%}"),
+                             use_container_width=True)
+
+                st.markdown("#### Allocation Metrics")
+                mrows = ["Expected Return", "Volatility", "Sharpe",
+                         "Diversification Ratio", "Largest Position",
+                         "Effective Holdings", "RC Dispersion"]
+                mtab = pd.DataFrame(index=mrows)
+                for m, a in ok_allocs.items():
+                    s = allocation_summary(a.weights.values, mu_simp.values,
+                                           cov_simp, rf_rate, tickers)
+                    mtab[m] = [
+                        f"{s['expected_return']:.2%}",
+                        f"{s['volatility']:.2%}",
+                        f"{s['sharpe']:.2f}",
+                        f"{s['diversification_ratio']:.2f}",
+                        f"{s['largest_position']:.1%}",
+                        f"{s['effective_holdings']:.2f}",
+                        f"{s['rc_dispersion']:.2%}",
+                    ]
+                st.dataframe(mtab, use_container_width=True)
+                st.caption(
+                    "RC Dispersion is the std of percentage risk contributions "
+                    "(near zero = evenly spread risk, the risk-parity ideal).")
+
+                st.markdown("#### Weight Comparison Chart")
+                fig_w = go.Figure()
+                palette = px.colors.qualitative.Plotly
+                for i, (m, a) in enumerate(ok_allocs.items()):
+                    fig_w.add_trace(go.Bar(
+                        x=tickers, y=a.weights.values, name=m,
+                        marker_color=palette[i % len(palette)]))
+                fig_w.update_layout(
+                    **CHART_THEME, barmode="group",
+                    title="Target Weights by Method",
+                    xaxis_title="Ticker", yaxis_title="Weight",
+                    yaxis_tickformat=".0%",
+                )
+                st.plotly_chart(fig_w, use_container_width=True)
+
+                rc_methods = [m for m in (
+                    "Current", "Risk Parity", "Max Diversification",
+                    "Black-Litterman") if m in ok_allocs]
+                if rc_methods:
+                    st.markdown("#### Risk Contribution Comparison")
+                    fig_rc = go.Figure()
+                    for i, m in enumerate(rc_methods):
+                        fig_rc.add_trace(go.Bar(
+                            x=tickers,
+                            y=ok_allocs[m].risk_contributions.values, name=m,
+                            marker_color=palette[i % len(palette)]))
+                    fig_rc.update_layout(
+                        **CHART_THEME, barmode="group",
+                        title="Percentage Risk Contribution by Method",
+                        xaxis_title="Ticker", yaxis_title="Risk Contribution",
+                        yaxis_tickformat=".0%",
+                    )
+                    st.plotly_chart(fig_rc, use_container_width=True)
+                    st.caption(
+                        "Risk parity should show approximately equal bars "
+                        "when successful.")
+
+            if ("Black-Litterman" in ok_allocs and bl_post is not None
+                    and bl_post.success):
+                st.markdown("#### Black-Litterman Prior vs Posterior")
+                post_df = pd.DataFrame({
+                    "Ticker": tickers,
+                    "Historical Expected Return":
+                        [f"{v:.2%}" for v in mu_simp.values],
+                    "BL Prior Return":
+                        [f"{v:.2%}" for v in bl_post.prior.values],
+                    "BL Posterior Return":
+                        [f"{v:.2%}" for v in bl_post.posterior.values],
+                    "Change": [f"{(b - a):+.2%}" for a, b in zip(
+                        bl_post.prior.values, bl_post.posterior.values)],
+                }).set_index("Ticker")
+                st.dataframe(post_df, use_container_width=True)
+                _bl_ref_w = _bl_reference_weights(
+                    bl_cfg["ref"], weights, tickers)
+                _prior_ret = float(np.dot(_bl_ref_w, bl_post.prior.values))
+                _post_ret = float(np.dot(
+                    ok_allocs["Black-Litterman"].weights.values,
+                    bl_post.posterior.values))
+                d1, d2, d3 = st.columns(3)
+                d1.metric("Risk Aversion (δ)", f"{bl_cfg['delta']:.2f}")
+                d2.metric("Tau (τ)", f"{bl_cfg['tau']:.3f}")
+                d3.metric("Views", f"{bl_post.n_views}")
+                e1, e2, e3 = st.columns(3)
+                e1.metric("Prior Expected Return", f"{_prior_ret:.2%}",
+                          help="Reference weights × prior returns.")
+                e2.metric("Posterior Expected Return", f"{_post_ret:.2%}",
+                          help="BL weights × posterior returns.")
+                e3.metric("BL Sharpe",
+                          f"{ok_allocs['Black-Litterman'].sharpe:.2f}")
 
 
 # ============================================================
@@ -2277,6 +2626,260 @@ with tab_backtest:
     else:
         st.caption("Advanced details need a portfolio strategy selected above.")
 
+    # ---- Static Out-of-Sample Allocation Comparison ----
+    st.markdown("---")
+    st.markdown("### Static Out-of-Sample Allocation Comparison")
+    st.caption(
+        "Portfolio weights are estimated using data **strictly before** the "
+        "test period, then frozen throughout the historical test. No "
+        "re-estimation occurs during the test; periodic rebalancing (if any) "
+        "returns to those same frozen weights."
+    )
+    oo1, oo2, oo3, oo4 = st.columns(4)
+    with oo1:
+        _oos_default = max(
+            bt_min_date,
+            (pd.Timestamp(bt_max_date) - pd.DateOffset(years=3)).date())
+        oos_start = st.date_input(
+            "Test Start Date", value=_oos_default,
+            min_value=bt_min_date, max_value=bt_max_date, key="oos_start",
+            help="Estimation uses only data strictly before this date.")
+    with oo2:
+        oos_lookback = st.selectbox(
+            "Estimation Lookback", [1, 2, 3, 5], index=2, key="oos_lookback",
+            format_func=lambda y: f"{y} Year{'s' if y > 1 else ''} (~{y * 252} obs)",
+            help="Calendar years of history ending strictly before test start.")
+    with oo3:
+        oos_freq_label = st.selectbox(
+            "Test Rebalancing",
+            ["Monthly", "Quarterly", "Semi-annual", "Annual"],
+            index=1, key="oos_freq",
+            help="Rebalance during the test back to the frozen weights.")
+    with oo4:
+        oos_costs = st.number_input(
+            "Test Costs (bps)", min_value=0.0, max_value=1000.0,
+            value=10.0, step=1.0, key="oos_costs")
+
+    os1, os2, os3 = st.columns(3)
+    with os1:
+        oos_eq = st.checkbox("Equal Weight", value=True, key="oos_eq")
+        oos_mv = st.checkbox("Minimum Variance", value=False, key="oos_mv")
+    with os2:
+        oos_ms = st.checkbox("Maximum Sharpe", value=False, key="oos_ms")
+        oos_erc = st.checkbox("Risk Parity", value=True, key="oos_erc")
+    with os3:
+        oos_md = st.checkbox("Max Diversification", value=True, key="oos_md")
+        oos_bl = st.checkbox("Black-Litterman", value=False, key="oos_bl")
+    oos_cur = st.checkbox(
+        "Current Weights — Retrospective", value=False, key="oos_cur",
+        help="Today's mix evaluated over the test window — a retrospective "
+             "hypothetical with hindsight.")
+    if oos_cur:
+        st.caption(
+            "Current Weights — Retrospective uses today's live weights over "
+            "the test window; treat it as a hindsight benchmark, not an "
+            "achievable historical strategy.")
+
+    oos_bl_cfg, oos_bl_err = None, None
+    oos_delta_bench = False
+    if oos_bl:
+        with st.expander("Black-Litterman inputs (out-of-sample)", expanded=True):
+            oos_bl_cfg, oos_bl_err = _bl_views_editor("oos_bl", tickers)
+            oos_delta_bench = st.checkbox(
+                "Estimate δ from benchmark (estimation window)", value=False,
+                key="oos_delta_bench",
+                help="δ = (benchmark excess return) / (benchmark variance), "
+                     "annualised simple units over the estimation window. "
+                     "Falls back to the slider on invalid estimates.")
+        if oos_bl_err:
+            st.error(f"Black-Litterman inputs: {oos_bl_err}")
+        st.warning(
+            "Black-Litterman views are treated as assumptions available at "
+            "the test start date. Historical results are hypothetical and "
+            "may contain human hindsight if the views were created using "
+            "later knowledge.")
+
+    try:
+        oos_T = pd.Timestamp(oos_start)
+        oos_est, oos_info = estimation_window(
+            bt_full, tickers, oos_T, float(oos_lookback))
+    except ValueError as e:
+        st.error(f"Estimation window: {e}")
+        st.stop()
+    st.caption(
+        f"Estimation period: {oos_info['est_start']} to {oos_info['est_end']} "
+        f"({oos_info['n_obs']:,} trading days); test starts "
+        f"{oos_info['test_start']}. No observation dated ≥ test start "
+        "entered estimation."
+    )
+    try:
+        oos_prices, oos_notes = prepare_backtest_data(
+            bt_full, tickers, oos_T, pd.Timestamp(bt_end))
+    except ValueError as e:
+        st.error(f"Test window: {e}")
+        st.stop()
+    for _note in oos_notes:
+        st.warning(_note)
+
+    oos_bench_full = None
+    if bench_sym_bt is not None:
+        try:
+            oos_bench_full = load_benchmark_data(bench_sym_bt, "max")
+        except ValueError as e:
+            st.warning(f"Out-of-sample benchmark unavailable: {e}")
+        except Exception:
+            st.warning("Could not load benchmark data (network or API error).")
+
+    try:
+        oos_rets = simple_returns_from_prices(oos_est, tickers)
+        oos_mu = annualised_mean_returns_simple(oos_rets)
+        oos_cov = annualised_covariance_simple(oos_rets)
+    except ValueError as e:
+        st.error(f"Estimation statistics: {e}")
+        st.stop()
+
+    _oos_freq = {"Monthly": "monthly", "Quarterly": "quarterly",
+                 "Semi-annual": "semi-annual", "Annual": "annual"}[oos_freq_label]
+    _oos_cap = float(bt_capital)
+    _oos_cost = float(oos_costs)
+    oos_results: dict = {}
+    try:
+        if oos_eq:
+            oos_results["Equal Weight"] = backtest_rebalanced(
+                oos_prices, np.ones(len(tickers)) / len(tickers),
+                _oos_cap, _oos_freq, _oos_cost, rf_rate,
+                name="Equal Weight (OOS)")
+        if oos_mv:
+            _r = min_variance(oos_mu.values, oos_cov.values, rf_rate, 0.0, 1.0)
+            if _r.success and _r.weights is not None:
+                oos_results["Minimum Variance"] = backtest_rebalanced(
+                    oos_prices, _r.weights, _oos_cap, _oos_freq, _oos_cost,
+                    rf_rate, name="Minimum Variance (OOS)")
+            else:
+                st.error(f"❌ Minimum Variance estimation failed: {_r.message}")
+        if oos_ms:
+            _r = max_sharpe(oos_mu.values, oos_cov.values, rf_rate, 0.0, 1.0)
+            if _r.success and _r.weights is not None:
+                oos_results["Maximum Sharpe"] = backtest_rebalanced(
+                    oos_prices, _r.weights, _oos_cap, _oos_freq, _oos_cost,
+                    rf_rate, name="Maximum Sharpe (OOS)")
+            else:
+                st.error(f"❌ Maximum Sharpe estimation failed: {_r.message}")
+        if oos_erc:
+            _r = equal_risk_contribution(
+                tickers, oos_mu.values, oos_cov, rf_rate, 0.0, 1.0)
+            if _r.success and _r.weights is not None:
+                oos_results["Risk Parity"] = backtest_rebalanced(
+                    oos_prices, _r.weights.values, _oos_cap, _oos_freq,
+                    _oos_cost, rf_rate, name="Risk Parity (OOS)")
+            else:
+                st.error(f"❌ Risk Parity estimation failed: {_r.message}")
+        if oos_md:
+            _r = maximum_diversification(
+                tickers, oos_mu.values, oos_cov, rf_rate, 0.0, 1.0)
+            if _r.success and _r.weights is not None:
+                oos_results["Max Diversification"] = backtest_rebalanced(
+                    oos_prices, _r.weights.values, _oos_cap, _oos_freq,
+                    _oos_cost, rf_rate, name="Max Diversification (OOS)")
+            else:
+                st.error(f"❌ Max Diversification estimation failed: {_r.message}")
+        if oos_bl:
+            if oos_bl_err or oos_bl_cfg is None:
+                st.error(f"❌ Black-Litterman inputs: "
+                         f"{oos_bl_err or 'unavailable'}")
+            else:
+                _oos_delta = oos_bl_cfg["delta"]
+                if oos_delta_bench:
+                    if oos_bench_full is None:
+                        st.warning("Benchmark δ estimate unavailable — "
+                                   "using the slider value.")
+                    else:
+                        try:
+                            _bwin = oos_bench_full.loc[
+                                (oos_bench_full.index >= pd.Timestamp(
+                                    oos_info["est_start"]))
+                                & (oos_bench_full.index < oos_T)].dropna()
+                            if len(_bwin) < 2:
+                                raise ValueError("too few benchmark points")
+                            _br = _bwin.pct_change().dropna()
+                            _oos_delta = estimate_risk_aversion_from_benchmark(
+                                float(_br.mean() * 252 - rf_rate),
+                                float(_br.var() * 252))
+                            st.caption(f"Benchmark-implied δ = {_oos_delta:.2f} "
+                                       f"(estimation window).")
+                        except ValueError as e:
+                            st.warning(f"Benchmark δ estimate rejected ({e}) — "
+                                       "using the slider value.")
+                _oos_post, _oos_alloc = _run_bl_pipeline(
+                    tickers, oos_cov, oos_bl_cfg["ref"], weights,
+                    _oos_delta, oos_bl_cfg["tau"], oos_bl_cfg["views"],
+                    rf_rate, 0.0, 1.0)
+                if _oos_alloc.success and _oos_alloc.weights is not None:
+                    oos_results["Black-Litterman"] = backtest_rebalanced(
+                        oos_prices, _oos_alloc.weights.values, _oos_cap,
+                        _oos_freq, _oos_cost, rf_rate,
+                        name="Black-Litterman (OOS)")
+                else:
+                    st.error(f"❌ Black-Litterman estimation failed: "
+                             f"{_oos_alloc.message}")
+        if oos_cur:
+            oos_results["Current — Retrospective"] = backtest_rebalanced(
+                oos_prices, np.asarray(weights, dtype=float),
+                _oos_cap, _oos_freq, _oos_cost, rf_rate,
+                name="Current — Retrospective (OOS)")
+        if oos_bench_full is not None and bench_sym_bt is not None:
+            try:
+                oos_results[bench_sym_bt] = backtest_benchmark(
+                    oos_bench_full, oos_prices.index, _oos_cap, rf_rate,
+                    name=f"{bench_sym_bt} (OOS)")
+            except ValueError as e:
+                st.warning(f"Out-of-sample benchmark skipped: {e}")
+    except ValueError as e:
+        st.error(f"Out-of-sample backtest failed: {e}")
+        st.stop()
+    if not oos_results:
+        st.info("Select at least one out-of-sample strategy.")
+        st.stop()
+
+    st.markdown(f"### Out-of-Sample Growth of {fmt_usd(_oos_cap)}")
+    st.plotly_chart(plot_backtest_growth(oos_results, _oos_cap),
+                    use_container_width=True)
+    st.caption(
+        f"Test window: {oos_prices.index[0].date()} to "
+        f"{oos_prices.index[-1].date()} ({len(oos_prices):,} trading days); "
+        "all lines start at the same initial capital."
+    )
+
+    st.markdown("### Out-of-Sample Comparison")
+    _oos_table = compare_backtests(oos_results)
+    _oos_disp = pd.DataFrame(index=_oos_table.index)
+    for _col in _oos_table.columns:
+        _is_bench = oos_results[_col].is_benchmark
+        _cells = []
+        for _metric in _oos_table.index:
+            _v = _oos_table.loc[_metric, _col]
+            if _metric == "Total Costs" and _is_bench:
+                _cells.append("N/A")
+            elif _metric in ("Final Value", "Total Costs"):
+                _cells.append(fmt_usd(_v))
+            elif _metric in ("Total Return", "CAGR", "Annualised Return",
+                             "Volatility", "Max Drawdown", "Best Day",
+                             "Worst Day"):
+                _cells.append(fmt_pct(_v))
+            elif _metric in ("Sharpe", "Sortino", "Calmar"):
+                _cells.append(f"{_v:.2f}")
+            elif _metric == "Rebalances":
+                _cells.append(f"{int(_v)}")
+            else:
+                _cells.append(str(_v))
+        _oos_disp[_col] = _cells
+    st.dataframe(_oos_disp, use_container_width=True)
+    st.caption(
+        "Benchmark Total Costs show as N/A (the passive leg is not "
+        "cost-modelled). Frozen estimation weights were never re-estimated "
+        "during the test."
+    )
+
 
 # ============================================================
 # TAB 8 — FACTOR ANALYSIS
@@ -2477,6 +3080,13 @@ with tab_factors:
     except ValueError as e:
         st.error(f"Regression failed: {e}")
         st.stop()
+
+    st.caption(
+        f"Factor sample: {_y_al.index[0].date()} – {_y_al.index[-1].date()} "
+        f"({_res.observations:,} observations). Portfolio observations after "
+        f"{_y_al.index[-1].date()} are excluded because factor observations "
+        "are not yet available."
+    )
 
     # ---- Factor Exposures (2 rows × 3, short values) ----
     st.markdown("---")
