@@ -205,6 +205,17 @@ from analytics.validation import (
     validate_ticker_symbol,
     validate_weight_bounds,
 )
+from analytics.walkforward import (
+    BL_HINDSIGHT_WARNING,
+    HINDSIGHT_WARNING,
+    RF_CONSTANT_NOTE,
+    SURVIVORSHIP_WARNING,
+    WALK_FORWARD_LABELS,
+    WalkForwardConfig,
+    ex_ante_realised_frame,
+    run_walk_forward,
+    turnover_diagnostics,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1162,15 +1173,23 @@ def _snapshot_alloc(method, w, tickers, mu_s, cov_df, rf, message):
         message=message)
 
 
-def _bl_views_editor(prefix: str, tickers: list[str]):
+def _bl_views_editor(prefix: str, tickers: list[str],
+                     ref_default: str | None = None):
     """Render Black-Litterman reference/delta/tau/views inputs.
 
     Returns ``(config, error)`` where config is None when inputs are
-    invalid. Config: ``{"ref", "delta", "tau", "views"}``.
+    invalid. Config: ``{"ref", "delta", "tau", "views"}``. ``ref_default``
+    optionally preselects the reference prior (walk-forward defaults to
+    the Equal Weights proxy prior for genuine OOS).
     """
+    _ref_options = ["Current Portfolio — proxy prior",
+                    "Equal Weights — proxy prior"]
+    _ref_index = (_ref_options.index(ref_default) if ref_default in _ref_options
+                  else 0)
     ref_choice = st.selectbox(
         "Reference weights (prior)",
-        ["Current Portfolio — proxy prior", "Equal Weights — proxy prior"],
+        _ref_options,
+        index=_ref_index,
         key=f"{prefix}_ref",
         help="Used to reverse-engineer implied equilibrium returns.",
     )
@@ -1258,6 +1277,37 @@ def _run_bl_pipeline(tickers, cov_df, ref_choice, live_weights, delta, tau,
     alloc = black_litterman_allocation(
         tickers, post.posterior, cov_df, delta, rf_rate, min_w, max_w)
     return post, alloc
+
+
+def _render_backtest_comparison(results: dict) -> None:
+    """Render a formatted strategy-comparison table (raw values stay numeric).
+
+    Shared by the static OOS and walk-forward sections so both format
+    identically. Benchmark Total Costs render as N/A via ``is_benchmark``.
+    """
+    _table = compare_backtests(results)
+    _disp = pd.DataFrame(index=_table.index)
+    for _col in _table.columns:
+        _is_bench = results[_col].is_benchmark
+        _cells = []
+        for _metric in _table.index:
+            _v = _table.loc[_metric, _col]
+            if _metric == "Total Costs" and _is_bench:
+                _cells.append("N/A")
+            elif _metric in ("Final Value", "Total Costs"):
+                _cells.append(fmt_usd(_v))
+            elif _metric in ("Total Return", "CAGR", "Annualised Return",
+                             "Volatility", "Max Drawdown", "Best Day",
+                             "Worst Day"):
+                _cells.append(fmt_pct(_v))
+            elif _metric in ("Sharpe", "Sortino", "Calmar"):
+                _cells.append(f"{_v:.2f}")
+            elif _metric == "Rebalances":
+                _cells.append(f"{int(_v)}")
+            else:
+                _cells.append(str(_v))
+        _disp[_col] = _cells
+    st.dataframe(_disp, use_container_width=True)
 
 
 try:
@@ -3232,6 +3282,455 @@ with tab_backtest:
         "be subject to survivorship and selection bias."
     )
 
+
+    # Benchmark symbol (shared by static, OOS and walk-forward).
+    try:
+        bench_sym_bt = validate_ticker_symbol(st.session_state.bt_benchmark)
+    except ValueError as e:
+        st.error(f"Invalid benchmark ticker: {e}")
+        bench_sym_bt = None
+
+    # ---- Walk-Forward Optimisation (estimate → invest → re-estimate) ----
+    st.markdown("---")
+    st.markdown("### Walk-Forward Optimisation")
+    st.caption(
+        "Each rebalance re-estimates its target portfolio using only data "
+        "dated **strictly before** the execution date — then trades to that "
+        "target at the execution-day close. This answers: had this "
+        "construction process actually been run through time, how would it "
+        "have performed? Unlike the static comparison above, nothing here "
+        "is frozen: targets evolve as estimation windows roll forward."
+    )
+    st.caption(SURVIVORSHIP_WARNING)
+    st.caption(HINDSIGHT_WARNING)
+
+    wf1, wf2, wf3, wf4 = st.columns(4)
+    with wf1:
+        _wf_start_default = max(
+            bt_min_date,
+            (pd.Timestamp(bt_max_date) - pd.DateOffset(years=5)).date())
+        wf_start = st.date_input(
+            "Test Start", value=_wf_start_default,
+            min_value=bt_min_date, max_value=bt_max_date, key="wf_start",
+            help="Estimation for the initial allocation uses only data "
+                 "strictly before this date.")
+        wf_end = st.date_input(
+            "Test End", value=bt_max_date,
+            min_value=bt_min_date, max_value=bt_max_date, key="wf_end",
+            help="Last date of the simulated test window.")
+    with wf2:
+        wf_lookback = st.selectbox(
+            "Estimation Lookback", [1, 2, 3, 5], index=2, key="wf_lookback",
+            format_func=lambda y: f"{y} Year{'s' if y > 1 else ''} (~{y * 252} obs)",
+            help="Calendar years of history ending strictly before each "
+                 "execution date (rolling), or ignored in expanding mode.")
+        wf_window = st.selectbox(
+            "Window Type", ["Rolling", "Expanding"], index=0, key="wf_window",
+            help="Rolling uses only the trailing lookback; expanding uses "
+                 "all history available before each execution date.")
+    with wf3:
+        wf_freq_label = st.selectbox(
+            "Rebalance Frequency",
+            ["Monthly", "Quarterly", "Semi-annual", "Annual"],
+            index=1, key="wf_freq",
+            help="Scheduled dates map to the first trading day on or after "
+                 "each calendar mark; training always ends before that day.")
+        wf_costs = st.number_input(
+            "Transaction Cost (bps)", min_value=0.0, max_value=1000.0,
+            value=10.0, step=1.0, key="wf_costs")
+    with wf4:
+        wf_minw = st.slider(
+            "Min weight per asset", 0.0, 0.5, 0.0, 0.05, format="%.2f",
+            key="wf_minw")
+        wf_maxw = st.slider(
+            "Max weight per asset", 0.5, 1.0, 1.0, 0.05, format="%.2f",
+            key="wf_maxw")
+
+    wm1, wm2, wm3 = st.columns(3)
+    with wm1:
+        wf_m_mv = st.checkbox("Minimum Variance", value=True, key="wf_m_mv")
+        wf_m_ms = st.checkbox("Maximum Sharpe", value=False, key="wf_m_ms")
+    with wm2:
+        wf_m_erc = st.checkbox("ERC", value=True, key="wf_m_erc")
+        wf_m_md = st.checkbox("Max Diversification", value=True,
+                              key="wf_m_md")
+    with wm3:
+        wf_m_bl = st.checkbox("Black-Litterman", value=False, key="wf_m_bl")
+    wf_eq = st.checkbox(
+        "Equal Weight (no optimisation)", value=True, key="wf_eq",
+        help="Constant 1/N targets rebalanced on the same schedule — "
+             "never optimised.")
+    _wf_methods = ([m for m, on in
+                    (("min_variance", wf_m_mv), ("max_sharpe", wf_m_ms),
+                     ("erc", wf_m_erc), ("max_diversification", wf_m_md),
+                     ("black_litterman", wf_m_bl)) if on])
+    _wf_labels = [WALK_FORWARD_LABELS[m] for m in _wf_methods]
+    if _wf_labels:
+        wc1, wc2 = st.columns(2)
+        with wc1:
+            wf_static_method = st.selectbox(
+                "Static counterpart method", _wf_labels, index=0,
+                key="wf_static_method",
+                help="Frozen initial targets of this method, rebalanced on "
+                     "the same schedule — answers whether re-estimating "
+                     "actually helped.")
+        with wc2:
+            wf_drag_method = st.selectbox(
+                "Cost-drag twin (0 bps) for", ["None"] + _wf_labels, index=0,
+                key="wf_drag_method",
+                help="Re-runs one method's exact target schedule at zero "
+                     "cost; drag = gross final − net final (compounding "
+                     "included, not summed costs).")
+    else:
+        wf_static_method, wf_drag_method = None, "None"
+
+    wf_bl_cfg, wf_bl_err = None, None
+    wf_delta_bench = False
+    if wf_m_bl:
+        with st.expander("Black-Litterman inputs (walk-forward)",
+                         expanded=True):
+            wf_bl_cfg, wf_bl_err = _bl_views_editor(
+                "wf_bl", tickers,
+                ref_default="Equal Weights — proxy prior")
+            wf_delta_bench = st.checkbox(
+                "Estimate δ from benchmark (each training window)",
+                value=False, key="wf_delta_bench",
+                help="δ is recalculated per rebalance from that window's "
+                     "benchmark observations only; falls back to the slider "
+                     "on invalid estimates.")
+        if wf_bl_err:
+            st.error(f"Black-Litterman inputs: {wf_bl_err}")
+        st.warning(BL_HINDSIGHT_WARNING)
+        if wf_bl_cfg is not None and wf_bl_cfg["ref"].startswith("Current"):
+            st.warning(
+                "Current-Portfolio reference uses today's weights — labelled "
+                "RETROSPECTIVE and excluded from strict out-of-sample claims. "
+                "Prefer the Equal Weights prior for genuine walk-forward.")
+
+    _wf_key = (tuple(tickers), str(wf_start), str(wf_end), int(wf_lookback),
+               str(wf_window), str(wf_freq_label), float(wf_costs),
+               float(wf_minw), float(wf_maxw), tuple(_wf_methods),
+               str(wf_static_method), str(wf_drag_method),
+               repr(wf_bl_cfg), bool(wf_delta_bench), str(base_ccy),
+               float(bt_capital), float(rf_rate), str(bench_sym_bt))
+    _wf_freq = {"Monthly": "monthly", "Quarterly": "quarterly",
+                "Semi-annual": "semi-annual",
+                "Annual": "annual"}[wf_freq_label]
+
+    if st.button("Run Walk-Forward Analysis", key="wf_run"):
+        if not _wf_methods:
+            st.error("Select at least one walk-forward method.")
+            st.stop()
+        if wf_m_bl and (wf_bl_err or wf_bl_cfg is None):
+            st.error(f"Black-Litterman inputs: "
+                     f"{wf_bl_err or 'unavailable'}")
+            st.stop()
+        try:
+            # Convert only the era the run can touch (estimation lookback
+            # + test window, with a 1-year buffer for calendar edges): full
+            # max-history conversion would fail on ancient FX gaps (e.g. a
+            # 1988 listing vs FX history from 2003) that this window never
+            # needs. Gaps INSIDE the needed era still raise honestly below.
+            _wf_need_from = (pd.Timestamp(wf_start) - pd.DateOffset(
+                years=int(wf_lookback) + 1)).date()
+            _wf_native = bt_full.loc[
+                pd.Timestamp(_wf_need_from):pd.Timestamp(wf_end)]
+            if _wf_native.empty:
+                raise ValueError("no market history covers the selected "
+                                 "walk-forward era.")
+            _wf_base_full = base_price_panel(
+                _wf_native, tickers, instruments, ccy.get("fx_hist"),
+                base_ccy)
+        except ValueError as e:
+            st.error(f"Base-currency panel: {e}")
+            st.stop()
+        _wf_bench_full = None
+        if bench_sym_bt is not None:
+            try:
+                _wf_bench_nat = load_benchmark_data(bench_sym_bt, "max")
+                _wf_bench_nat = _wf_bench_nat.loc[
+                    pd.Timestamp(_wf_need_from):pd.Timestamp(wf_end)]
+                _wf_bench_full = base_benchmark_series(
+                    _wf_bench_nat, bench_sym_bt,
+                    base_ccy, ccy.get("fx_hist"))
+            except ValueError as e:
+                st.warning(f"Walk-forward benchmark unavailable: {e}")
+            except Exception:
+                st.warning("Could not load benchmark data "
+                           "(network or API error).")
+        _wf_results: dict = {}
+        _wf_ok = True
+        for _m in _wf_methods:
+            _bcfg = WalkForwardConfig(
+                method=_m, test_start=wf_start, test_end=wf_end,
+                lookback_years=float(wf_lookback),
+                window_type=str(wf_window).lower(),
+                rebalance_frequency=_wf_freq,
+                transaction_cost_bps=float(wf_costs),
+                base_currency=base_ccy, min_weight=float(wf_minw),
+                max_weight=float(wf_maxw), risk_free_annual=float(rf_rate))
+            if _m == "black_litterman":
+                _bcfg.bl_views = list(wf_bl_cfg["views"])
+                _bcfg.bl_delta = float(wf_bl_cfg["delta"])
+                _bcfg.bl_tau = float(wf_bl_cfg["tau"])
+                _bcfg.bl_delta_from_benchmark = bool(wf_delta_bench)
+                if wf_bl_cfg["ref"].startswith("Current"):
+                    _bcfg.bl_ref = "retrospective_current"
+                    _bcfg.bl_ref_weights = np.asarray(weights, dtype=float)
+            try:
+                _res = run_walk_forward(
+                    _wf_base_full, tickers, _bcfg, float(bt_capital),
+                    benchmark_base=_wf_bench_full)
+            except ValueError as e:
+                st.error(f"Walk-forward {WALK_FORWARD_LABELS[_m]} failed: {e}")
+                _wf_ok = False
+                continue
+            if not _res.success:
+                st.error(f"Walk-forward {WALK_FORWARD_LABELS[_m]} failed: "
+                         f"{_res.message}")
+                _wf_ok = False
+                continue
+            _wf_results[f"WF {WALK_FORWARD_LABELS[_m]}"] = _res
+        if not _wf_results:
+            st.error("No walk-forward strategy completed.")
+            st.stop()
+        # Static counterpart: frozen INITIAL targets of the selected method
+        # on the identical window/capital/costs/schedule (fair comparison).
+        _wf_static: dict = {}
+        try:
+            _w0_name = f"WF {wf_static_method}"
+            _w0 = _wf_results[_w0_name].target_weights.iloc[0].values
+            _static_window, _ = prepare_backtest_data(
+                _wf_base_full, tickers, pd.Timestamp(wf_start),
+                pd.Timestamp(wf_end))
+            _wf_static[f"Static {wf_static_method}"] = backtest_rebalanced(
+                _static_window, _w0, float(bt_capital), _wf_freq,
+                float(wf_costs), float(rf_rate),
+                name=f"Static {wf_static_method}")
+            if wf_eq:
+                _wf_static["Equal Weight"] = backtest_rebalanced(
+                    _static_window, np.ones(len(tickers)) / len(tickers),
+                    float(bt_capital), _wf_freq, float(wf_costs),
+                    float(rf_rate), name="Equal Weight")
+        except (ValueError, KeyError) as e:
+            st.warning(f"Static counterpart unavailable: {e}")
+        if _wf_bench_full is not None and bench_sym_bt is not None:
+            try:
+                _wf_static[bench_sym_bt] = backtest_benchmark(
+                    _wf_bench_full, _static_window.index, float(bt_capital),
+                    float(rf_rate), name=bench_sym_bt)
+            except (ValueError, NameError) as e:
+                st.warning(f"Walk-forward benchmark skipped: {e}")
+            except Exception:
+                st.warning("Walk-forward benchmark skipped "
+                           "(network or API error).")
+        # Zero-cost twin for the drag diagnostic (same targets by
+        # deterministic construction — verified in tests).
+        _wf_drag: dict = {}
+        if wf_drag_method and wf_drag_method != "None":
+            _dm = [m for m in _wf_methods
+                   if WALK_FORWARD_LABELS[m] == wf_drag_method]
+            if _dm:
+                _dcfg = WalkForwardConfig(
+                    method=_dm[0], test_start=wf_start, test_end=wf_end,
+                    lookback_years=float(wf_lookback),
+                    window_type=str(wf_window).lower(),
+                    rebalance_frequency=_wf_freq, transaction_cost_bps=0.0,
+                    base_currency=base_ccy, min_weight=float(wf_minw),
+                    max_weight=float(wf_maxw),
+                    risk_free_annual=float(rf_rate))
+                if _dm[0] == "black_litterman":
+                    _dcfg.bl_views = list(wf_bl_cfg["views"])
+                    _dcfg.bl_delta = float(wf_bl_cfg["delta"])
+                    _dcfg.bl_tau = float(wf_bl_cfg["tau"])
+                    _dcfg.bl_delta_from_benchmark = bool(wf_delta_bench)
+                    if wf_bl_cfg["ref"].startswith("Current"):
+                        _dcfg.bl_ref = "retrospective_current"
+                        _dcfg.bl_ref_weights = np.asarray(weights,
+                                                          dtype=float)
+                try:
+                    _dres = run_walk_forward(
+                        _wf_base_full, tickers, _dcfg, float(bt_capital),
+                        benchmark_base=_wf_bench_full)
+                    if _dres.success:
+                        _wf_drag[f"WF {wf_drag_method} (0 bps)"] = _dres
+                except ValueError as e:
+                    st.warning(f"Zero-cost twin unavailable: {e}")
+        st.session_state["wf_results"] = {
+            "key": _wf_key, "dynamic": _wf_results, "static": _wf_static,
+            "drag": _wf_drag,
+            "test_window": (str(wf_start), str(wf_end)),
+        }
+        if not _wf_ok:
+            st.warning("Some walk-forward methods failed — completed "
+                       "strategies are shown below; failures carry no "
+                       "invented weights.")
+
+    _wf_cached = st.session_state.get("wf_results")
+    if _wf_cached and _wf_cached.get("key") != _wf_key:
+        st.info("Walk-forward inputs changed — press Run Walk-Forward "
+                "Analysis to refresh the results below.")
+        _wf_cached = None
+    if _wf_cached:
+        _wf_dyn = _wf_cached["dynamic"]
+        _wf_stat = _wf_cached.get("static", {})
+        _wf_all = {**_wf_dyn, **_wf_stat, **_wf_cached.get("drag", {})}
+        _wf_cap = float(bt_capital)
+        st.markdown(f"### Walk-Forward Growth of {fmt_usd(_wf_cap)}")
+        st.plotly_chart(plot_backtest_growth(_wf_all, _wf_cap,
+                                             currency=base_ccy),
+                        use_container_width=True)
+        st.caption(
+            f"Test window: {_wf_cached['test_window'][0]} to "
+            f"{_wf_cached['test_window'][1]}. Static lines freeze the "
+            "selected method's initial walk-forward targets; dynamic lines "
+            "re-estimate at every event using only strictly-prior data. "
+            "Same window, capital, currency, universe and costs throughout."
+        )
+        st.markdown("### Walk-Forward vs Static Comparison")
+        _render_backtest_comparison(_wf_all)
+        st.caption(
+            "Benchmark Total Costs show as N/A (the passive leg is not "
+            "cost-modelled)."
+        )
+
+        st.markdown("### Turnover Diagnostics")
+        _to_rows = []
+        for _nm, _r in _wf_dyn.items():
+            _td = turnover_diagnostics(_r)
+            _to_rows.append({
+                "Strategy": _nm,
+                "Scheduled": _td["n_scheduled"],
+                "Successful": _td["n_successful"],
+                "Failed/Skipped": _td["n_failed"],
+                "Avg Turnover": fmt_pct(_td["avg_turnover"]),
+                "Median Turnover": fmt_pct(_td["median_turnover"]),
+                "Max Turnover": fmt_pct(_td["max_turnover"]),
+                "Cumulative Turnover": fmt_pct(_td["cumulative_turnover"]),
+                "Total Costs": fmt_usd(_td["total_costs"]),
+            })
+        st.dataframe(pd.DataFrame(_to_rows), use_container_width=True,
+                     hide_index=True)
+        _drag_res = _wf_cached.get("drag", {})
+        if _drag_res:
+            _dnm = next(iter(_drag_res))
+            _gross = _drag_res[_dnm].metrics["final_value"]
+            _base_nm = _dnm.replace(" (0 bps)", "")
+            if _base_nm in _wf_dyn:
+                _net = _wf_dyn[_base_nm].metrics["final_value"]
+                d1, d2, d3 = st.columns(3)
+                d1.metric("Gross Final Value (0 bps)", fmt_usd(_gross))
+                d2.metric("Net Final Value", fmt_usd(_net))
+                d3.metric("Transaction Cost Drag", fmt_usd(_gross - _net),
+                          help="Zero-cost final wealth minus net final "
+                               "wealth — lost compounding included, not "
+                               "summed costs.")
+        st.caption(RF_CONSTANT_NOTE)
+        st.caption(
+            "Currency conversion covers the estimation era onward (lookback "
+            "plus test window); older history the run cannot touch is never "
+            "converted. Per-event training windows are listed in the event "
+            "table below.")
+
+        _wf_names = list(_wf_dyn.keys())
+        _wf_chart = st.selectbox(
+            "Detail strategy", _wf_names, index=0, key="wf_chart_method",
+            help="Drives the allocation, event and drawdown views below.")
+        _wr = _wf_dyn[_wf_chart]
+        st.markdown(f"### Allocation Through Time — {_wf_chart}")
+        if _wr.target_weights is not None and not _wr.target_weights.empty:
+            st.plotly_chart(plot_weight_drift(
+                _wr.target_weights, title=f"Target Allocation — {_wf_chart}"),
+                use_container_width=True)
+            st.caption(
+                "Estimated target weights at each successful rebalance "
+                "(re-estimated from strictly-prior data); holdings drift "
+                "between events.")
+            with st.expander("Target weights by date (CSV)", expanded=False):
+                st.dataframe(_wr.target_weights.style.format("{:.2%}"),
+                             use_container_width=True)
+                st.download_button(
+                    "Download target weights (CSV)",
+                    data=_wr.target_weights.to_csv().encode("utf-8"),
+                    file_name="walkforward-target-weights.csv",
+                    mime="text/csv", key="wf_dl_weights")
+            _stab = _wr.metrics
+            s1, s2 = st.columns(2)
+            s1.metric("Mean |Δ target| (L1)",
+                      f"{_stab.get('weight_stability_l1_mean', 0.0):.2%}",
+                      help="Average absolute target-weight change between "
+                           "consecutive events.")
+            s2.metric("Max |Δ target| (L1)",
+                      f"{_stab.get('weight_stability_l1_max', 0.0):.2%}")
+        st.markdown(f"### Rebalance Events — {_wf_chart}")
+        _ev = _wr.events.copy()
+        if not _ev.empty:
+            _ev_disp = pd.DataFrame({
+                "Execution Date": pd.to_datetime(
+                    _ev["Execution Date"]).dt.date,
+                "Training Start": pd.to_datetime(
+                    _ev["Training Start"]).dt.date,
+                "Training End": pd.to_datetime(
+                    _ev["Training End"]).dt.date,
+                "Method": _ev["Method"],
+                "Status": _ev["Status"],
+                "Turnover": _ev["Turnover"].map(fmt_pct),
+                "Transaction Cost": _ev["Transaction Cost"].map(fmt_usd),
+                "Value Before": _ev["Portfolio Value Before"].map(fmt_usd),
+                "Value After": _ev["Portfolio Value After"].map(fmt_usd),
+                "Reason": _ev["Reason"],
+            })
+            st.dataframe(_ev_disp, use_container_width=True, hide_index=True)
+            if not _wr.failures.empty:
+                st.warning(
+                    f"{len(_wr.failures)} rebalance(s) failed/skipped — "
+                    "holdings were kept and the run continued. See Reason "
+                    "above; no fallback weights were invented.")
+            st.download_button(
+                "Download rebalance events (CSV)",
+                data=_wr.events.to_csv(index=False).encode("utf-8"),
+                file_name="walkforward-events.csv",
+                mime="text/csv", key="wf_dl_events")
+            st.download_button(
+                "Download wealth path (CSV)",
+                data=_wr.values.rename("value").to_csv().encode("utf-8"),
+                file_name="walkforward-wealth.csv",
+                mime="text/csv", key="wf_dl_wealth")
+            st.caption(
+                f"Base Currency: {base_ccy}; method: {_wf_chart}; lookback: "
+                f"{wf_lookback}y {str(wf_window).lower()}; frequency: "
+                f"{wf_freq_label}; costs: {float(wf_costs):g} bps.")
+        st.markdown(f"### Estimated vs Realised — {_wf_chart}")
+        st.dataframe(ex_ante_realised_frame(_wr), use_container_width=True,
+                     hide_index=True)
+        st.caption(
+            "Ex-ante estimates are labelled 'Estimated at rebalance' and are "
+            "not predictions — realised performance below is historical fact, "
+            "not a forecast test.")
+        st.markdown(f"### Drawdown — {_wf_chart}")
+        _wf_bench_name = (bench_sym_bt if bench_sym_bt in _wf_all else None)
+        _wf_static_name = next(
+            (n for n in _wf_all
+             if n.startswith("Static ") and n in _wf_stat), None)
+        _wf_dd_b = _wf_all[_wf_bench_name].drawdowns if _wf_bench_name else None
+        st.plotly_chart(
+            plot_drawdown(_wr.drawdowns, _wf_dd_b,
+                          _wf_bench_name or "Benchmark",
+                          _wr.metrics["max_drawdown"]),
+            use_container_width=True,
+        )
+        _wfd = _wr.metrics
+        wdd1, wdd2, wdd3 = st.columns(3)
+        wdd1.metric("Current Drawdown", fmt_pct(_wfd["current_drawdown"]))
+        wdd2.metric("Maximum Drawdown", fmt_pct(_wfd["max_drawdown"]))
+        wdd3.metric("Total Costs", fmt_usd(_wfd["total_costs"]))
+        if _wf_static_name is not None:
+            st.caption(
+                f"Static counterpart '{_wf_static_name}' final value: "
+                f"{fmt_usd(_wf_all[_wf_static_name].metrics['final_value'])} "
+                f"vs walk-forward {fmt_usd(_wfd['final_value'])} — the gap "
+                f"answers whether re-estimating helped.")
+
     # ---- Prepare the common-date window (real data only) ----
     # Convert native history to base currency FIRST, so analytics run on
     # base-currency returns (FX movement included), never mixed natives.
@@ -3250,11 +3749,6 @@ with tab_backtest:
             f"Holdings translated to {base_ccy} with date-matched historical "
             "FX before simulation, so currency movement is part of returns.")
 
-    try:
-        bench_sym_bt = validate_ticker_symbol(st.session_state.bt_benchmark)
-    except ValueError as e:
-        st.error(f"Invalid benchmark ticker: {e}")
-        bench_sym_bt = None
 
     bench_full = None
     if bench_sym_bt is not None and show_bench:
@@ -3721,29 +4215,7 @@ with tab_backtest:
     )
 
     st.markdown("### Out-of-Sample Comparison")
-    _oos_table = compare_backtests(oos_results)
-    _oos_disp = pd.DataFrame(index=_oos_table.index)
-    for _col in _oos_table.columns:
-        _is_bench = oos_results[_col].is_benchmark
-        _cells = []
-        for _metric in _oos_table.index:
-            _v = _oos_table.loc[_metric, _col]
-            if _metric == "Total Costs" and _is_bench:
-                _cells.append("N/A")
-            elif _metric in ("Final Value", "Total Costs"):
-                _cells.append(fmt_usd(_v))
-            elif _metric in ("Total Return", "CAGR", "Annualised Return",
-                             "Volatility", "Max Drawdown", "Best Day",
-                             "Worst Day"):
-                _cells.append(fmt_pct(_v))
-            elif _metric in ("Sharpe", "Sortino", "Calmar"):
-                _cells.append(f"{_v:.2f}")
-            elif _metric == "Rebalances":
-                _cells.append(f"{int(_v)}")
-            else:
-                _cells.append(str(_v))
-        _oos_disp[_col] = _cells
-    st.dataframe(_oos_disp, use_container_width=True)
+    _render_backtest_comparison(oos_results)
     st.caption(
         "Benchmark Total Costs show as N/A (the passive leg is not "
         "cost-modelled). Frozen estimation weights were never re-estimated "

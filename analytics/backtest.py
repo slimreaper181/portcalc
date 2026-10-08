@@ -385,6 +385,21 @@ def _solve_cost_fraction(
     )
 
 
+def solve_rebalance_cost_fraction(
+    current_weights: np.ndarray,
+    target_weights: np.ndarray,
+    cost_bps: float,
+) -> float:
+    """Public alias for the exact transaction-cost fixed-point solver.
+
+    Returns the cost as a fraction of pre-rebalance value such that the
+    reported cost equals ``rate × Σ|final executed trades|`` and
+    ``value_before − cost == value_after``. Shared by the static engine and
+    the walk-forward engine so both use identical accounting.
+    """
+    return _solve_cost_fraction(current_weights, target_weights, cost_bps)
+
+
 # ---------------------------------------------------------------------------
 # Core share-based simulation engine
 # ---------------------------------------------------------------------------
