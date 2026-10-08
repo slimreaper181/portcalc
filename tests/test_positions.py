@@ -640,3 +640,72 @@ def test_purchase_manual_override_wins_2026_08_13():
     assert v.native_cost_basis == pytest.approx(1500.0)
     assert v.base_market_value == pytest.approx(1600.0)
     assert v.unrealised_pnl == pytest.approx(100.0)
+
+
+# ---------------------------------------------------------------------------
+# Regression: GBp estimates must be normalised before storage (100× guard)
+# ---------------------------------------------------------------------------
+
+def test_gbp_estimate_normalised_before_storage_2026_08_13():
+    # Live BARC.L shape: raw close 520.5 GBp on 2026-08-13. The Add-Position
+    # handler stores purchase_price_native, so the raw quote-unit estimate
+    # must be normalised (×0.01 → £5.205) — storing 520.5 would overstate
+    # the cost basis 100×. Mirrors the handler's exact formula.
+    buy = date(2026, 8, 13)
+    idx = pd.bdate_range("2026-08-03", periods=15)
+    closes = pd.Series(515.0 + np.arange(len(idx), dtype=float), index=idx)
+    raw_on_day = float(closes[closes.index.date == buy].iloc[0])
+    out = resolve_purchase_price(closes, pd.Series(dtype=float), buy,
+                                 date(2026, 9, 1))
+    assert out["status"] == "ok"
+    assert out["raw_close"] == pytest.approx(raw_on_day)
+    native_each = normalise_quote(out["price"], 0.01)
+    assert native_each == pytest.approx(raw_on_day / 100.0)
+    assert native_each < 20.0  # pence-scale guard: never hundreds of pounds
+    pos = Position(ticker="BARC.L", shares=100.0, purchase_date=buy,
+                   purchase_price_native=native_each,
+                   purchase_price_source="estimate",
+                   manual_purchase_price=False, native_currency="GBP",
+                   quote_unit="GBp", quote_scale=0.01)
+    v = value_position(pos, normalise_quote(raw_on_day + 5.0, 0.01),
+                       "Yahoo", None, 1.0, 1.0, "GBP")
+    assert v.native_cost_basis == pytest.approx(100.0 * raw_on_day / 100.0)
+    assert v.unrealised_pnl == pytest.approx(100.0 * 5.0 / 100.0)
+
+
+def test_app_estimate_paths_apply_quote_scale():
+    # Guards the 100× bug at its source: every estimate path in app.py's
+    # Add-Position handler (exact-date ok + weekend prev/next choice) must
+    # pass the raw quote-unit price through normalise_quote before it is
+    # stored as purchase_price_native.
+    import ast
+    from pathlib import Path
+    tree = ast.parse(
+        (Path(__file__).resolve().parent.parent / "app.py").read_text(
+            encoding="utf-8"))
+    norm_lines: list = []
+
+    class V(ast.NodeVisitor):
+        def visit_Call(self, node):  # noqa: N802
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == "normalise_quote":
+                norm_lines.append(node.lineno)
+            self.generic_visit(node)
+
+    V().visit(tree)
+    assert norm_lines, "app.py never calls normalise_quote"
+    # Locate the `if st.button("Add Position"):` handler block.
+    handler_spans = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            src = ast.dump(node.test)
+            if "Add Position" in src:
+                handler_spans.append((node.lineno,
+                                      getattr(node, "end_lineno", node.lineno)))
+    assert handler_spans, "Add Position handler not found in app.py"
+    inside = [ln for ln in norm_lines
+              if any(lo <= ln <= hi for lo, hi in handler_spans)]
+    # ok-path + prev-choice + next-choice = 3 normalisations.
+    assert len(inside) >= 3, (
+        f"expected >=3 normalise_quote calls in Add Position handler, "
+        f"found {len(inside)} at lines {inside}")

@@ -142,6 +142,7 @@ from analytics.positions import (
     estimate_dividend_income,
     export_portfolio,
     format_money,
+    normalise_quote,
     position_from_dict,
     resolve_purchase_price,
     summarize_portfolio_csv,
@@ -733,9 +734,13 @@ with st.sidebar:
                             res = resolve_purchase_price(
                                 raw, splits, buy_date, _today)
                             if res["status"] == "ok":
+                                # res["price"] is in raw quote units (e.g. GBp)
+                                # — normalise to native currency before storing.
                                 _complete_add_position(
                                     sym, sh, res["used_date"],
-                                    res["price"], "estimate", False, inst)
+                                    normalise_quote(res["price"],
+                                                    inst.quote_scale),
+                                    "estimate", False, inst)
                             elif res["status"] == "missing":
                                 st.session_state.pending_buy = {
                                     "ticker": sym, "shares": sh,
@@ -743,9 +748,13 @@ with st.sidebar:
                                              "quote_unit": inst.quote_unit,
                                              "quote_scale": inst.quote_scale},
                                     "prev": [res["prev"][0].isoformat(),
-                                             res["prev"][1]],
+                                             normalise_quote(
+                                                 res["prev"][1],
+                                                 inst.quote_scale)],
                                     "next": [res["next"][0].isoformat(),
-                                             res["next"][1]],
+                                             normalise_quote(
+                                                 res["next"][1],
+                                                 inst.quote_scale)],
                                 }
                                 st.rerun()
                             else:
