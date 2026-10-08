@@ -539,6 +539,129 @@ def build_core_analytics(
 
 
 # ---------------------------------------------------------------------------
+# Cached data loaders (must precede ALL UI code — Streamlit executes this
+# module top-to-bottom, so any loader referenced by the sidebar must already
+# be defined when the sidebar block runs).
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_market_data(tickers: list[str], period: str):
+    prices  = fetch_price_history(tickers, period=period)
+    current = fetch_current_prices(tickers)
+    rf      = fetch_risk_free_rate()
+    return prices, current, rf
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_benchmark_data(benchmark_ticker: str, period: str):
+    """Cached benchmark history for the same period as the portfolio."""
+    return fetch_benchmark_history(benchmark_ticker, period=period)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_backtest_data(tickers: list[str]):
+    """Cached full-length history for backtesting (same yfinance pipeline)."""
+    return fetch_price_history(list(tickers), period="max")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_factor_data():
+    """Cached French factor datasets (change only daily)."""
+    return fetch_french_factors()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_exchange_hint(ticker: str):
+    """Cached yfinance exchange code (TradingView resolution hint only)."""
+    try:
+        return fetch_exchange_code(ticker)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_instruments(tickers):
+    """Cached canonical instrument metadata (currency, quote scale, tz).
+
+    Returns ``(instruments, problems)`` where problems lists tickers whose
+    metadata could not be established; callers must fail clearly rather
+    than assume USD.
+    """
+    instruments, problems = {}, []
+    for t in list(tickers):
+        try:
+            instruments[t] = get_instrument(t)
+        except ValueError as e:
+            problems.append(f"{t}: {e}")
+        except Exception as e:
+            problems.append(f"{t}: metadata lookup failed ({e}).")
+    return instruments, problems
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_fx_history():
+    """Cached daily USD-per-unit FX history (long TTL — history is static)."""
+    return fetch_fx_history()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_current_fx():
+    """Cached current FX snapshot: ``{pair: (rate, timestamp_utc)}``.
+
+    Short TTL; lightweight 5-day fetch. Derived from the same Yahoo
+    series family as historical FX so sources never disagree.
+    """
+    out = {}
+    for pair in ("GBPUSD=X", "EURUSD=X"):
+        try:
+            out[pair] = fetch_current_fx(pair)
+        except ValueError as e:
+            out[pair] = (None, str(e))
+        except Exception as e:
+            out[pair] = (None, f"FX request failed ({e}).")
+    return out
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_raw_history(ticker: str):
+    """Cached raw closes for purchase-price lookup (long TTL)."""
+    return fetch_raw_closes(ticker)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_splits(ticker: str):
+    """Cached split history for cost-basis adjustment (long TTL)."""
+    return fetch_splits(ticker)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_dividends_history(ticker: str):
+    """Cached dividend history for income estimates (long TTL)."""
+    return fetch_dividends(ticker)
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def load_alpaca_trades(symbols):
+    """Cached Alpaca latest trades (short 10s TTL — live data).
+
+    Never raises: returns ``(trades, status)`` where ``status`` is ``None``
+    on success, ``"disabled"`` when credentials are absent, or a short
+    error message otherwise. Callers fall back per symbol to Yahoo.
+    """
+    try:
+        creds = get_alpaca_credentials()
+    except Exception:
+        return {}, "disabled"
+    try:
+        trades = fetch_latest_trades(list(symbols), credentials=creds)
+    except AlpacaError as e:
+        return {}, str(e)
+    except Exception as e:
+        return {}, f"Live-price request failed ({e})."
+    return trades, None
+
+
+# ---------------------------------------------------------------------------
 # Sidebar — Portfolio Editor
 # ---------------------------------------------------------------------------
 
@@ -756,123 +879,6 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_market_data(tickers: list[str], period: str):
-    prices  = fetch_price_history(tickers, period=period)
-    current = fetch_current_prices(tickers)
-    rf      = fetch_risk_free_rate()
-    return prices, current, rf
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_benchmark_data(benchmark_ticker: str, period: str):
-    """Cached benchmark history for the same period as the portfolio."""
-    return fetch_benchmark_history(benchmark_ticker, period=period)
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_backtest_data(tickers: list[str]):
-    """Cached full-length history for backtesting (same yfinance pipeline)."""
-    return fetch_price_history(list(tickers), period="max")
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_factor_data():
-    """Cached French factor datasets (change only daily)."""
-    return fetch_french_factors()
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_exchange_hint(ticker: str):
-    """Cached yfinance exchange code (TradingView resolution hint only)."""
-    try:
-        return fetch_exchange_code(ticker)
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_instruments(tickers):
-    """Cached canonical instrument metadata (currency, quote scale, tz).
-
-    Returns ``(instruments, problems)`` where problems lists tickers whose
-    metadata could not be established; callers must fail clearly rather
-    than assume USD.
-    """
-    instruments, problems = {}, []
-    for t in list(tickers):
-        try:
-            instruments[t] = get_instrument(t)
-        except ValueError as e:
-            problems.append(f"{t}: {e}")
-        except Exception as e:
-            problems.append(f"{t}: metadata lookup failed ({e}).")
-    return instruments, problems
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_fx_history():
-    """Cached daily USD-per-unit FX history (long TTL — history is static)."""
-    return fetch_fx_history()
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_current_fx():
-    """Cached current FX snapshot: ``{pair: (rate, timestamp_utc)}``.
-
-    Short TTL; lightweight 5-day fetch. Derived from the same Yahoo
-    series family as historical FX so sources never disagree.
-    """
-    out = {}
-    for pair in ("GBPUSD=X", "EURUSD=X"):
-        try:
-            out[pair] = fetch_current_fx(pair)
-        except ValueError as e:
-            out[pair] = (None, str(e))
-        except Exception as e:
-            out[pair] = (None, f"FX request failed ({e}).")
-    return out
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_raw_history(ticker: str):
-    """Cached raw closes for purchase-price lookup (long TTL)."""
-    return fetch_raw_closes(ticker)
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_splits(ticker: str):
-    """Cached split history for cost-basis adjustment (long TTL)."""
-    return fetch_splits(ticker)
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_dividends_history(ticker: str):
-    """Cached dividend history for income estimates (long TTL)."""
-    return fetch_dividends(ticker)
-
-
-@st.cache_data(ttl=10, show_spinner=False)
-def load_alpaca_trades(symbols):
-    """Cached Alpaca latest trades (short 10s TTL — live data).
-
-    Never raises: returns ``(trades, status)`` where ``status`` is ``None``
-    on success, ``"disabled"`` when credentials are absent, or a short
-    error message otherwise. Callers fall back per symbol to Yahoo.
-    """
-    try:
-        creds = get_alpaca_credentials()
-    except Exception:
-        return {}, "disabled"
-    try:
-        trades = fetch_latest_trades(list(symbols), credentials=creds)
-    except AlpacaError as e:
-        return {}, str(e)
-    except Exception as e:
-        return {}, f"Live-price request failed ({e})."
-    return trades, None
-
 
 def resolve_valuation_prices(tickers, yahoo_current):
     """Blend Alpaca live trades over Yahoo current prices (valuation only).

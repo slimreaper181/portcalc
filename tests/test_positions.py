@@ -514,3 +514,129 @@ def test_alpaca_isolation(monkeypatch):
     from analytics.currency import convert_value
     assert convert_value(100.0, "GBP", "USD",
                          {"USD": 1.0, "GBP": 1.2}) == pytest.approx(120.0)
+
+
+# ---------------------------------------------------------------------------
+# Regression: purchase-date lookup UI wiring (NameError guard)
+# ---------------------------------------------------------------------------
+
+def _app_module_level_wiring():
+    """Parse app.py into module-level bindings + module-level name loads.
+
+    Streamlit executes app.py top-to-bottom, so any helper the sidebar (or
+    any other module-level block) calls must be bound earlier in the file.
+    Returns ``(bound, uses)`` where ``bound`` maps name -> first binding
+    lineno and ``uses`` lists ``(name, lineno)`` loads outside def/class
+    bodies (which resolve names lazily at call time and are order-safe).
+    """
+    import ast
+    import builtins
+    from pathlib import Path
+    tree = ast.parse(
+        (Path(__file__).resolve().parent.parent / "app.py").read_text(
+            encoding="utf-8"))
+    bound: dict = {}
+    uses: list = []
+
+    def scan(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            return  # body resolves names at call time — order-safe
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for a in node.names:
+                bound.setdefault((a.asname or a.name).split(".")[0],
+                                 node.lineno)
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id not in dir(builtins):
+                uses.append((node.id, node.lineno))
+            return
+        if isinstance(node, ast.AST):
+            for child in ast.iter_child_nodes(node):
+                scan(child)
+
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            bound.setdefault(stmt.name, stmt.lineno)
+        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            scan(stmt)
+        elif isinstance(stmt, ast.Assign):
+            for t in stmt.targets:
+                for n in ast.walk(t):
+                    if (isinstance(n, ast.Name)
+                            and isinstance(n.ctx, ast.Store)):
+                        bound.setdefault(n.id, stmt.lineno)
+            scan(stmt.value)
+        elif isinstance(stmt, ast.AnnAssign):
+            for n in ast.walk(stmt.target):
+                if (isinstance(n, ast.Name)
+                        and isinstance(n.ctx, ast.Store)):
+                    bound.setdefault(n.id, stmt.lineno)
+            if stmt.value is not None:
+                scan(stmt.value)
+        else:
+            scan(stmt)
+    return bound, uses
+
+
+def test_app_purchase_loaders_defined_before_sidebar_use():
+    # Guards the reported NameError: `load_raw_history` was defined AFTER
+    # the sidebar block that calls it, so adding a holding with a purchase
+    # date crashed. Every cached loader referenced by module-level UI code
+    # (Add Position handler, Refresh block) must be bound earlier in app.py.
+    bound, uses = _app_module_level_wiring()
+    loader_uses = sorted({(n, ln) for n, ln in uses if n.startswith("load_")},
+                         key=lambda x: x[1])
+    assert loader_uses, "expected module-level loader calls in app.py"
+    assert {"load_raw_history", "load_splits",
+            "load_dividends_history"} <= {n for n, _ in loader_uses}
+    late = [f"{name} used at line {ln} but bound at line "
+            f"{bound.get(name, 'NEVER')}"
+            for name, ln in loader_uses
+            if name not in bound or ln < bound[name]]
+    assert not late, "UI uses helpers before definition: " + "; ".join(late)
+
+
+def test_purchase_lookup_path_trading_date_2026_08_13():
+    # Mirrors the sidebar Add-Position handler end to end on synthetic data:
+    # raw closes + splits -> estimate -> valuation. 2026-08-13 is a Thursday
+    # (trading day), so the estimate must resolve on the exact date.
+    buy = date(2026, 8, 13)
+    assert buy.weekday() < 5  # non-vacuous: this really is a trading day
+    idx = pd.bdate_range("2026-08-03", periods=15)
+    assert buy in set(idx.date)
+    closes = pd.Series(200.0 + np.arange(len(idx), dtype=float), index=idx)
+    asof = date(2026, 9, 1)
+    out = resolve_purchase_price(closes, pd.Series(dtype=float), buy, asof)
+    assert out["status"] == "ok"  # no NameError, no missing/invalid
+    assert out["used_date"] == buy
+    expect = float(closes[closes.index.date == buy].iloc[0])
+    assert out["raw_close"] == pytest.approx(expect)
+    assert out["price"] == pytest.approx(expect)  # no splits -> factor 1
+    assert math.isfinite(out["price"]) and out["price"] > 0
+    # ...and the estimate flows into cost basis / P&L rendering.
+    pos = Position(ticker="AAPL", shares=10.0, purchase_date=buy,
+                   purchase_price_native=out["price"],
+                   purchase_price_source="estimate",
+                   manual_purchase_price=False, native_currency="USD",
+                   quote_unit="USD", quote_scale=1.0)
+    v = value_position(pos, expect + 5.0, "Yahoo", None, 1.0, 1.0, "USD")
+    assert v.native_cost_basis == pytest.approx(10.0 * expect)
+    assert v.base_market_value == pytest.approx(10.0 * (expect + 5.0))
+    assert v.unrealised_pnl == pytest.approx(50.0)
+
+
+def test_purchase_manual_override_wins_2026_08_13():
+    # The "actual execution price" checkbox path must keep working: a manual
+    # price replaces the raw-close estimate for the same purchase date.
+    buy = date(2026, 8, 13)
+    pos = Position(ticker="MSFT", shares=10.0, purchase_date=buy,
+                   purchase_price_native=150.0,
+                   purchase_price_source="manual",
+                   manual_purchase_price=True, native_currency="USD",
+                   quote_unit="USD", quote_scale=1.0)
+    v = value_position(pos, 160.0, "Yahoo", None, 1.0, 1.0, "USD")
+    assert v.native_cost_basis == pytest.approx(1500.0)
+    assert v.base_market_value == pytest.approx(1600.0)
+    assert v.unrealised_pnl == pytest.approx(100.0)
