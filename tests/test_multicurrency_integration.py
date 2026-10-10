@@ -260,3 +260,33 @@ def test_oos_estimation_ignores_future_fx():
         assert np.array_equal(ra.weights.values, rb.weights.values)
     # Future FX paths really do differ (sanity that the test is non-vacuous).
     assert fx_a["GBP"].iloc[0] != fx_b["GBP"].iloc[0]
+
+
+def test_era_scoped_conversion_matches_full_panel():
+    # Converting only the needed era must equal converting the full panel
+    # then slicing (ffill limit 5 trading days << era buffer). This pins the
+    # UI's era-scoped conversion: identical numbers on success, while
+    # ancient FX gaps outside the asked window can no longer fail the run.
+    idx = pd.bdate_range("2015-01-01", periods=2600)
+    rng = np.random.default_rng(31)
+    native = pd.DataFrame({
+        "A": 100 * np.exp(np.cumsum(rng.normal(0.0004, 0.010, 2600))),
+        "B": (300 + np.cumsum(rng.normal(0.05, 1.5, 2600))),  # pence
+        "C": 50 * np.exp(np.cumsum(rng.normal(0.0003, 0.009, 2600))),
+    }, index=idx)
+    fx = pd.DataFrame({
+        "GBP": 1.25 + np.linspace(0, 0.10, 2600),
+        "EUR": np.full(2600, 1.10),
+    }, index=idx)
+    legs = (("A", 1.0, "USD"), ("B", 0.01, "GBP"), ("C", 1.0, "EUR"))
+    full = pd.DataFrame(index=idx)
+    for t, scale, ccy in legs:
+        full[t] = convert_price_series(native[t] * scale, ccy, "USD", fx)
+    start, end = pd.Timestamp("2024-01-02"), pd.Timestamp("2024-12-31")
+    era = native.loc[start - pd.Timedelta(days=30):end]
+    fx_era = fx.loc[start - pd.Timedelta(days=30):end]
+    scoped = pd.DataFrame(index=era.index)
+    for t, scale, ccy in legs:
+        scoped[t] = convert_price_series(era[t] * scale, ccy, "USD", fx_era)
+    pd.testing.assert_frame_equal(
+        scoped.loc[start:end], full.loc[start:end])

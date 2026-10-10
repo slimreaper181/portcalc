@@ -3734,9 +3734,15 @@ with tab_backtest:
     # ---- Prepare the common-date window (real data only) ----
     # Convert native history to base currency FIRST, so analytics run on
     # base-currency returns (FX movement included), never mixed natives.
+    # Only the asked window (plus a 30-day edge buffer for the bounded FX
+    # carry-forward) is converted: ancient history outside the window can
+    # neither help nor fail the run. Results are identical to converting
+    # everything first (pinned by test_era_scoped_conversion_matches_full_panel).
     try:
+        _bt_need_from = pd.Timestamp(bt_start) - pd.Timedelta(days=30)
         bt_base_full = base_price_panel(
-            bt_full, tickers, instruments, ccy.get("fx_hist"), base_ccy)
+            bt_full.loc[_bt_need_from:pd.Timestamp(bt_end)],
+            tickers, instruments, ccy.get("fx_hist"), base_ccy)
         bt_prices, bt_notes = prepare_backtest_data(
             bt_base_full, tickers, pd.Timestamp(bt_start), pd.Timestamp(bt_end))
     except ValueError as e:
@@ -3754,6 +3760,8 @@ with tab_backtest:
     if bench_sym_bt is not None and show_bench:
         try:
             _bench_native = load_benchmark_data(bench_sym_bt, "max")
+            _bench_native = _bench_native.loc[
+                _bt_need_from:pd.Timestamp(bt_end)]
             bench_full = base_benchmark_series(
                 _bench_native, bench_sym_bt, base_ccy, ccy.get("fx_hist"))
         except ValueError as e:
@@ -4059,9 +4067,14 @@ with tab_backtest:
     try:
         oos_T = pd.Timestamp(oos_start)
         # Convert to base currency BEFORE estimation: estimation covariance
-        # and all test wealth paths then live in base-currency space.
+        # and all test wealth paths then live in base-currency space. Only
+        # the estimation era onward is converted (same era-scoping as the
+        # static setup above — identical numbers, no ancient-FX failures).
+        _oos_need_from = (oos_T - pd.DateOffset(
+            years=int(oos_lookback) + 1)).date()
         oos_base_full = base_price_panel(
-            bt_full, tickers, instruments, ccy.get("fx_hist"), base_ccy)
+            bt_full.loc[pd.Timestamp(_oos_need_from):pd.Timestamp(bt_end)],
+            tickers, instruments, ccy.get("fx_hist"), base_ccy)
         oos_est, oos_info = estimation_window(
             oos_base_full, tickers, oos_T, float(oos_lookback))
     except ValueError as e:
@@ -4086,6 +4099,8 @@ with tab_backtest:
     if bench_sym_bt is not None:
         try:
             _oos_bench_native = load_benchmark_data(bench_sym_bt, "max")
+            _oos_bench_native = _oos_bench_native.loc[
+                pd.Timestamp(_oos_need_from):pd.Timestamp(bt_end)]
             oos_bench_full = base_benchmark_series(
                 _oos_bench_native, bench_sym_bt, base_ccy, ccy.get("fx_hist"))
         except ValueError as e:
@@ -4246,16 +4261,11 @@ with tab_factors:
         st.error("Could not load price history (network or API error). "
                  "Check your connection and try again.")
         st.stop()
-    # Translate history into base currency up front: factor regressions
-    # then describe the investor's base-currency experience. The French
-    # factors themselves are never converted (US factor datasets).
-    try:
-        fa_full = base_price_panel(
-            fa_full, tickers, instruments, ccy.get("fx_hist"), base_ccy)
-    except ValueError as e:
-        st.error(f"Factor data error: {e}")
-        st.stop()
-
+    # Range for the window widgets comes from the native common history (no
+    # FX involved, so ancient listings never block widget setup). Currency
+    # conversion below covers only the selected era — identical numbers to
+    # converting everything first (see era-equivalence test), while FX gaps
+    # outside the asked window can no longer fail the run.
     fa_common = fa_full.dropna(how="any")
     if len(fa_common) < 2:
         st.error("No overlapping history available for factor analysis.")
@@ -4321,6 +4331,27 @@ with tab_factors:
             "Benchmark (comparison only)", key="fa_benchmark",
             help="Any Yahoo Finance ticker, e.g. SPY, QQQ, ^GSPC.")
     st.caption(MODEL_DESCRIPTIONS[fa_model_key])
+
+    # Translate the selected era into base currency up front: factor
+    # regressions then describe the investor's base-currency experience.
+    # The French factors themselves are never converted (US datasets).
+    # "Selected Backtest Strategy" may analyse the Backtest tab's window,
+    # so the era covers both windows when that source is chosen.
+    try:
+        _fa_era_start = pd.Timestamp(fa_start)
+        if fa_source == "Selected Backtest Strategy":
+            _fa_era_start = min(
+                _fa_era_start,
+                pd.Timestamp(st.session_state.get("bt_start", fa_start)))
+        _fa_need_from = _fa_era_start - pd.Timedelta(days=30)
+        _fa_need_to = max(pd.Timestamp(fa_end),
+                          pd.Timestamp(st.session_state.get("bt_end", fa_end)))
+        fa_full = base_price_panel(
+            fa_full.loc[_fa_need_from:_fa_need_to],
+            tickers, instruments, ccy.get("fx_hist"), base_ccy)
+    except ValueError as e:
+        st.error(f"Factor data error: {e}")
+        st.stop()
 
     # ---- Build the analysed wealth series (backtest engine, no Alpaca) ----
     _FA_CAPITAL = 10_000.0
@@ -4570,6 +4601,8 @@ with tab_factors:
         if _fa_bench_sym is not None:
             try:
                 _bench_native = load_benchmark_data(_fa_bench_sym, "max")
+                _bench_native = _bench_native.loc[
+                    _fa_need_from:fa_values.index[-1]]
                 _bench_full = base_benchmark_series(
                     _bench_native, _fa_bench_sym, base_ccy, ccy.get("fx_hist"))
             except ValueError as e:
