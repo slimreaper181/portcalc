@@ -174,6 +174,7 @@ from analytics.allocation import (
 )
 from analytics.validation import (
     canonical_tickers,
+    validate_horizon_years,
     validate_monthly_contrib,
     validate_shares,
     validate_simulation_count,
@@ -192,7 +193,13 @@ from analytics.walkforward import (
     turnover_diagnostics,
 )
 from ui.feedback import flash, render_flash
-from ui.formatting import format_trade_time
+from ui.formatting import fmt_pct, fmt_usd, format_trade_time, style_matrix
+from ui.tables import render_backtest_comparison as _render_backtest_comparison
+from ui.bl import (
+    _bl_reference_weights,
+    _bl_views_editor,
+    _run_bl_pipeline,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -342,31 +349,6 @@ if "data_loaded" not in st.session_state:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def style_matrix(df: pd.DataFrame, fmt: str = ".4f") -> Styler:
-    """Apply background gradient styling to a numeric DataFrame."""
-    return (
-        df.style
-        .format("{:" + fmt + "}")
-        .background_gradient(cmap="Blues", axis=None)
-    )
-
-
-def fmt_usd(value: float, currency: str | None = None) -> str:
-    """Format money in the active base currency (explicit override allowed).
-
-    Existing call sites keep working unchanged; the base currency is read
-    from session state. Use an explicit currency for native-currency values.
-    """
-    try:
-        ccy = currency or st.session_state.get("base_currency", "USD")
-    except Exception:
-        ccy = currency or "USD"
-    return format_money(value, ccy)
-
-
-def fmt_pct(value: float) -> str:
-    return f"{value:.2%}"
 
 
 # ---------------------------------------------------------------------------
@@ -647,143 +629,6 @@ def _snapshot_alloc(method, w, tickers, mu_s, cov_df, rf, message):
         diversification_ratio=summary["diversification_ratio"],
         risk_contributions=summary["risk_contributions"],
         message=message)
-
-
-def _bl_views_editor(prefix: str, tickers: list[str],
-                     ref_default: str | None = None):
-    """Render Black-Litterman reference/delta/tau/views inputs.
-
-    Returns ``(config, error)`` where config is None when inputs are
-    invalid. Config: ``{"ref", "delta", "tau", "views"}``. ``ref_default``
-    optionally preselects the reference prior (walk-forward defaults to
-    the Equal Weights proxy prior for genuine OOS).
-    """
-    _ref_options = ["Current Portfolio — proxy prior",
-                    "Equal Weights — proxy prior"]
-    _ref_index = (_ref_options.index(ref_default) if ref_default in _ref_options
-                  else 0)
-    ref_choice = st.selectbox(
-        "Reference weights (prior)",
-        _ref_options,
-        index=_ref_index,
-        key=f"{prefix}_ref",
-        help="Used to reverse-engineer implied equilibrium returns.",
-    )
-    st.caption(
-        "These weights are used to reverse-engineer implied equilibrium "
-        "returns. They are not necessarily true market-cap equilibrium weights."
-    )
-    delta = st.slider(
-        "Risk aversion (δ)", 0.5, 10.0, 2.5, 0.1, format="%.1f",
-        key=f"{prefix}_delta",
-        help="Higher δ means more risk-averse posterior portfolios.",
-    )
-    with st.expander("Advanced: prior uncertainty (τ)", expanded=False):
-        tau = st.slider(
-            "Tau (τ)", 0.01, 0.30, 0.05, 0.005, format="%.3f",
-            key=f"{prefix}_tau",
-            help="τ controls uncertainty in the prior expected returns.",
-        )
-        st.caption("τ controls uncertainty in the prior expected returns.")
-    n_views_raw = st.number_input(
-        "Number of views", min_value=0, max_value=4, value=0, step=1,
-        key=f"{prefix}_nviews",
-        help="Absolute and/or relative views, each with its own confidence.",
-    )
-    n_views = int(n_views_raw)
-    views = []
-    for i in range(n_views):
-        with st.expander(f"View {i + 1}", expanded=(i == 0)):
-            vtype = st.selectbox("Type", ["Absolute", "Relative"],
-                                 key=f"{prefix}_vtype_{i}")
-            conf_pct = st.slider(
-                "Confidence (%)", 5, 95, 70, 5,
-                key=f"{prefix}_conf_{i}",
-                help="Higher confidence pulls the posterior harder toward "
-                     "the view.")
-            conf = float(conf_pct) / 100.0
-            if vtype == "Absolute":
-                tick = st.selectbox("Asset", tickers,
-                                    key=f"{prefix}_tick_{i}")
-                ret_pct = st.number_input(
-                    "Expected annual return (%)", value=10.0, step=0.5,
-                    key=f"{prefix}_ret_{i}")
-                views.append({"type": "absolute", "ticker": tick,
-                              "return": float(ret_pct) / 100.0,
-                              "confidence": conf})
-            else:
-                if len(tickers) < 2:
-                    return None, "Relative views need at least two holdings."
-                long = st.selectbox("Outperform (long)", tickers,
-                                    key=f"{prefix}_long_{i}")
-                short = st.selectbox(
-                    "Underperform (short)", tickers,
-                    index=1 if len(tickers) > 1 else 0,
-                    key=f"{prefix}_short_{i}")
-                spread = st.number_input(
-                    "Expected outperformance, annual (%)", value=3.0, step=0.5,
-                    key=f"{prefix}_spread_{i}")
-                views.append({"type": "relative", "long": long,
-                              "short": short,
-                              "return": float(spread) / 100.0,
-                              "confidence": conf})
-    return ({"ref": ref_choice, "delta": float(delta), "tau": float(tau),
-             "views": views}, None)
-
-
-def _bl_reference_weights(ref_choice: str, live_weights, tickers):
-    """Resolve Current/Equal reference weights for Black-Litterman."""
-    if ref_choice.startswith("Current"):
-        return np.asarray(live_weights, dtype=float)
-    return np.ones(len(tickers)) / len(tickers)
-
-
-def _run_bl_pipeline(tickers, cov_df, ref_choice, live_weights, delta, tau,
-                     views, rf_rate, min_w, max_w):
-    """Run BL posterior + utility allocation. Returns (posterior, alloc)."""
-    ref_w = _bl_reference_weights(ref_choice, live_weights, tickers)
-    post = black_litterman_posterior(tickers, cov_df, ref_w, delta, tau, views)
-    if not post.success or post.posterior is None:
-        alloc = AllocationResult(
-            method="Black-Litterman", success=False, weights=None,
-            expected_return=float("nan"), volatility=float("nan"),
-            sharpe=float("nan"), diversification_ratio=float("nan"),
-            risk_contributions=None, message=post.message)
-        return post, alloc
-    alloc = black_litterman_allocation(
-        tickers, post.posterior, cov_df, delta, rf_rate, min_w, max_w)
-    return post, alloc
-
-
-def _render_backtest_comparison(results: dict) -> None:
-    """Render a formatted strategy-comparison table (raw values stay numeric).
-
-    Shared by the static OOS and walk-forward sections so both format
-    identically. Benchmark Total Costs render as N/A via ``is_benchmark``.
-    """
-    _table = compare_backtests(results)
-    _disp = pd.DataFrame(index=_table.index)
-    for _col in _table.columns:
-        _is_bench = results[_col].is_benchmark
-        _cells = []
-        for _metric in _table.index:
-            _v = _table.loc[_metric, _col]
-            if _metric == "Total Costs" and _is_bench:
-                _cells.append("N/A")
-            elif _metric in ("Final Value", "Total Costs"):
-                _cells.append(fmt_usd(_v))
-            elif _metric in ("Total Return", "CAGR", "Annualised Return",
-                             "Volatility", "Max Drawdown", "Best Day",
-                             "Worst Day"):
-                _cells.append(fmt_pct(_v))
-            elif _metric in ("Sharpe", "Sortino", "Calmar"):
-                _cells.append(f"{_v:.2f}")
-            elif _metric == "Rebalances":
-                _cells.append(f"{int(_v)}")
-            else:
-                _cells.append(str(_v))
-        _disp[_col] = _cells
-    st.dataframe(_disp, width="stretch")
 
 
 try:

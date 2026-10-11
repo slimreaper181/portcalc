@@ -88,3 +88,40 @@ def pnl_styler(df: pd.DataFrame, cols) -> "pd.io.formats.style.Styler":
     if not cols:
         return df.style
     return df.style.map(_color, subset=cols)
+
+
+def render_backtest_comparison(results: dict) -> None:
+    """Formatted strategy-comparison table (raw values stay numeric).
+
+    Shared by static OOS and walk-forward sections. Benchmark Total Costs
+    render as N/A via ``is_benchmark``.
+    """
+    import streamlit as st
+
+    from analytics.backtest import compare_backtests
+    from ui.formatting import fmt_pct as _pct
+    from ui.formatting import fmt_usd as _usd
+
+    table = compare_backtests(results)
+    disp = pd.DataFrame(index=table.index)
+    for col in table.columns:
+        is_bench = results[col].is_benchmark
+        cells = []
+        for metric in table.index:
+            v = table.loc[metric, col]
+            if metric == "Total Costs" and is_bench:
+                cells.append("N/A")
+            elif metric in ("Final Value", "Total Costs"):
+                cells.append(_usd(v))
+            elif metric in ("Total Return", "CAGR", "Annualised Return",
+                             "Volatility", "Max Drawdown", "Best Day",
+                             "Worst Day"):
+                cells.append(_pct(v))
+            elif metric in ("Sharpe", "Sortino", "Calmar"):
+                cells.append(f"{v:.2f}")
+            elif metric == "Rebalances":
+                cells.append(f"{int(v)}")
+            else:
+                cells.append(str(v))
+        disp[col] = cells
+    st.dataframe(disp, width="stretch")

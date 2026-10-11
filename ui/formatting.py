@@ -116,3 +116,33 @@ def format_trade_time(ts):
             return ts.strftime("%H:%M:%S UTC")
         except Exception:
             return "time unknown"
+
+
+def fmt_usd(value, currency=None):
+    """Money in the active base currency (explicit override allowed).
+
+    Session-aware shell default: reads the base currency from Streamlit
+    session state unless ``currency`` is given. Safe outside a session
+    (falls back to USD).
+    """
+    if currency is None:
+        try:
+            import streamlit as st
+            currency = st.session_state.get("base_currency", "USD")
+        except Exception:
+            currency = "USD"
+    return format_money(value, currency)
+
+
+def fmt_pct(value):
+    """Fraction to percent (session-independent)."""
+    return format_percent(value)
+
+
+def style_matrix(df, fmt=".4f"):
+    """Blue-gradient styled numeric matrix (correlation/covariance views)."""
+    return (
+        df.style
+        .format("{:" + fmt + "}")
+        .background_gradient(cmap="Blues", axis=None)
+    )
