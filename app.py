@@ -577,107 +577,25 @@ ctx = {
     "core": core,
 }
 
-# Shared render context for ui/views tabs (single source of shell state).
-# Overview may return an updated dict (history-period rebuild) merged back.
-ctx = {
-    "tickers": tickers,
-    "base_ccy": base_ccy,
-    "ccy": ccy,
-    "prices": prices,
-    "current_prices": current_prices,
-    "rf_rate": rf_rate,
-    "weights": weights,
-    "portfolio_value": portfolio_value,
-    "rets": rets,
-    "mu": mu,
-    "cov": cov,
-    "corr": corr,
-    "port_return": port_return,
-    "port_vol": port_vol,
-    "port_sharpe": port_sharpe,
-    "port_daily_returns": port_daily_returns,
-    "rc": rc,
-    "positions": positions,
-    "valuations": valuations,
-    "val_agg": val_agg,
-    "val_warnings": val_warnings,
-    "val_by_ticker": val_by_ticker,
-    "pos_by_ticker": pos_by_ticker,
-    "valuation_prices": valuation_prices,
-    "price_view": price_view,
-    "alpaca_status": alpaca_status,
-    "instruments": instruments,
-    "native_panel": native_panel,
-    "core": core,
-}
+# ---------------------------------------------------------------------------
+# Application shell header (compact context — details live in the tabs)
+# ---------------------------------------------------------------------------
 
-# Shared render context for ui/views tabs (single source of shell state).
-# Overview may return an updated dict (history-period rebuild) merged back.
-ctx = {
-    "tickers": tickers,
-    "base_ccy": base_ccy,
-    "ccy": ccy,
-    "prices": prices,
-    "current_prices": current_prices,
-    "rf_rate": rf_rate,
-    "weights": weights,
-    "portfolio_value": portfolio_value,
-    "rets": rets,
-    "mu": mu,
-    "cov": cov,
-    "corr": corr,
-    "port_return": port_return,
-    "port_vol": port_vol,
-    "port_sharpe": port_sharpe,
-    "port_daily_returns": port_daily_returns,
-    "rc": rc,
-    "positions": positions,
-    "valuations": valuations,
-    "val_agg": val_agg,
-    "val_warnings": val_warnings,
-    "val_by_ticker": val_by_ticker,
-    "pos_by_ticker": pos_by_ticker,
-    "valuation_prices": valuation_prices,
-    "price_view": price_view,
-    "alpaca_status": alpaca_status,
-    "instruments": instruments,
-    "native_panel": native_panel,
-    "core": core,
-}
+from ui.formatting import format_date, format_money
 
-# Shared render context for ui/views tabs (single source of shell state).
-# Overview may return an updated dict (history-period rebuild) merged back.
-ctx = {
-    "tickers": tickers,
-    "base_ccy": base_ccy,
-    "ccy": ccy,
-    "prices": prices,
-    "current_prices": current_prices,
-    "rf_rate": rf_rate,
-    "weights": weights,
-    "portfolio_value": portfolio_value,
-    "rets": rets,
-    "mu": mu,
-    "cov": cov,
-    "corr": corr,
-    "port_return": port_return,
-    "port_vol": port_vol,
-    "port_sharpe": port_sharpe,
-    "port_daily_returns": port_daily_returns,
-    "rc": rc,
-    "positions": positions,
-    "valuations": valuations,
-    "val_agg": val_agg,
-    "val_warnings": val_warnings,
-    "val_by_ticker": val_by_ticker,
-    "pos_by_ticker": pos_by_ticker,
-    "valuation_prices": valuation_prices,
-    "price_view": price_view,
-    "alpaca_status": alpaca_status,
-    "instruments": instruments,
-    "native_panel": native_panel,
-    "core": core,
-}
+_header_bench = st.session_state.get("bt_benchmark", "SPY")
+try:
+    _header_through = format_date(prices.index[-1])
+except Exception:
+    _header_through = "—"
+st.markdown("## Portfolio Calc")
+st.caption("Portfolio Research & Risk")
+_h1, _h2, _h3, _h4 = st.columns(4)
+_h1.metric("Portfolio Value", format_money(portfolio_value, base_ccy))
+_h2.metric("Base Currency", base_ccy)
+_h3.metric("Benchmark", str(_header_bench))
+_h4.metric("Data Through", _header_through)
+st.markdown("---")
 
 # ---------------------------------------------------------------------------
 # Main tabs
