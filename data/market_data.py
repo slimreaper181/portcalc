@@ -145,6 +145,57 @@ def fetch_current_prices(tickers: list[str]) -> dict[str, float]:
     return prices
 
 
+def fetch_previous_closes(tickers: list[str]) -> dict[str, float]:
+    """Previous official daily close per ticker (Day-P&L baseline).
+
+    Uses the last two daily bars; the baseline is the second-to-last close
+    (never today's forming bar). Unavailable tickers map to NaN (callers
+    must handle missing baselines explicitly — never assume zero).
+    """
+    wanted = _normalise_requested(tickers)
+    out: dict[str, float] = {}
+    for t in wanted:
+        prev = np.nan
+        try:
+            hist = yf.Ticker(t).history(period="5d", auto_adjust=False)
+            if hist is not None and len(hist) >= 2 and "Close" in hist.columns:
+                prev = float(hist["Close"].iloc[-2])
+        except Exception:
+            prev = np.nan
+        out[t] = float(prev) if np.isfinite(prev) else np.nan
+    return out
+
+
+def fetch_intraday(ticker: str, days: int = 1) -> pd.Series:
+    """Intraday closes for display only (1D/5D Security Detail chart).
+
+    Never feeds daily-return analytics (mixed frequencies would corrupt
+    them). Raises ``ValueError`` when unavailable.
+    """
+    sym = validate_ticker_symbol(ticker)
+    if days not in (1, 5):
+        raise ValueError(f"Intraday window must be 1 or 5 days, got {days!r}.")
+    try:
+        hist = yf.Ticker(sym).history(
+            period="1d" if days == 1 else "5d",
+            interval="15m" if days == 1 else "60m")
+    except Exception as e:
+        raise ValueError(
+            f"Could not download intraday data for {sym} ({e})."
+        )
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        raise ValueError(f"No intraday data available for {sym}.")
+    s = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+    if s.empty:
+        raise ValueError(f"No intraday data available for {sym}.")
+    try:
+        idx = pd.DatetimeIndex(s.index)
+        s.index = idx.tz_convert("UTC") if idx.tz is not None else idx
+    except Exception:
+        pass
+    return s.sort_index().rename(sym)
+
+
 def fetch_exchange_code(ticker: str) -> str | None:
     """
     Best-effort yfinance exchange code for a ticker (e.g. ``NMS``, ``NYQ``).
