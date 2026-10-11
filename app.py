@@ -192,7 +192,10 @@ from analytics.walkforward import (
     run_walk_forward,
     turnover_diagnostics,
 )
+from ui.errors import render_section
 from ui.feedback import flash, render_flash
+from ui.views import overview as views_overview
+from ui.views import risk as views_risk
 from ui.formatting import fmt_pct, fmt_usd, format_trade_time, style_matrix
 from ui.tables import render_backtest_comparison as _render_backtest_comparison
 from ui.bl import (
@@ -713,6 +716,40 @@ except ValueError as e:
 val_by_ticker = {v.ticker: v for v in valuations}
 pos_by_ticker = positions
 
+# Shared render context for ui/views tabs (single source of shell state).
+# Overview may return an updated dict (history-period rebuild) merged back.
+ctx = {
+    "tickers": tickers,
+    "base_ccy": base_ccy,
+    "ccy": ccy,
+    "prices": prices,
+    "current_prices": current_prices,
+    "rf_rate": rf_rate,
+    "weights": weights,
+    "portfolio_value": portfolio_value,
+    "rets": rets,
+    "mu": mu,
+    "cov": cov,
+    "corr": corr,
+    "port_return": port_return,
+    "port_vol": port_vol,
+    "port_sharpe": port_sharpe,
+    "port_daily_returns": port_daily_returns,
+    "rc": rc,
+    "positions": positions,
+    "valuations": valuations,
+    "val_agg": val_agg,
+    "val_warnings": val_warnings,
+    "val_by_ticker": val_by_ticker,
+    "pos_by_ticker": pos_by_ticker,
+    "valuation_prices": valuation_prices,
+    "price_view": price_view,
+    "alpaca_status": alpaca_status,
+    "instruments": instruments,
+    "native_panel": native_panel,
+    "core": core,
+}
+
 # ---------------------------------------------------------------------------
 # Main tabs
 # ---------------------------------------------------------------------------
@@ -733,537 +770,13 @@ tab_overview, tab_risk, tab_optimise, tab_scenario, tab_perf, tab_security, tab_
 # TAB 1 — OVERVIEW
 # ============================================================
 with tab_overview:
-    st.markdown("## Portfolio Overview")
-
-    # History period selector lives here
-    hist_col, _ = st.columns([2, 8])
-    with hist_col:
-        hist_period = st.selectbox(
-            "History period",
-            ["6mo", "1y", "2y", "5y"],
-            index=2,
-            key="hist_period_tab1",
-        )
-
-    if hist_period != "2y":
-        with st.spinner("Fetching data…"):
-            try:
-                prices, current_prices, rf_rate = load_market_data(tickers, hist_period)
-                valuation_prices, price_view, alpaca_status = resolve_valuation_prices(
-                    tickers, current_prices)
-                ccy = build_currency_layer(
-                    tickers, prices, valuation_prices, base_ccy)
-                native_panel = ccy["native_panel"]
-                instruments = ccy["instruments"]
-                core = build_core_analytics(tickers, ccy["base_panel"],
-                                            ccy["base_current"], rf_rate)
-                _native_current_norm = {
-                    t: float(valuation_prices.get(t, float("nan")))
-                    * ccy["instruments"][t].quote_scale for t in tickers}
-                positions, valuations, val_agg, val_warnings = \
-                    build_position_valuations(
-                        tickers, ccy["instruments"], _native_current_norm,
-                        price_view, ccy["fx_hist"], ccy["fx_now"], base_ccy)
-                val_by_ticker = {v.ticker: v for v in valuations}
-                pos_by_ticker = positions
-            except ValueError as e:
-                st.error(f"Data error: {e}")
-                st.stop()
-            except Exception:
-                st.error("Could not load market data for the selected period.")
-                st.stop()
-            prices = core["prices"]
-            current_prices = core["current_prices"]
-            rf_rate = core["rf_rate"]
-            weights = core["weights"]
-            portfolio_value = core["portfolio_value"]
-            rets = core["rets"]
-            mu = core["mu"]
-            cov = core["cov"]
-            corr = core["corr"]
-            port_return = core["port_return"]
-            port_vol = core["port_vol"]
-            port_sharpe = core["port_sharpe"]
-            rc = core["rc"]
-            port_daily_returns = core["port_daily_returns"]
-
-    for _w in val_warnings:
-        st.warning(_w)
-
-    # Headline portfolio value on its own row: full width, never truncated.
-    st.metric(f"Portfolio Value ({base_ccy})", fmt_usd(portfolio_value),
-              help="Total current market value across all positions, "
-              f"in {base_ccy}.")
-    _fx_ts_txt = "-"
-    try:
-        if ccy.get("fx_timestamp") is not None:
-            _fx_ts_txt = ccy["fx_timestamp"].strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
-        pass
-    st.caption(
-        f"Historical prices through {prices.index[-1].date()} · "
-        f"FX through {_fx_ts_txt} · FX source: Yahoo Finance.")
-
-    # Small metrics (percentages / ratios): up to 4-5 per row is fine.
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Expected Return", fmt_pct(port_return))
-    c2.metric("Volatility (σ)", fmt_pct(port_vol))
-    c3.metric("Sharpe Ratio", f"{port_sharpe:.2f}")
-    c4.metric("Risk-Free Rate", fmt_pct(rf_rate))
-
-    st.markdown("---")
-
-    # Positions table from the single central valuation (base currency).
-    _sym = currency_symbol(base_ccy)
-    pos_head, pos_refresh = st.columns([4, 1])
-    with pos_head:
-        st.markdown("### Positions")
-    with pos_refresh:
-        if st.button("↻ Refresh live prices", key="refresh_live",
-                     help="Clear the short-TTL live-price/FX caches and fetch "
-                          "fresh Alpaca trades and FX."):
-            load_alpaca_trades.clear()
-            try:
-                load_current_fx.clear()
-            except Exception:
-                pass
-            st.rerun()
-    rows = []
-    for _v in valuations:
-        _p = pos_by_ticker.get(_v.ticker, {})
-        _buy = _p.purchase_date.isoformat() if getattr(
-            _p, "purchase_date", None) else "—"
-        _buy_px = (format_money(_p.purchase_price_native,
-                                _v.native_currency)
-                   if getattr(_p, "purchase_price_native", None) else "—")
-        _pnl = _v.unrealised_pnl if _v.unrealised_pnl is not None else float("nan")
-        _pnlp = (_v.unrealised_pnl_pct * 100 if _v.unrealised_pnl_pct is not None
-                 else float("nan"))
-        rows.append({
-            "Ticker": _v.ticker,
-            "Shares": _v.shares,
-            "Buy Date": _buy,
-            "Buy Px": _buy_px,
-            "Now Px": format_money(_v.native_current_price,
-                                   _v.native_currency),
-            "Source": _v.price_source,
-            f"Value ({base_ccy})": _v.base_market_value,
-            f"P&L ({base_ccy})": _pnl,
-            "P&L (%)": _pnlp,
-            "Weight": val_agg["weights"].get(_v.ticker, 0.0),
-        })
-    pos_df = pd.DataFrame(rows)
-    st.dataframe(
-        pos_df.style
-        .format({
-            f"Value ({base_ccy})": _sym + "{:,.2f}",
-            f"P&L ({base_ccy})": _sym + "{:+,.2f}",
-            "P&L (%)": "{:+.2f}%",
-            "Weight": "{:.1%}",
-        }, na_rep="—")
-        .map(lambda v: "color: #3fb950" if isinstance(v, (int, float)) and v > 0
-                  else ("color: #f85149" if isinstance(v, (int, float)) and v < 0 else ""),
-                  subset=[f"P&L ({base_ccy})", "P&L (%)"]),
-        width="stretch",
-    )
-    st.caption(
-        "Unrealised P&L = current market value − purchase cost (Price/FX "
-        "P&L). Cash dividends received are excluded — see Estimated "
-        "Dividend Income in Security Detail.")
-    if alpaca_status is None:
-        st.caption("Live US equity prices: Alpaca IEX. Historical portfolio "
-                   "analytics: Yahoo Finance. TradingView: charting only.")
-    elif alpaca_status == "disabled":
-        st.caption("Alpaca credentials not configured — current prices use "
-                   "Yahoo Finance. Historical analytics: Yahoo Finance.")
-    else:
-        st.warning(f"Live prices unavailable ({alpaca_status}) — current "
-                   "prices use Yahoo Finance. Historical analytics unaffected.")
-
-    st.markdown("---")
-
-    # ---- Quote-currency exposure (current base-currency market values) ----
-    st.markdown("### Quote Currency Exposure")
-    _expo: dict[str, float] = {}
-    for _v in valuations:
-        _expo[_v.native_currency] = _expo.get(_v.native_currency, 0.0) \
-            + _v.base_market_value
-    _expo_tot = sum(_expo.values())
-    _e1, _e2 = st.columns([1, 1])
-    with _e1:
-        fig_fx = go.Figure(go.Pie(
-            labels=list(_expo),
-            values=[_expo[k] / _expo_tot for k in _expo],
-            hole=0.45,
-            marker=dict(colors=px.colors.qualitative.Plotly),
-            textinfo="label+percent",
-            textfont=dict(family="IBM Plex Mono", size=13),
-        ))
-        fig_fx.update_layout(**CHART_THEME, title="Exposure by Quotation Currency")
-        st.plotly_chart(fig_fx, width="stretch")
-    with _e2:
-        for _ccy, _val in sorted(_expo.items(), key=lambda kv: -kv[1]):
-            st.metric(f"{_ccy} exposure",
-                      f"{_val / _expo_tot:.1%} ({fmt_usd(_val)})")
-    st.caption("Quote Currency Exposure: share of current portfolio value "
-               "economically exposed to each quotation currency — not "
-               "corporate revenue exposure.")
-
-    with st.expander("FX Shock — prices held constant"):
-        st.caption(
-            "First-order static sensitivity: local security prices held "
-            "constant while each non-base currency moves. Illustration, "
-            "not a forecast.")
-        _shocks = {}
-        _scols = st.columns(max(1, len([c for c in _expo if c != base_ccy]) or 1))
-        _i = 0
-        for _ccy in sorted(_expo):
-            if _ccy == base_ccy:
-                continue
-            with _scols[_i % len(_scols)]:
-                _shocks[_ccy] = st.number_input(
-                    f"{_ccy} shock (%)", value=0.0, step=1.0,
-                    key=f"fx_shock_{_ccy}") / 100.0
-            _i += 1
-        if any(_shocks.values()):
-            try:
-                _sr = fx_shock_portfolio(
-                    {k: v for k, v in _expo.items()}, _shocks, base_ccy)
-                s1, s2 = st.columns(2)
-                s1.metric("Shocked Value", fmt_usd(_sr["shocked_total"]))
-                s2.metric("Change", f"{_sr['pct_change']:+.2%}")
-            except ValueError as e:
-                st.error(str(e))
-
-    # ---- Data quality, freshness, methodology ----
-    with st.expander("Data Quality & Freshness"):
-        _now = datetime.now(timezone.utc)
-        _q_ages, _items = {}, []
-        for _v in valuations:
-            _age = quote_age_days(_v.current_price_timestamp, _now)
-            _q_ages[_v.ticker] = _age
-            _ts = (_v.current_price_timestamp.strftime("%Y-%m-%d %H:%M UTC")
-                   if _v.current_price_timestamp else "unknown")
-            _items.append({
-                "Item": f"{_v.ticker} price ({_v.price_source})",
-                "Status": "ok" if _age is not None and _age <= 5 else
-                          ("stale" if _age is not None else "unknown"),
-                "As of": _ts,
-            })
-        _fx_age = quote_age_days(ccy.get("fx_timestamp"), _now)
-        _items.append({
-            "Item": "Current FX (Yahoo Finance)",
-            "Status": "ok" if _fx_age is not None and _fx_age <= 5 else
-                      ("stale" if _fx_age is not None else "unknown"),
-            "As of": (ccy["fx_timestamp"].strftime("%Y-%m-%d %H:%M UTC")
-                      if ccy.get("fx_timestamp") else "unknown"),
-        })
-        _n_purch = sum(1 for t in tickers
-                       if pos_by_ticker.get(t) is not None
-                       and getattr(pos_by_ticker[t], "purchase_price_native",
-                                   None) is not None)
-        _items.append({"Item": "Purchase prices",
-                       "Status": f"{_n_purch} / {len(tickers)}",
-                       "As of": "position entry"})
-        _items.append({"Item": "Native currencies",
-                       "Status": f"{len(instruments)} / {len(tickers)}",
-                       "As of": "metadata lookup"})
-        st.dataframe(pd.DataFrame(_items), width="stretch",
-                     hide_index=True)
-        for _w in freshness_report(_q_ages, _fx_age):
-            st.warning(_w)
-        st.caption(f"Last refreshed: {_now.strftime('%H:%M:%S UTC')} "
-                   "(current quotes/FX; historical datasets have their own "
-                   "as-of dates shown per section).")
-
-    with st.expander("FX Conversion Details"):
-        _fxrows = []
-        for _v in valuations:
-            try:
-                _r = fx_rate_between(_v.native_currency, base_ccy,
-                                     ccy["fx_now"])
-                _rl = f"{_r:.4f}"
-            except ValueError:
-                _rl = "n/a"
-            _fxrows.append({
-                "Ticker": _v.ticker,
-                "Pair": f"{_v.native_currency} → {base_ccy}",
-                "Rate": _rl,
-                "Basis": "Current" if _v.native_currency != base_ccy
-                         else "Identity (no FX)",
-            })
-        st.dataframe(pd.DataFrame(_fxrows), width="stretch",
-                     hide_index=True)
-
-    with st.expander("Methodology & Data Sources"):
-        st.markdown(
-            f"""
-            **Current US prices** — Alpaca IEX (fallback: Yahoo Finance).
-            **Fallback prices** — Yahoo Finance.
-            **Historical prices** — Yahoo Finance (adjusted closes).
-            **Current FX** — Yahoo Finance (short TTL).
-            **Historical FX** — Yahoo Finance (long TTL).
-            **Factor data** — Kenneth R. French Data Library.
-            **Charts** — TradingView (native quotation, display only).
-
-            Prices remain in each security's native market currency.
-            Current portfolio values are translated using current FX rates.
-            Historical analytics and backtests use date-matched historical
-            FX, so currency movements are included in base-currency
-            investment returns.
-            """
-        )
-
-    # ---- Portfolio data export / snapshot ----
-    st.markdown("### Portfolio Data")
-    _d1, _d2 = st.columns(2)
-    with _d1:
-        _csv_df = summarize_portfolio_csv(
-            valuations, {t: pos_by_ticker[t] for t in tickers
-                         if t in pos_by_ticker})
-        st.download_button(
-            "Download Portfolio Summary (CSV)",
-            data=_csv_df.to_csv(index=False), file_name="portcalc-summary.csv",
-            mime="text/csv", key="dl_csv")
-    with _d2:
-        _snap = build_analysis_snapshot(
-            tickers, {t: pos_by_ticker[t].shares for t in tickers
-                      if t in pos_by_ticker},
-            {t: (pos_by_ticker[t].purchase_date.isoformat()
-                 if pos_by_ticker[t].purchase_date else None)
-             for t in tickers if t in pos_by_ticker},
-            base_ccy, "2y",
-            st.session_state.get("bt_benchmark", "SPY"),
-            float(rf_rate), None, 0.0, 1.0, {}, None, "Yahoo Finance",
-            prices.index[-1].date().isoformat())
-        st.download_button(
-            "Download Analysis Snapshot (JSON)",
-            data=json.dumps(_snap, indent=2),
-            file_name=f"{_snap['run_id']}.json", mime="application/json",
-            key="dl_snap")
-        st.caption(f"Run ID {_snap['run_id']} · inputs only, no secrets.")
-
-    st.markdown("---")
-
-    col_weights, col_rc = st.columns(2)
-
-    with col_weights:
-        st.markdown("### Weight Allocation")
-        fig_pie = go.Figure(go.Pie(
-            labels=tickers,
-            values=weights,
-            hole=0.45,
-            marker=dict(colors=px.colors.qualitative.Plotly),
-            textinfo="label+percent",
-            textfont=dict(family="IBM Plex Mono", size=13),
-        ))
-        fig_pie.update_layout(**CHART_THEME, title="Portfolio Weights")
-        st.plotly_chart(fig_pie, width="stretch")
-
-    with col_rc:
-        st.markdown("### Risk Contributions")
-        fig_rc = go.Figure(go.Bar(
-            x=tickers, y=rc,
-            marker_color="#58a6ff",
-            text=[f"{v:.1%}" for v in rc],
-            textposition="outside",
-        ))
-        fig_rc.update_layout(
-            **CHART_THEME,
-            title="Risk Contribution per Asset",
-            yaxis_tickformat=".0%",
-        )
-        st.plotly_chart(fig_rc, width="stretch")
-
-    st.markdown("---")
-
-    col_cov, col_corr = st.columns(2)
-
-    with col_cov:
-        st.markdown("### Covariance Matrix")
-        st.dataframe(style_matrix(cov, ".5f"), width="stretch")
-
-    with col_corr:
-        st.markdown("### Correlation Matrix")
-        st.dataframe(style_matrix(corr, ".4f"), width="stretch")
-
-    # Cumulative returns chart (log returns -> exp(cumsum), NOT (1+r).cumprod())
-    st.markdown("---")
-    st.markdown("### Cumulative Returns")
-
-    cum_ret = cumulative_growth_from_log_returns(rets)
-    fig_cum = go.Figure()
-    for col in tickers:
-        fig_cum.add_trace(go.Scatter(
-            x=cum_ret.index, y=cum_ret[col],
-            mode="lines", name=col,
-        ))
-    fig_cum.update_layout(
-        **CHART_THEME,
-        title="Cumulative Return (base = 1, from log returns)",
-        xaxis_title="Date", yaxis_title=f"Growth of {currency_symbol(base_ccy)}1",
-    )
-    st.plotly_chart(fig_cum, width="stretch")
-
-
-# ============================================================
+    _ov_out = render_section("Overview", views_overview.render, ctx)
+    if isinstance(_ov_out, dict):
+        ctx.update(_ov_out)
 # TAB 2 — RISK
 # ============================================================
 with tab_risk:
-    st.markdown("## Risk Analysis")
-
-    r_col1, r_col2 = st.columns([1, 3])
-
-    with r_col1:
-        var_horizon = st.number_input(
-            "VaR Horizon (days)", min_value=1, max_value=30, value=1, step=1
-        )
-        st.caption("VaR confidence fixed at 95% (industry standard)")
-
-    st.markdown("---")
-
-    # Daily parameters (log-return space)
-    port_std_daily  = to_daily(port_vol)
-    mu_daily        = mean_to_daily(mu.values)
-    cov_daily       = cov.values / 252
-
-    try:
-        var_param = parametric_var(port_std_daily, portfolio_value, 0.95, int(var_horizon))
-    except ValueError as e:
-        var_param = None
-        st.error(f"Parametric VaR error: {e}")
-    try:
-        var_hist = historical_var(
-            port_daily_returns, portfolio_value, 0.95, int(var_horizon)
-        )
-    except ValueError as e:
-        var_hist = None
-        hist_err = str(e)
-    try:
-        var_mc, mc_sim_rets = monte_carlo_var(
-            weights, mu_daily, cov_daily, portfolio_value, 0.95, int(var_horizon), 10_000
-        )
-    except ValueError as e:
-        var_mc, mc_sim_rets = None, None
-        st.error(f"Monte Carlo VaR error: {e}")
-
-    v1, v2, v3 = st.columns(3)
-    with v1:
-        st.markdown("#### Parametric VaR")
-        st.metric("95% VaR", fmt_usd(var_param) if var_param is not None else "n/a")
-        st.caption(
-            "Assumes normally distributed returns. "
-            f"At 95% confidence over {int(var_horizon)}d, potential loss ≤ "
-            f"{fmt_usd(var_param) if var_param is not None else 'n/a'}."
-        )
-    with v2:
-        st.markdown("#### Historical VaR")
-        st.metric("95% VaR", fmt_usd(var_hist) if var_hist is not None else "n/a")
-        if var_hist is None:
-            st.caption(f"Historical VaR unavailable: {hist_err}")
-        else:
-            n_win = len(port_daily_returns) - int(var_horizon) + 1
-            st.caption(
-                "Uses genuine rolling "
-                f"{int(var_horizon)}-day historical returns ({n_win:,} overlapping "
-                "windows). No normality or √T-scaling assumption."
-            )
-    with v3:
-        st.markdown("#### Monte Carlo VaR")
-        st.metric("95% VaR", fmt_usd(var_mc) if var_mc is not None else "n/a")
-        st.caption(
-            "10,000 simulated return paths using multivariate normal. "
-            "Log returns are converted to simple P&L via exp(r)−1. "
-            "Captures correlation structure."
-        )
-
-    # Historical CVaR (Expected Shortfall) at the same horizon
-    st.markdown("---")
-    st.markdown("### Historical CVaR (Expected Shortfall)")
-    try:
-        cvar_out = historical_cvar(
-            port_daily_returns, portfolio_value, 0.95, int(var_horizon)
-        )
-    except ValueError as e:
-        cvar_out = None
-        st.warning(f"Historical CVaR unavailable: {e}")
-
-    if cvar_out is not None:
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            st.metric(
-                f"95% Historical VaR ({int(var_horizon)}d)",
-                fmt_usd(cvar_out["var_currency"]),
-                help="Loss threshold exceeded in the worst 5% of historical periods.",
-            )
-            st.caption(f"Cutoff return: {cvar_out['var_pct']:.2%}")
-        with cc2:
-            st.metric(
-                f"95% Historical CVaR ({int(var_horizon)}d)",
-                fmt_usd(cvar_out["cvar_currency"]),
-                help="Average loss once the VaR threshold has been exceeded.",
-            )
-            st.caption(
-                f"Average tail loss: {cvar_out['cvar_pct']:.2%} "
-                f"over {cvar_out['n_tail']:,} of {cvar_out['n_windows']:,} "
-                "genuine rolling windows."
-            )
-        st.caption(
-            "VaR estimates the loss threshold exceeded in the worst 5% of periods. "
-            "CVaR estimates the average loss once that threshold has been exceeded."
-        )
-
-    st.markdown("---")
-
-    # Return distribution
-    st.markdown("### Daily Return Distribution")
-    fig_dist = go.Figure()
-    fig_dist.add_trace(go.Histogram(
-        x=port_daily_returns,
-        nbinsx=60,
-        name="Daily Returns",
-        marker_color="rgba(88, 166, 255, 0.6)",
-        marker_line=dict(color="rgba(88,166,255,0.9)", width=0.5),
-    ))
-    var_pct_5 = np.percentile(port_daily_returns, 5)
-    fig_dist.add_vline(x=var_pct_5, line=dict(color="#f85149", dash="dash", width=2))
-    fig_dist.add_annotation(
-        x=var_pct_5, text="5th pct",
-        showarrow=True, arrowcolor="#f85149",
-        font=dict(color="#f85149"), yref="paper", y=0.9,
-    )
-    fig_dist.update_layout(
-        **CHART_THEME,
-        title="Portfolio Daily Return Distribution",
-        xaxis_title="Daily Return", yaxis_title="Count",
-    )
-    st.plotly_chart(fig_dist, width="stretch")
-
-    # MC simulation return histogram
-    if mc_sim_rets is not None:
-        st.markdown("### Monte Carlo Simulated Returns")
-        fig_mc = go.Figure(go.Histogram(
-            x=mc_sim_rets,
-            nbinsx=60,
-            marker_color="rgba(240, 136, 62, 0.6)",
-            marker_line=dict(color="rgba(240,136,62,0.9)", width=0.5),
-        ))
-        var_mc_pct = np.percentile(mc_sim_rets, 5)
-        fig_mc.add_vline(x=var_mc_pct, line=dict(color="#f85149", dash="dash", width=2))
-        fig_mc.add_annotation(
-            x=var_mc_pct, text="VaR 5th pct",
-            showarrow=True, arrowcolor="#f85149",
-            font=dict(color="#f85149"), yref="paper", y=0.9,
-        )
-        fig_mc.update_layout(
-            **CHART_THEME,
-            title=f"MC Simulated {int(var_horizon)}-Day Portfolio Returns (simple returns)",
-            xaxis_title="Portfolio Return", yaxis_title="Count",
-        )
-        st.plotly_chart(fig_mc, width="stretch")
-
-
-# ============================================================
+    render_section("Risk", views_risk.render, ctx)
 # TAB 3 — OPTIMISE
 # ============================================================
 with tab_optimise:

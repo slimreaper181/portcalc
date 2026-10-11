@@ -32,21 +32,31 @@ def unexpected_error_card(section: str, exc: BaseException) -> None:
                 + "".join(traceback.format_exception(exc))[-2000:])
 
 
-def render_section(name: str, fn, *args, **kwargs) -> bool:
+#: Verification switch: when True, section errors re-raise instead of
+#: carding (used by headless AppTest audits to catch extraction bugs that
+#: the boundary would otherwise mask as cards).
+STRICT = False
+
+
+def render_section(name: str, fn, *args, **kwargs):
     """Run one UI section with an error boundary.
 
-    Returns True when the section rendered. Expected ``ValueError`` shows
-    the message as a card; anything else shows the unexpected card. Either
-    way the exception never propagates to sibling sections — this replaces
-    the cross-tab ``st.stop()`` cascade for section-local failures.
+    Returns the function's result on success (None for plain renderers),
+    False on failure. Expected ``ValueError`` shows the message as a card;
+    anything else shows the unexpected card. Either way the exception never
+    propagates to sibling sections — this replaces the cross-tab
+    ``st.stop()`` cascade for section-local failures.
     """
     try:
-        fn(*args, **kwargs)
-        return True
+        return fn(*args, **kwargs)
     except ValueError as e:
+        if STRICT:
+            raise
         error_card(f"{name} unavailable", str(e) or "Invalid inputs.",
                    action="Adjust the section inputs and try again.")
         return False
     except Exception as e:  # never let one section kill the page
+        if STRICT:
+            raise
         unexpected_error_card(name, e)
         return False
