@@ -101,3 +101,18 @@ def format_date(d) -> str:
     except (ValueError, TypeError):
         pass
     return MISSING
+
+
+def format_trade_time(ts):
+    """Format an Alpaca trade timestamp as ET (UTC fallback). Never raises."""
+    if ts is None:
+        return "time unknown"
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ts.astimezone(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET")
+    except Exception:
+        try:
+            return ts.strftime("%H:%M:%S UTC")
+        except Exception:
+            return "time unknown"
