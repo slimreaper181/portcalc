@@ -220,9 +220,10 @@ if "data_loaded" not in st.session_state:
 
 with st.sidebar:
     st.markdown("## 📈 Portfolio Editor")
-    st.markdown("---")
     render_flash()  # rerun-surviving confirmations render once, here
 
+    st.markdown('<div class="pc-kicker">PORTFOLIO</div>',
+                unsafe_allow_html=True)
     # --- Base currency (global valuation currency) ---
     if st.session_state.get("base_currency") not in SUPPORTED_BASE_CURRENCIES:
         st.session_state.base_currency = "USD"
@@ -345,8 +346,9 @@ with st.sidebar:
                     st.session_state.pending_buy = None
                     st.rerun()
 
+    st.markdown('<div class="pc-kicker">HOLDINGS</div>',
+                unsafe_allow_html=True)
     # --- Current positions ---
-    st.markdown("### Current Positions")
     to_remove = []
     for ticker, pos in list(st.session_state.portfolio.items()):
         col1, col2 = st.columns([3, 1])
@@ -370,75 +372,93 @@ with st.sidebar:
         flash(f"Removed {t}.", "info")
         st.rerun()
 
-    st.markdown("---")
+    st.markdown('<div class="pc-kicker">DATA</div>',
+                unsafe_allow_html=True)
+    with st.expander("Market data", expanded=False):
+        if st.button("🔄 Refresh Market Data"):
+            st.session_state.data_loaded = False
+            for _cache_fn in (load_market_data, load_benchmark_data,
+                              load_backtest_data, load_factor_data,
+                              load_exchange_hint, load_alpaca_trades,
+                              load_instruments, load_fx_history, load_current_fx,
+                              load_raw_history, load_splits, load_dividends_history):
+                try:
+                    _cache_fn.clear()
+                except Exception:
+                    pass
+            flash("Market data refreshed.", "success")
+            st.rerun()
+        st.caption(
+            "Current US prices: Alpaca IEX (Yahoo fallback). Historical "
+            "prices, FX: Yahoo Finance. Factors: Kenneth French library. "
+            "Charts: TradingView (display only).")
 
-    if st.button("🔄 Refresh Market Data"):
-        st.session_state.data_loaded = False
-        for _cache_fn in (load_market_data, load_benchmark_data,
-                          load_backtest_data, load_factor_data,
-                          load_exchange_hint, load_alpaca_trades,
-                          load_instruments, load_fx_history, load_current_fx,
-                          load_raw_history, load_splits, load_dividends_history):
-            try:
-                _cache_fn.clear()
-            except Exception:
-                pass
-        flash("Market data refreshed.", "success")
-        st.rerun()
-
+    st.markdown('<div class="pc-kicker">FILES</div>',
+                unsafe_allow_html=True)
     # --- Export / Import (positions + settings only, never secrets) ---
-    st.markdown("### Portfolio Data")
-    try:
-        _export_doc = export_portfolio(
-            st.session_state.portfolio,
-            st.session_state.get("base_currency", "USD"))
-        st.download_button(
-            "Export Portfolio (JSON)", data=json.dumps(_export_doc, indent=2),
-            file_name="portcalc-portfolio.json", mime="application/json",
-            key="export_json")
-    except ValueError as e:
-        st.warning(f"Export unavailable: {e}")
-    _uploaded = st.file_uploader("Import Portfolio (JSON)", type=["json"],
-                                 key="import_json")
-    if _uploaded is not None:
-        if st.button("Replace portfolio with import", key="import_apply"):
-            try:
-                _doc = json.load(_uploaded)
-                _imp_positions, _imp_base = validate_positions_import(_doc)
-            except (ValueError, json.JSONDecodeError) as e:
-                st.error(f"Import rejected: {e}")
-            except Exception:
-                st.error("Import rejected: unreadable file.")
-            else:
-                st.session_state.portfolio = _imp_positions
-                if _imp_base in SUPPORTED_BASE_CURRENCIES:
-                    st.session_state.base_currency = _imp_base
-                    save_settings({"base_currency": _imp_base})
-                save_portfolio(st.session_state.portfolio)
-                st.session_state.data_loaded = False
-                flash(f"Imported {len(_imp_positions)} positions "
-                      f"(base {_imp_base}).", "success")
-                st.rerun()
+    with st.expander("Import / export / reset", expanded=False):
+        st.markdown("### Portfolio Data")
+        try:
+            _export_doc = export_portfolio(
+                st.session_state.portfolio,
+                st.session_state.get("base_currency", "USD"))
+            st.download_button(
+                "Export Portfolio (JSON)", data=json.dumps(_export_doc, indent=2),
+                file_name="portcalc-portfolio.json", mime="application/json",
+                key="export_json")
+        except ValueError as e:
+            st.warning(f"Export unavailable: {e}")
+        _uploaded = st.file_uploader("Import Portfolio (JSON)", type=["json"],
+                                     key="import_json")
+        if _uploaded is not None:
+            if st.button("Replace portfolio with import", key="import_apply"):
+                try:
+                    _doc = json.load(_uploaded)
+                    _imp_positions, _imp_base = validate_positions_import(_doc)
+                except (ValueError, json.JSONDecodeError) as e:
+                    st.error(f"Import rejected: {e}")
+                except Exception:
+                    st.error("Import rejected: unreadable file.")
+                else:
+                    st.session_state.portfolio = _imp_positions
+                    if _imp_base in SUPPORTED_BASE_CURRENCIES:
+                        st.session_state.base_currency = _imp_base
+                        save_settings({"base_currency": _imp_base})
+                    save_portfolio(st.session_state.portfolio)
+                    st.session_state.data_loaded = False
+                    flash(f"Imported {len(_imp_positions)} positions "
+                          f"(base {_imp_base}).", "success")
+                    st.rerun()
 
-    # --- Reset with intentional confirmation ---
-    if st.button("Reset Portfolio", key="reset_start"):
-        st.session_state.confirm_reset = True
-        st.rerun()
-    if st.session_state.get("confirm_reset"):
-        st.warning("Delete ALL positions? This cannot be undone.")
-        _r1, _r2 = st.columns(2)
-        with _r1:
-            if st.button("Confirm reset", key="reset_confirm"):
-                st.session_state.portfolio = {}
-                save_portfolio(st.session_state.portfolio)
-                st.session_state.confirm_reset = False
-                st.session_state.data_loaded = False
-                flash("Portfolio reset — all positions removed.", "warning")
-                st.rerun()
-        with _r2:
-            if st.button("Cancel", key="reset_cancel"):
-                st.session_state.confirm_reset = False
-                st.rerun()
+        # --- Reset with intentional confirmation ---
+        if st.button("Reset Portfolio", key="reset_start"):
+            st.session_state.confirm_reset = True
+            st.rerun()
+        if st.session_state.get("confirm_reset"):
+            st.warning("Delete ALL positions? This cannot be undone.")
+            _r1, _r2 = st.columns(2)
+            with _r1:
+                if st.button("Confirm reset", key="reset_confirm"):
+                    st.session_state.portfolio = {}
+                    save_portfolio(st.session_state.portfolio)
+                    st.session_state.confirm_reset = False
+                    st.session_state.data_loaded = False
+                    flash("Portfolio reset — all positions removed.", "warning")
+                    st.rerun()
+            with _r2:
+                if st.button("Cancel", key="reset_cancel"):
+                    st.session_state.confirm_reset = False
+                    st.rerun()
+
+    st.markdown('<div class="pc-kicker">ADVANCED</div>',
+                unsafe_allow_html=True)
+    with st.expander("Assumptions", expanded=False):
+        st.caption(
+            "Adjusted closes (splits/dividends per Yahoo). End-of-day "
+            "execution approximation; fractional shares; no market impact "
+            "beyond explicit bps costs. Risk-free rate fixed at 5% across "
+            "historical windows. French factors are US datasets. "
+            "TradingView charts are display-only.")
 
 
 try:
