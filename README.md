@@ -1,34 +1,84 @@
-# portcalc — Portfolio Analytics & Risk Dashboard
+# portcalc — Portfolio Research & Risk
 
-A modular Python portfolio analytics system with a Streamlit web interface.
+A modular Python portfolio research platform with a Streamlit web interface:
+institutional analytics (risk, optimisation, backtesting, walk-forward,
+factors) with purchase-date cost basis and USD/GBP/EUR multi-currency
+support.
 
 ## Features
 
 - **Live market data** via yfinance (prices, risk-free rate)
-- **Portfolio overview** — positions, P&L, weights, risk contributions
-- **Risk analysis** — Parametric, Historical, and Monte Carlo VaR
-- **Portfolio optimisation** — Min variance, Max Sharpe, target return/volatility, efficient frontier
-- **Scenario & Monte Carlo simulation** — forward simulation with stress scenarios (crash, bull, high-vol, custom)
-- **Portfolio persistence** — positions saved to `portfolio.json` between sessions
+- **Portfolio overview** — positions, cost basis, P&L, weights, insights,
+  quote-currency exposure, dividends, data quality
+- **Risk analysis** — Parametric, Historical, and Monte Carlo VaR, CVaR,
+  risk contributions, correlation
+- **Portfolio optimisation** — Min variance, Max Sharpe, target return/volatility,
+  efficient frontier, Equal Risk Contribution, Maximum Diversification,
+  Black-Litterman (absolute/relative views), side-by-side comparison
+- **Scenario & Monte Carlo simulation** — forward simulation with stress
+  scenarios (crash, bull, high-vol, custom), contributions, comparison
+- **Performance analytics** — benchmark comparison, drawdowns, rolling
+  metrics, beta/alpha/tracking error, currency-aware benchmark
+- **Security detail** — position card, performance, risk relationship,
+  TradingView chart (display only), Alpaca live US prices with fallback
+- **Historical backtesting** — buy-and-hold, periodic rebalancing, exact
+  transaction-cost accounting, three gated workflows (Historical, Static
+  OOS, Walk-Forward)
+- **Walk-forward optimisation** — rolling/expanding re-estimation with
+  strict no-look-ahead (training dates < execution date), turnover and
+  cost-drag diagnostics, static-vs-dynamic comparison
+- **Factor analysis** — CAPM, FF3, FF5, FF5+Momentum on French data with
+  attribution and rolling exposures
+- **Purchase dates & cost basis** — split-adjusted estimates, GBp
+  normalisation, manual execution-price override
+- **Multi-currency** — USD/GBP/EUR base with date-matched historical FX
+- **Portfolio persistence** — versioned JSON import/export
+  (`portfolio.json`), analysis snapshot export
 
 ## Project Structure
 
 ```
 portcalc/
-├── app.py                  # Streamlit entry point
-├── requirements.txt
-├── portfolio.json          # Saved positions (auto-created)
+├── app.py                  # Streamlit shell (session, sidebar, navigation)
+├── ui/                     # Presentation layer (no numerical logic)
+│   ├── theme.py            # Design tokens + global stylesheet
+│   ├── formatting.py       # Money/percent/date vocabulary
+│   ├── charts.py           # Plotly design system
+│   ├── tables.py           # Table presentation + comparison renderer
+│   ├── feedback.py         # Rerun-surviving flash messages
+│   ├── errors.py           # Section error boundaries
+│   ├── state.py            # Session defaults + result cache
+│   ├── insights.py         # Deterministic portfolio observations
+│   ├── bl.py               # Black-Litterman UI inputs
+│   └── views/              # One render module per research tab
+│       └── overview.py risk.py optimise.py scenarios.py
+│           performance.py security.py backtest.py factors.py
 ├── data/
 │   ├── __init__.py
-│   └── market_data.py      # yfinance wrappers
+│   ├── market_data.py      # yfinance wrappers
+│   ├── pipeline.py         # Cached loaders + composed data plumbing
+│   ├── fx.py               # FX + instrument metadata
+│   ├── alpaca.py           # Live US prices (valuation only)
+│   └── factors.py          # French data library access
 └── analytics/
     ├── __init__.py
-    ├── returns.py           # Log returns, mean, covariance, correlation
-    ├── portfolio.py         # Portfolio metrics, Sharpe, risk contributions, CML
-    ├── var.py               # Parametric, historical, Monte Carlo VaR
-    ├── optimisation.py      # SLSQP optimisation, efficient frontier, rebalancing
-    └── scenario.py          # Monte Carlo forward simulation, stress scenarios
+    ├── returns.py          # Log returns, mean, covariance, correlation
+    ├── portfolio.py        # Portfolio metrics, Sharpe, risk contributions, CML
+    ├── var.py              # Parametric, historical, Monte Carlo VaR + CVaR
+    ├── optimisation.py     # SLSQP optimisation, efficient frontier, rebalancing
+    ├── scenario.py         # Monte Carlo forward simulation, stress scenarios
+    ├── allocation.py       # ERC, MaxDiv, Black-Litterman, OOS windows
+    ├── backtest.py         # Static backtesting engine (exact costs)
+    ├── walkforward.py      # Walk-forward optimisation engine
+    ├── currency.py         # FX maths (no look-ahead)
+    ├── positions.py        # Cost basis, valuation, splits, dividends
+    ├── performance.py      # Drawdowns, rolling metrics, benchmark stats
+    └── factors.py          # Factor regressions + attribution
 ```
+
+UI modules must not contain numerical logic; analytics modules stay
+importable without Streamlit session state (the cached pipeline in
+`data/pipeline.py` is the only Streamlit-aware data layer).
 
 ## Installation
 
