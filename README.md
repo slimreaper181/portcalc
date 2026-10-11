@@ -220,3 +220,8 @@ into backtest wealth paths (which use adjusted prices).
   bias); rebalances execute at the next eligible close (approximation);
   static out-of-sample weights are never re-estimated in-test.
 - TradingView charts show native market quotation, display only.
+- Data model notes for future work: positions are single-lot aggregates
+  (`purchase_date` may be null, prices are per current split-adjusted
+  share); cash balances, multi-lot tax lots and realised-P&L ledgers are
+  not modelled yet, so those extensions need no redesign of the analytics
+  layer, only new position kinds and ledger views.
