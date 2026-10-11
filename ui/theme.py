@@ -52,6 +52,14 @@ section[data-testid="stSidebar"] { background: #0e1319; border-right: 1px solid 
 section[data-testid="stSidebar"] .stMarkdown h2 { font-size: 13px; letter-spacing: 2px; color: #9aa7b8; }
 div[data-testid="stMetric"] { background: #11161d; border: 1px solid #232c38; border-radius: 10px; padding: 12px 14px; }
 div[data-testid="stMetric"] label { color: #9aa7b8 !important; }
+div[data-testid="stMetricValue"] { color: #58a6ff; }
+div[data-testid="stMetricValue"], div[data-testid="stMetricValue"] > div {
+  white-space: normal !important;
+  overflow: visible !important;
+  text-overflow: clip !important;
+}
+.stButton>button { border-radius: 6px; font-weight: 600; }
+.stButton>button[kind="primary"] { background: #1f3a5f; border: 1px solid #58a6ff; color: #e6ebf2; }
 div[data-testid="stTabs"] button { color: #9aa7b8; }
 div[data-testid="stTabs"] button[aria-selected="true"] { color: #e6ebf2; border-bottom: 2px solid #58a6ff; }
 .stDataFrame { border: 1px solid #232c38; border-radius: 10px; }

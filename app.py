@@ -216,6 +216,7 @@ from analytics.walkforward import (
     run_walk_forward,
     turnover_diagnostics,
 )
+from ui.feedback import flash, render_flash
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -243,66 +244,11 @@ DEFAULT_PORTFOLIO = {
 }
 
 # ---------------------------------------------------------------------------
-# Page configuration
+# Page configuration + visual theme (single design system in ui/theme.py)
 # ---------------------------------------------------------------------------
 
-st.set_page_config(
-    page_title="Portfolio Analytics",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.markdown("""
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap');
-
-  html, body, [class*="css"] {
-    font-family: 'IBM Plex Sans', sans-serif;
-    background-color: #0d1117;
-    color: #c9d1d9;
-  }
-  h1, h2, h3, h4 { font-family: 'IBM Plex Mono', monospace; color: #e6edf3; }
-  .stTabs [data-baseweb="tab"] { font-family: 'IBM Plex Mono', monospace; font-size: 14px; }
-  .metric-card {
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 8px;
-    padding: 16px;
-    text-align: center;
-  }
-  .metric-card .value { font-size: 26px; font-weight: 600; color: #58a6ff; }
-  .metric-card .label { font-size: 12px; color: #8b949e; margin-top: 4px; }
-  div[data-testid="stSidebarContent"] {
-    background-color: #161b22;
-    border-right: 1px solid #30363d;
-  }
-  .stButton>button {
-    background-color: #238636;
-    color: #ffffff;
-    border: none;
-    border-radius: 6px;
-    font-family: 'IBM Plex Mono', monospace;
-    font-weight: 600;
-  }
-  .stButton>button:hover { background-color: #2ea043; }
-  div[data-testid="stMetricValue"] {
-    color: #58a6ff;
-    font-family: 'IBM Plex Mono', monospace;
-    /* Never ellipsise financial values: allow wrapping instead of clipping.
-       Layouts below keep large currency metrics to 2-3 cards per row so
-       wrapping is a last resort, not the norm. */
-    white-space: normal !important;
-    overflow: visible !important;
-    text-overflow: clip !important;
-  }
-  div[data-testid="stMetricValue"] > div {
-    white-space: normal !important;
-    overflow: visible !important;
-    text-overflow: clip !important;
-  }
-</style>
-""", unsafe_allow_html=True)
+from ui.theme import inject_theme
+inject_theme()
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +344,8 @@ def _complete_add_position(sym, shares, purchase_date, price_native,
     st.session_state.data_loaded = False
     _label = {"estimate": "estimated close", "manual": "actual execution",
               "legacy": "legacy cost"}.get(source, source)
-    st.success(f"Added {sym} ({_label}).")
+    # Flash (not st.success): per-run deltas are dropped by st.rerun().
+    flash(f"Added {sym} ({_label}).", "success")
     st.rerun()
 
 
@@ -680,6 +627,7 @@ def load_alpaca_trades(symbols):
 with st.sidebar:
     st.markdown("## 📈 Portfolio Editor")
     st.markdown("---")
+    render_flash()  # rerun-surviving confirmations render once, here
 
     # --- Base currency (global valuation currency) ---
     if st.session_state.get("base_currency") not in SUPPORTED_BASE_CURRENCIES:
@@ -825,6 +773,7 @@ with st.sidebar:
         del st.session_state.portfolio[t]
         save_portfolio(st.session_state.portfolio)
         st.session_state.data_loaded = False
+        flash(f"Removed {t}.", "info")
         st.rerun()
 
     st.markdown("---")
@@ -840,6 +789,7 @@ with st.sidebar:
                 _cache_fn.clear()
             except Exception:
                 pass
+        flash("Market data refreshed.", "success")
         st.rerun()
 
     # --- Export / Import (positions + settings only, never secrets) ---
@@ -872,8 +822,8 @@ with st.sidebar:
                     save_settings({"base_currency": _imp_base})
                 save_portfolio(st.session_state.portfolio)
                 st.session_state.data_loaded = False
-                st.success(f"Imported {len(_imp_positions)} positions "
-                           f"(base {_imp_base}).")
+                flash(f"Imported {len(_imp_positions)} positions "
+                      f"(base {_imp_base}).", "success")
                 st.rerun()
 
     # --- Reset with intentional confirmation ---
@@ -889,6 +839,7 @@ with st.sidebar:
                 save_portfolio(st.session_state.portfolio)
                 st.session_state.confirm_reset = False
                 st.session_state.data_loaded = False
+                flash("Portfolio reset — all positions removed.", "warning")
                 st.rerun()
         with _r2:
             if st.button("Cancel", key="reset_cancel"):
@@ -1307,7 +1258,7 @@ def _render_backtest_comparison(results: dict) -> None:
             else:
                 _cells.append(str(_v))
         _disp[_col] = _cells
-    st.dataframe(_disp, use_container_width=True)
+    st.dataframe(_disp, width="stretch")
 
 
 try:
@@ -1543,7 +1494,7 @@ with tab_overview:
         .map(lambda v: "color: #3fb950" if isinstance(v, (int, float)) and v > 0
                   else ("color: #f85149" if isinstance(v, (int, float)) and v < 0 else ""),
                   subset=[f"P&L ({base_ccy})", "P&L (%)"]),
-        use_container_width=True,
+        width="stretch",
     )
     st.caption(
         "Unrealised P&L = current market value − purchase cost (Price/FX "
@@ -1579,7 +1530,7 @@ with tab_overview:
             textfont=dict(family="IBM Plex Mono", size=13),
         ))
         fig_fx.update_layout(**CHART_THEME, title="Exposure by Quotation Currency")
-        st.plotly_chart(fig_fx, use_container_width=True)
+        st.plotly_chart(fig_fx, width="stretch")
     with _e2:
         for _ccy, _val in sorted(_expo.items(), key=lambda kv: -kv[1]):
             st.metric(f"{_ccy} exposure",
@@ -1647,7 +1598,7 @@ with tab_overview:
         _items.append({"Item": "Native currencies",
                        "Status": f"{len(instruments)} / {len(tickers)}",
                        "As of": "metadata lookup"})
-        st.dataframe(pd.DataFrame(_items), use_container_width=True,
+        st.dataframe(pd.DataFrame(_items), width="stretch",
                      hide_index=True)
         for _w in freshness_report(_q_ages, _fx_age):
             st.warning(_w)
@@ -1671,7 +1622,7 @@ with tab_overview:
                 "Basis": "Current" if _v.native_currency != base_ccy
                          else "Identity (no FX)",
             })
-        st.dataframe(pd.DataFrame(_fxrows), use_container_width=True,
+        st.dataframe(pd.DataFrame(_fxrows), width="stretch",
                      hide_index=True)
 
     with st.expander("Methodology & Data Sources"):
@@ -1737,7 +1688,7 @@ with tab_overview:
             textfont=dict(family="IBM Plex Mono", size=13),
         ))
         fig_pie.update_layout(**CHART_THEME, title="Portfolio Weights")
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.plotly_chart(fig_pie, width="stretch")
 
     with col_rc:
         st.markdown("### Risk Contributions")
@@ -1752,7 +1703,7 @@ with tab_overview:
             title="Risk Contribution per Asset",
             yaxis_tickformat=".0%",
         )
-        st.plotly_chart(fig_rc, use_container_width=True)
+        st.plotly_chart(fig_rc, width="stretch")
 
     st.markdown("---")
 
@@ -1760,11 +1711,11 @@ with tab_overview:
 
     with col_cov:
         st.markdown("### Covariance Matrix")
-        st.dataframe(style_matrix(cov, ".5f"), use_container_width=True)
+        st.dataframe(style_matrix(cov, ".5f"), width="stretch")
 
     with col_corr:
         st.markdown("### Correlation Matrix")
-        st.dataframe(style_matrix(corr, ".4f"), use_container_width=True)
+        st.dataframe(style_matrix(corr, ".4f"), width="stretch")
 
     # Cumulative returns chart (log returns -> exp(cumsum), NOT (1+r).cumprod())
     st.markdown("---")
@@ -1782,7 +1733,7 @@ with tab_overview:
         title="Cumulative Return (base = 1, from log returns)",
         xaxis_title="Date", yaxis_title=f"Growth of {currency_symbol(base_ccy)}1",
     )
-    st.plotly_chart(fig_cum, use_container_width=True)
+    st.plotly_chart(fig_cum, width="stretch")
 
 
 # ============================================================
@@ -1916,7 +1867,7 @@ with tab_risk:
         title="Portfolio Daily Return Distribution",
         xaxis_title="Daily Return", yaxis_title="Count",
     )
-    st.plotly_chart(fig_dist, use_container_width=True)
+    st.plotly_chart(fig_dist, width="stretch")
 
     # MC simulation return histogram
     if mc_sim_rets is not None:
@@ -1939,7 +1890,7 @@ with tab_risk:
             title=f"MC Simulated {int(var_horizon)}-Day Portfolio Returns (simple returns)",
             xaxis_title="Portfolio Return", yaxis_title="Count",
         )
-        st.plotly_chart(fig_mc, use_container_width=True)
+        st.plotly_chart(fig_mc, width="stretch")
 
 
 # ============================================================
@@ -1995,11 +1946,11 @@ with tab_optimise:
             # Clamp a stale session value into the current bounds.
             st.session_state.target_r_val = float(
                 np.clip(st.session_state.target_r_val, r_min_bound, r_max_bound))
+            # No `value=` here: the widget reads the clamped session value
+            # (passing both logs a Streamlit session-state warning).
             target_r_val = st.slider(
                 "Target annual return",
-                r_min_bound, r_max_bound,
-                st.session_state.target_r_val,
-                0.005,
+                min_value=r_min_bound, max_value=r_max_bound, step=0.005,
                 format="%.1f%%",
                 key="target_r_val",
             )
@@ -2030,9 +1981,7 @@ with tab_optimise:
             )
             target_v_val = st.slider(
                 "Target annual volatility",
-                v_min_bound, v_max_bound,
-                st.session_state.target_v_val,
-                0.005,
+                min_value=v_min_bound, max_value=v_max_bound, step=0.005,
                 format="%.1f%%",
                 key="target_v_val",
             )
@@ -2119,7 +2068,7 @@ with tab_optimise:
                 xaxis_title="Volatility (σ)", yaxis_title="Expected Return",
                 xaxis_tickformat=".0%", yaxis_tickformat=".0%",
             )
-            st.plotly_chart(fig_ef, use_container_width=True)
+            st.plotly_chart(fig_ef, width="stretch")
 
         # Rebalancing trades
         st.markdown("---")
@@ -2164,7 +2113,7 @@ with tab_optimise:
                             currency_symbol(base_ccy) + "{:+,.2f}",
                     })
                     .map(_colour_action, subset=["Action"]),
-                    use_container_width=True,
+                    width="stretch",
                 )
         else:
             detail = ""
@@ -2263,7 +2212,7 @@ with tab_optimise:
                 wtab = pd.DataFrame(
                     {m: a.weights for m, a in ok_allocs.items()})
                 st.dataframe(wtab.style.format("{:.1%}"),
-                             use_container_width=True)
+                             width="stretch")
 
                 st.markdown("#### Allocation Metrics")
                 mrows = ["Expected Return", "Volatility", "Sharpe",
@@ -2282,7 +2231,7 @@ with tab_optimise:
                         f"{s['effective_holdings']:.2f}",
                         f"{s['rc_dispersion']:.2%}",
                     ]
-                st.dataframe(mtab, use_container_width=True)
+                st.dataframe(mtab, width="stretch")
                 st.caption(
                     "RC Dispersion is the std of percentage risk contributions "
                     "(near zero = evenly spread risk, the risk-parity ideal).")
@@ -2300,7 +2249,7 @@ with tab_optimise:
                     xaxis_title="Ticker", yaxis_title="Weight",
                     yaxis_tickformat=".0%",
                 )
-                st.plotly_chart(fig_w, use_container_width=True)
+                st.plotly_chart(fig_w, width="stretch")
 
                 rc_methods = [m for m in (
                     "Current", "Risk Parity", "Max Diversification",
@@ -2319,7 +2268,7 @@ with tab_optimise:
                         xaxis_title="Ticker", yaxis_title="Risk Contribution",
                         yaxis_tickformat=".0%",
                     )
-                    st.plotly_chart(fig_rc, use_container_width=True)
+                    st.plotly_chart(fig_rc, width="stretch")
                     st.caption(
                         "Risk parity should show approximately equal bars "
                         "when successful.")
@@ -2338,7 +2287,7 @@ with tab_optimise:
                     "Change": [f"{(b - a):+.2%}" for a, b in zip(
                         bl_post.prior.values, bl_post.posterior.values)],
                 }).set_index("Ticker")
-                st.dataframe(post_df, use_container_width=True)
+                st.dataframe(post_df, width="stretch")
                 _bl_ref_w = _bl_reference_weights(
                     bl_cfg["ref"], weights, tickers)
                 _prior_ret = float(np.dot(_bl_ref_w, bl_post.prior.values))
@@ -2407,7 +2356,7 @@ with tab_scenario:
             custom_shock = 0.0
             custom_vol   = 1.0
 
-        run_btn = st.button("▶  Run Simulation", use_container_width=True)
+        run_btn = st.button("▶  Run Simulation", width="stretch")
 
     with sc2:
         if run_btn or st.session_state.get("sc_ran"):
@@ -2493,15 +2442,15 @@ with tab_scenario:
                     paths, pct_df, float(initial_investment), sc_info["label"],
                     total_contributed=metrics["total_contributed"],
                 ),
-                use_container_width=True,
+                width="stretch",
             )
             st.plotly_chart(
                 plot_confidence_bands(pct_df, float(initial_investment), sc_info["label"]),
-                use_container_width=True,
+                width="stretch",
             )
             st.plotly_chart(
                 plot_final_distribution(paths, metrics, float(initial_investment), sc_info["label"]),
-                use_container_width=True,
+                width="stretch",
             )
 
         else:
@@ -2580,7 +2529,7 @@ with tab_scenario:
                 "P(Loss)": "{:.1%}",
                 "Avg Max Drawdown": "{:.1%}",
             }),
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -2667,7 +2616,7 @@ with tab_perf:
                 st.plotly_chart(
                     plot_growth_comparison(g_p, g_b, 10_000.0, bench_sym,
                                            currency=base_ccy),
-                    use_container_width=True,
+                    width="stretch",
                 )
                 st.caption(
                     f"Both series start at {_g_sym}10,000 on {g_p.index[0].date()} "
@@ -2757,7 +2706,7 @@ with tab_perf:
                     },
                     index=_metrics,
                 )
-                st.dataframe(perf_table, use_container_width=True)
+                st.dataframe(perf_table, width="stretch")
                 st.caption(
                     f"Best day: portfolio {p_simple.idxmax().date()} "
                     f"({p_simple.max():.2%}) vs {bench_sym} {b_simple.idxmax().date()} "
@@ -2773,7 +2722,7 @@ with tab_perf:
                 dd_b = drawdown_series(g_b)
                 st.plotly_chart(
                     plot_drawdown(dd_p, dd_b, bench_sym, perf_p["max_drawdown"]),
-                    use_container_width=True,
+                    width="stretch",
                 )
                 st.markdown("#### Five Largest Drawdowns (Portfolio, Full History)")
                 wealth_full = growth_of_capital(port_daily_returns, 1.0)
@@ -2795,7 +2744,7 @@ with tab_perf:
                             "Drawdown %": "{:.2%}",
                             "Duration (days)": "{:.0f}",
                         }),
-                        use_container_width=True,
+                        width="stretch",
                     )
                 else:
                     st.caption("No drawdown episodes found.")
@@ -2835,13 +2784,13 @@ with tab_perf:
 
                         st.plotly_chart(_roll_fig(
                             rr_p, rr_b, "Rolling Annualised Return",
-                            "Return", ".0%"), use_container_width=True)
+                            "Return", ".0%"), width="stretch")
                         st.plotly_chart(_roll_fig(
                             rv_p, rv_b, "Rolling Annualised Volatility",
-                            "Volatility (σ)", ".0%"), use_container_width=True)
+                            "Volatility (σ)", ".0%"), width="stretch")
                         st.plotly_chart(_roll_fig(
                             rs_p, rs_b, "Rolling Sharpe Ratio",
-                            "Sharpe", ".1f"), use_container_width=True)
+                            "Sharpe", ".1f"), width="stretch")
 
                 # ---- Best / worst periods ----
                 st.markdown("---")
@@ -3145,7 +3094,7 @@ with tab_security:
         fig_sec.update_layout(**CHART_THEME, title=f"{sel} Price History",
                               xaxis_title="Date",
                               yaxis_title=f"Price ({_nat_ccy})")
-        st.plotly_chart(fig_sec, use_container_width=True)
+        st.plotly_chart(fig_sec, width="stretch")
 
     # ---- Performance snapshot (project's own prices) ----
     st.markdown("---")
@@ -3579,7 +3528,7 @@ with tab_backtest:
         st.markdown(f"### Walk-Forward Growth of {fmt_usd(_wf_cap)}")
         st.plotly_chart(plot_backtest_growth(_wf_all, _wf_cap,
                                              currency=base_ccy),
-                        use_container_width=True)
+                        width="stretch")
         st.caption(
             f"Test window: {_wf_cached['test_window'][0]} to "
             f"{_wf_cached['test_window'][1]}. Static lines freeze the "
@@ -3609,7 +3558,7 @@ with tab_backtest:
                 "Cumulative Turnover": fmt_pct(_td["cumulative_turnover"]),
                 "Total Costs": fmt_usd(_td["total_costs"]),
             })
-        st.dataframe(pd.DataFrame(_to_rows), use_container_width=True,
+        st.dataframe(pd.DataFrame(_to_rows), width="stretch",
                      hide_index=True)
         _drag_res = _wf_cached.get("drag", {})
         if _drag_res:
@@ -3641,14 +3590,14 @@ with tab_backtest:
         if _wr.target_weights is not None and not _wr.target_weights.empty:
             st.plotly_chart(plot_weight_drift(
                 _wr.target_weights, title=f"Target Allocation — {_wf_chart}"),
-                use_container_width=True)
+                width="stretch")
             st.caption(
                 "Estimated target weights at each successful rebalance "
                 "(re-estimated from strictly-prior data); holdings drift "
                 "between events.")
             with st.expander("Target weights by date (CSV)", expanded=False):
                 st.dataframe(_wr.target_weights.style.format("{:.2%}"),
-                             use_container_width=True)
+                             width="stretch")
                 st.download_button(
                     "Download target weights (CSV)",
                     data=_wr.target_weights.to_csv().encode("utf-8"),
@@ -3680,7 +3629,7 @@ with tab_backtest:
                 "Value After": _ev["Portfolio Value After"].map(fmt_usd),
                 "Reason": _ev["Reason"],
             })
-            st.dataframe(_ev_disp, use_container_width=True, hide_index=True)
+            st.dataframe(_ev_disp, width="stretch", hide_index=True)
             if not _wr.failures.empty:
                 st.warning(
                     f"{len(_wr.failures)} rebalance(s) failed/skipped — "
@@ -3701,7 +3650,7 @@ with tab_backtest:
                 f"{wf_lookback}y {str(wf_window).lower()}; frequency: "
                 f"{wf_freq_label}; costs: {float(wf_costs):g} bps.")
         st.markdown(f"### Estimated vs Realised — {_wf_chart}")
-        st.dataframe(ex_ante_realised_frame(_wr), use_container_width=True,
+        st.dataframe(ex_ante_realised_frame(_wr), width="stretch",
                      hide_index=True)
         st.caption(
             "Ex-ante estimates are labelled 'Estimated at rebalance' and are "
@@ -3717,7 +3666,7 @@ with tab_backtest:
             plot_drawdown(_wr.drawdowns, _wf_dd_b,
                           _wf_bench_name or "Benchmark",
                           _wr.metrics["max_drawdown"]),
-            use_container_width=True,
+            width="stretch",
         )
         _wfd = _wr.metrics
         wdd1, wdd2, wdd3 = st.columns(3)
@@ -3812,7 +3761,7 @@ with tab_backtest:
     st.markdown(f"### Growth of {fmt_usd(float(bt_capital))}")
     st.plotly_chart(plot_backtest_growth(_results, float(bt_capital),
                                                 currency=base_ccy),
-                    use_container_width=True)
+                    width="stretch")
     st.caption(
         f"{len(bt_prices)} common trading days "
         f"({bt_prices.index[0].date()} to {bt_prices.index[-1].date()}); "
@@ -3844,7 +3793,7 @@ with tab_backtest:
             else:
                 _cells.append(str(_v))
         _disp[_col] = _cells
-    st.dataframe(_disp, use_container_width=True)
+    st.dataframe(_disp, width="stretch")
     st.caption(
         "Benchmark Total Costs show as N/A (the passive leg is not "
         "cost-modelled). CAGR uses actual calendar elapsed time; "
@@ -3867,7 +3816,7 @@ with tab_backtest:
     st.plotly_chart(
         plot_drawdown(_sel_dd, _b_dd, _bench_dd_name or "Benchmark",
                       _results[_dd_choice].metrics["max_drawdown"]),
-        use_container_width=True,
+        width="stretch",
     )
     _dm = _results[_dd_choice].metrics
     dd1, dd2, dd3 = st.columns(3)
@@ -3920,7 +3869,7 @@ with tab_backtest:
                 _evd["Turnover"] = _evd["Turnover"].map(fmt_pct)
                 _evd["Transaction Cost"] = _evd["Transaction Cost"].map(fmt_usd)
                 _evd["Portfolio Value After"] = _evd["Portfolio Value After"].map(fmt_usd)
-                st.dataframe(_evd, use_container_width=True)
+                st.dataframe(_evd, width="stretch")
             st.caption("Every event reconciles: value before − costs = value after.")
         with st.expander("Trade Detail"):
             _tr = _results[_rb_choice].trades
@@ -3934,7 +3883,7 @@ with tab_backtest:
                 _trd["Trade Value"] = _trd["Trade Value"].map(
                     lambda v: fmt_usd(v) if v >= 0 else f"-{fmt_usd(-v)}")
                 _trd["Transaction Cost"] = _trd["Transaction Cost"].map(fmt_usd)
-                st.dataframe(_trd, use_container_width=True)
+                st.dataframe(_trd, width="stretch")
         with st.expander("Rolling Metrics (12M)"):
             _lr = _results[_rb_choice].log_returns
             if len(_lr) < 252:
@@ -3977,7 +3926,7 @@ with tab_backtest:
                     _fig.update_layout(**CHART_THEME, title=_t,
                                         xaxis_title="Date", yaxis_title=_y,
                                         yaxis_tickformat=_f)
-                    st.plotly_chart(_fig, use_container_width=True)
+                    st.plotly_chart(_fig, width="stretch")
         with st.expander("Weight Drift"):
             _wdf = _results[_rb_choice].weights
             if _wdf is None or _wdf.empty:
@@ -3985,7 +3934,7 @@ with tab_backtest:
             else:
                 st.plotly_chart(
                     plot_weight_drift(_wdf, f"Weight Drift — {_rb_choice}"),
-                    use_container_width=True)
+                    width="stretch")
                 st.caption("Buy-and-hold weights drift with prices; "
                            "rebalanced weights snap back to targets.")
     else:
@@ -4222,7 +4171,7 @@ with tab_backtest:
     st.markdown(f"### Out-of-Sample Growth of {fmt_usd(_oos_cap)}")
     st.plotly_chart(plot_backtest_growth(oos_results, _oos_cap,
                                                 currency=base_ccy),
-                    use_container_width=True)
+                    width="stretch")
     st.caption(
         f"Test window: {oos_prices.index[0].date()} to "
         f"{oos_prices.index[-1].date()} ({len(oos_prices):,} trading days); "
@@ -4535,7 +4484,7 @@ with tab_factors:
             "t-stat": f"{_res.t_stats[_f]:.2f}",
             "p-value": format_p_value(_p),
         })
-    st.dataframe(pd.DataFrame(_rows), use_container_width=True,
+    st.dataframe(pd.DataFrame(_rows), width="stretch",
                  hide_index=True)
     st.caption("* p < 0.05 under HAC robust errors — statistical significance "
                "only, never proof of a permanent economic exposure. Only "
@@ -4551,7 +4500,7 @@ with tab_factors:
         _contrib = None
     if _contrib is not None:
         st.plotly_chart(plot_factor_attribution(_contrib),
-                        use_container_width=True)
+                        width="stretch")
         st.caption(
             f"Model-implied historical attribution (annualised arithmetic: "
             f"fitted {_contrib['Fitted (linear, ann.)']:.2%} vs realised mean "
@@ -4579,14 +4528,14 @@ with tab_factors:
             plot_rolling_exposure(
                 _roll.index, _roll[_roll_factor],
                 f"{FACTOR_LABELS[_roll_factor]} ({int(fa_roll_win)}d)"),
-            use_container_width=True)
+            width="stretch")
         if _show_roll_alpha:
             _alpha_ann = (_roll["alpha"] + 1.0) ** 252 - 1.0
             st.plotly_chart(
                 plot_rolling_exposure(
                     _roll.index, _alpha_ann,
                     f"Historical Alpha, ann. ({int(fa_roll_win)}d)"),
-                use_container_width=True)
+                width="stretch")
             st.caption("Rolling alpha is annualised by exact compounding; "
                        "short windows make it noisy — interpret with care.")
 
@@ -4635,7 +4584,7 @@ with tab_factors:
                         _fa_bench_sym: [f"{_bres.betas[_f]:.2f}"
                                         for _f in _needed],
                     })
-                    st.dataframe(_comp, use_container_width=True,
+                    st.dataframe(_comp, width="stretch",
                                  hide_index=True)
                     st.caption(
                         "Same model, same alignment rules — useful for "
