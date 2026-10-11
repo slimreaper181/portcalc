@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timedelta, timezone
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
@@ -145,6 +146,74 @@ def render(ctx):
     c2.metric("Volatility (σ)", fmt_pct(port_vol))
     c3.metric("Sharpe Ratio", f"{port_sharpe:.2f}")
     c4.metric("Risk-Free Rate", fmt_pct(rf_rate))
+    _pnl_tot = val_agg.get("total_pnl")
+    _dd_stat = None
+    try:
+        import math as _math
+
+        from analytics.performance import drawdown_stats as _dd_stats
+        _wealth = port_daily_returns.copy()
+        _wealth = _wealth[np.isfinite(_wealth.values)]
+        if len(_wealth) >= 2:
+            _dd_stat = _dd_stats((_wealth.cumsum().apply(_math.exp)))
+    except Exception:
+        _dd_stat = None
+    k1, k2 = st.columns(2)
+    k1.metric(
+        f"Unrealised P&L ({base_ccy})",
+        (f"{_pnl_tot:+,.2f}" if _pnl_tot is not None
+         and np.isfinite(_pnl_tot) else "—"),
+        help="Current market value minus purchase cost (price/FX P&L).")
+    k2.metric(
+        "Max Drawdown",
+        fmt_pct(_dd_stat["max_drawdown"]) if _dd_stat else "—",
+        help="Peak-to-trough decline on the current history window.")
+
+    # Deterministic portfolio insights (analytics, never advice).
+    try:
+        from ui.insights import build_insights
+        _wts = val_agg.get("weights", {})
+        _wvals = np.array([float(_wts.get(t, 0.0)) for t in tickers])
+        _rc_arr = np.asarray(rc, dtype=float)
+        _rc_top = int(np.argmax(_rc_arr)) if len(_rc_arr) else 0
+        _facts = {
+            "n_assets": len(tickers),
+            "largest_weight": float(_wvals.max()) if len(_wvals) else None,
+            "largest_ticker": tickers[int(np.argmax(_wvals))] if _wvals.size else None,
+            "top3_weight": float(np.sort(_wvals)[-3:].sum())
+            if len(_wvals) >= 3 else None,
+            "max_rc_ticker": tickers[_rc_top] if tickers else None,
+            "max_rc_share": float(_rc_arr[_rc_top]) if len(_rc_arr) else None,
+            "max_rc_weight": float(_wvals[_rc_top]) if len(_wvals) else None,
+            "max_drawdown": (float(_dd_stat["max_drawdown"])
+                             if _dd_stat else None),
+        }
+        try:
+            from analytics.allocation import (
+                effective_number_of_holdings as _eff_n)
+            _facts["effective_holdings"] = float(_eff_n(_wvals))
+        except Exception:
+            pass
+        if len(tickers) > 1:
+            try:
+                _cm = corr.values.copy()
+                np.fill_diagonal(_cm, -np.inf)
+                _ij = np.unravel_index(np.argmax(_cm), _cm.shape)
+                _facts["max_corr_pair"] = (
+                    f"{tickers[_ij[0]]}/{tickers[_ij[1]]}")
+                _facts["max_corr_value"] = float(_cm[_ij])
+            except Exception:
+                pass
+        _insights = build_insights(_facts)
+    except Exception:
+        _insights = []
+    if _insights:
+        st.markdown("### Portfolio Insights")
+        for _ins in _insights:
+            _icon = {"notable": "🔶", "watch": "🔸"}.get(_ins.severity, "ℹ️")
+            st.markdown(f"{_icon} {_ins.text}")
+        st.caption("Deterministic observations from current analytics — "
+                   "not investment advice.")
 
     st.markdown("---")
 
@@ -174,6 +243,8 @@ def render(ctx):
         _pnl = _v.unrealised_pnl if _v.unrealised_pnl is not None else float("nan")
         _pnlp = (_v.unrealised_pnl_pct * 100 if _v.unrealised_pnl_pct is not None
                  else float("nan"))
+        _cost = (_v.base_cost_basis
+                 if _v.base_cost_basis is not None else float("nan"))
         rows.append({
             "Ticker": _v.ticker,
             "Shares": _v.shares,
@@ -182,6 +253,8 @@ def render(ctx):
             "Now Px": format_money(_v.native_current_price,
                                    _v.native_currency),
             "Source": _v.price_source,
+            "Ccy": _v.native_currency,
+            f"Cost ({base_ccy})": _cost,
             f"Value ({base_ccy})": _v.base_market_value,
             f"P&L ({base_ccy})": _pnl,
             "P&L (%)": _pnlp,
@@ -191,6 +264,7 @@ def render(ctx):
     st.dataframe(
         pos_df.style
         .format({
+            f"Cost ({base_ccy})": _sym + "{:,.2f}",
             f"Value ({base_ccy})": _sym + "{:,.2f}",
             f"P&L ({base_ccy})": _sym + "{:+,.2f}",
             "P&L (%)": "{:+.2f}%",
@@ -394,6 +468,19 @@ def render(ctx):
         ))
         fig_pie.update_layout(**CHART_THEME, title="Portfolio Weights")
         st.plotly_chart(fig_pie, width="stretch")
+        _wv = np.asarray(weights, dtype=float)
+        _order = np.argsort(_wv)[::-1]
+        _top3 = float(_wv[_order[:3]].sum()) if len(_wv) >= 3 else float(_wv.sum())
+        try:
+            from analytics.allocation import (
+                effective_number_of_holdings as _eff_n2)
+            _eff_txt = f"Effective holdings: {_eff_n2(_wv):.1f}. "
+        except Exception:
+            _eff_txt = ""
+        st.caption(
+            f"Largest: {tickers[_order[0]]} {float(_wv[_order[0]]):.1%}. "
+            f"Top 3: {_top3:.1%}. {_eff_txt}"
+            "Concentration raises single-name risk.")
 
     with col_rc:
         st.markdown("### Risk Contributions")
@@ -439,9 +526,6 @@ def render(ctx):
         xaxis_title="Date", yaxis_title=f"Growth of {currency_symbol(base_ccy)}1",
     )
     st.plotly_chart(fig_cum, width="stretch")
-
-
-# ============================================================
 
     # Propagate (possibly rebuilt) pipeline state to later tabs.
     return {
