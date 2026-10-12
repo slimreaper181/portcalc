@@ -230,11 +230,19 @@ def rebase_ledger_fx(transactions: list, new_base: str,
     Returns ``(adjusted_transactions, unresolved_ids)``.
     """
     from analytics.currency import rate_on_date
+    from analytics.ledger import Transaction as _Tx
     new_base = validate_base_currency(new_base)
     out, unresolved = [], []
     for tx in transactions or []:
         if not isinstance(tx, Transaction):
             continue
+        # Copy-on-write: callers' objects are never mutated.
+        tx = _Tx(transaction_id=tx.transaction_id, date=tx.date,
+                 type=tx.type, ticker=tx.ticker, quantity=tx.quantity,
+                 price_native=tx.price_native, currency=tx.currency,
+                 fee=tx.fee, purchase_fx=tx.purchase_fx, notes=tx.notes,
+                 source=tx.source, move_cash=tx.move_cash,
+                 created_at=tx.created_at)
         if tx.currency == new_base:
             tx.purchase_fx = 1.0
             out.append(tx)
