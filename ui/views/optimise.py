@@ -35,7 +35,7 @@ from analytics.optimisation import (
 )
 from analytics.validation import validate_weight_bounds
 from ui.bl import _bl_reference_weights, _bl_views_editor, _run_bl_pipeline
-from ui.formatting import fmt_pct
+from ui.formatting import fmt_pct, fmt_usd
 from ui.theme import CHART_THEME
 
 
@@ -91,6 +91,7 @@ def _snapshot_alloc(method, w, tickers, mu_s, cov_df, rf, message):
 def render(ctx):
     """Render the Optimise tab from the shared context."""
     base_ccy = ctx["base_ccy"]
+    ccy = ctx["ccy"]
     cov = ctx["cov"]
     mu = ctx["mu"]
     port_return = ctx["port_return"]
@@ -100,6 +101,10 @@ def render(ctx):
     rf_rate = ctx["rf_rate"]
     tickers = ctx["tickers"]
     weights = ctx["weights"]
+    live_snapshot = ctx.get("live_snapshot", {})
+    ledger_cash = ctx.get("ledger_cash", {})
+    instruments = ctx.get("instruments", {})
+    current_prices = ctx.get("current_prices", {})
 
     st.markdown("## Portfolio Optimisation")
 
@@ -123,12 +128,13 @@ def render(ctx):
 
     opt_mode = st.selectbox(
         "Optimisation view",
-        ["Classical", "Risk-Based", "Black-Litterman", "Compare"],
+        ["Classical", "Risk-Based", "Black-Litterman", "Compare", "Plan"],
         index=0, key="opt_mode",
         help="Classical solves mean-variance portfolios. Risk-Based runs "
              "risk parity and maximum diversification only. "
              "Black-Litterman runs the views-based allocation only. "
-             "Compare evaluates methods side by side.")
+             "Compare evaluates methods side by side. Plan turns a "
+             "target into cash-aware trades (research-only).")
 
     if opt_mode == "Classical":
         st.markdown("---")
@@ -335,7 +341,7 @@ def render(ctx):
                     detail = f" ({chosen.message})"
                 st.warning(f"Optimisation did not converge for selected target.{detail}")
 
-    if opt_mode != "Classical":
+    if opt_mode not in ("Classical", "Plan"):
             st.markdown("---")
             st.markdown("### Institutional Allocation")
             st.caption(
@@ -527,6 +533,165 @@ def render(ctx):
                               help="BL weights × posterior returns.")
                     e3.metric("BL Sharpe",
                               f"{ok_allocs['Black-Litterman'].sharpe:.2f}")
+
+    # ---- Rebalance Plan (research-only: targets → trades, no execution) ----
+    if opt_mode == "Plan":
+        from analytics.rebalance_plan import (
+            plan_diagnostics as _plan_diag,
+            plan_trades as _plan_tr,
+            resolve_planner_targets as _plan_tgt)
+        st.markdown("### Rebalance Plan")
+        st.caption("Research-only: proposes trades toward a target. Nothing "
+                   "is executed; no orders leave this app.")
+        p1, p2 = st.columns(2)
+        with p1:
+            _pm = st.selectbox(
+                "Target",
+                ["Equal Weight", "Minimum Variance", "Maximum Sharpe",
+                 "ERC", "Maximum Diversification", "Custom"],
+                key="plan_method",
+                help="Optimiser targets reuse the tested engines on current "
+                     "simple-return statistics. For BL, enter its weights "
+                     "as Custom.")
+        with p2:
+            _fx_now = ccy.get("fx_now", {}) or {}
+            _cash_base = 0.0
+            for _ccy, _bal in (ctx.get("ledger_cash", {}) or {}).items():
+                _r = _fx_now.get(_ccy)
+                if _r is not None and np.isfinite(float(_r)) \
+                        and float(_r) > 0:
+                    _cash_base += float(_bal) * float(_r)
+            _pcash = st.number_input(
+                "Cash available (base)", min_value=0.0,
+                value=float(_cash_base),
+                step=100.0, key="plan_cash",
+                help="Ledger cash converted at current FX. Deployable "
+                     "after the buffer below.")
+        _cw = np.asarray(weights, dtype=float)
+        try:
+            _srets = simple_returns_from_prices(prices, tickers)
+            _smu = annualised_mean_returns_simple(_srets)
+            _scov = annualised_covariance_simple(_srets)
+        except ValueError as e:
+            st.error(f"Planning statistics unavailable: {e}")
+            _smu = _scov = None
+        if _smu is not None:
+            _key = {"Equal Weight": "equal_weight",
+                    "Minimum Variance": "min_variance",
+                    "Maximum Sharpe": "max_sharpe", "ERC": "erc",
+                    "Maximum Diversification": "max_diversification",
+                    "Custom": "custom"}[_pm]
+            _custom = None
+            if _key == "custom":
+                st.caption("Custom target weights (must sum to 1).")
+                _ccols = st.columns(max(1, len(tickers)))
+                _custom = []
+                for _ci, _t in zip(_ccols, tickers):
+                    with _ci:
+                        _custom.append(st.number_input(
+                            _t, min_value=0.0, max_value=1.0, value=round(
+                                1.0 / len(tickers), 4), step=0.01,
+                            key=f"plan_w_{_t}"))
+                _custom = np.asarray(_custom, dtype=float)
+                if abs(float(_custom.sum()) - 1.0) > 1e-6:
+                    st.warning("Custom weights must sum to 1 to plan.")
+                    _custom = None
+            if _key != "custom" or _custom is not None:
+                try:
+                    _tname, _tw = _plan_tgt(
+                        _key, tickers, _smu.values, _scov, rf_rate,
+                        float(min_w), float(max_w),
+                        custom=_custom)
+                except ValueError as e:
+                    st.error(f"Target estimation failed: {e}")
+                    _tw = None
+                if _tw is not None:
+                    q1, q2, q3 = st.columns(3)
+                    with q1:
+                        _buf = st.number_input(
+                            "Min cash buffer (base)", min_value=0.0,
+                            value=0.0, step=100.0, key="plan_buffer")
+                    with q2:
+                        _minv = st.number_input(
+                            "Min trade value (base)", min_value=0.0,
+                            value=0.0, step=10.0, key="plan_minv")
+                    with q3:
+                        _cbps = st.number_input(
+                            "Cost (bps)", min_value=0.0, max_value=1000.0,
+                            value=10.0, step=1.0, key="plan_costs")
+                    _share_px = {}
+                    for _t in tickers:
+                        _mk = (live_snapshot.get(_t, {}) or {}).get("mark")
+                        _sc = 1.0
+                        try:
+                            _sc = float(instruments[_t].quote_scale or 1.0)
+                        except (KeyError, AttributeError, TypeError):
+                            pass
+                        if _mk is not None and np.isfinite(float(_mk)):
+                            _share_px[_t] = float(_mk) * _sc
+                        else:
+                            _share_px[_t] = float(
+                                current_prices.get(_t, float("nan")))
+                    try:
+                        _plan = _plan_tr(
+                            _cw, _tw.values, tickers, float(portfolio_value),
+                            _share_px, cash_available=float(_pcash),
+                            min_cash_buffer=float(_buf),
+                            min_trade_value=float(_minv), cost_bps=float(_cbps))
+                    except ValueError as e:
+                        st.error(f"Planning failed: {e}")
+                        _plan = None
+                    if _plan is not None:
+                        st.markdown("#### Proposed Trades")
+                        st.dataframe(_plan.trades, width="stretch",
+                                     hide_index=True)
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Turnover",
+                                  f"{_plan.gross_turnover:.2%}")
+                        m2.metric("Est. Cost",
+                                  fmt_usd(_plan.estimated_cost))
+                        m3.metric("Cash Residual",
+                                  fmt_usd(_plan.cash_remaining))
+                        m4.metric("Shortfall",
+                                  fmt_usd(_plan.cash_shortfall)
+                                  if _plan.cash_shortfall > 0 else "—")
+                        if _plan.cash_shortfall > 0:
+                            st.warning(
+                                "Plan needs more cash than available — "
+                                "raise cash, lower the buffer, or shrink "
+                                "targets. Nothing was executed.")
+                        if _plan.skipped_small:
+                            st.caption(
+                                "Held (below threshold): "
+                                + ", ".join(_plan.skipped_small) + ".")
+                        try:
+                            _dg = _plan_diag(
+                                _cw, _tw.values, tickers, _smu.values,
+                                _scov, rf_rate)
+                            st.markdown("#### Before / After")
+                            _drows = []
+                            for _lbl, _side in (("Current", _dg["current"]),
+                                                ("Target", _dg["target"])):
+                                _drows.append({
+                                    "Leg": _lbl,
+                                    "Exp Return":
+                                        f"{_side['expected_return']:.2%}",
+                                    "Vol":
+                                        f"{_side['volatility']:.2%}",
+                                    "Sharpe": f"{_side['sharpe']:.2f}",
+                                    "Largest":
+                                        f"{_side['largest_position']:.1%}",
+                                    "Eff N":
+                                        f"{_side['effective_holdings']:.2f}",
+                                })
+                            st.dataframe(pd.DataFrame(_drows),
+                                         width="stretch", hide_index=True)
+                        except ValueError as e:
+                            st.caption(f"Before/after unavailable: {e}")
+                        st.caption(
+                            "Order intents are descriptive research objects "
+                            f"({len(_plan.intents)} legs). No execution, no "
+                            "broker calls.")
 
 
     # ============================================================

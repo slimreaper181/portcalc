@@ -7,6 +7,8 @@ context dict and renders into the active tab.
 
 from __future__ import annotations
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -39,6 +41,12 @@ def render(ctx):
     ccy = ctx["ccy"]
     port_daily_returns = ctx["port_daily_returns"]
     rf_rate = ctx["rf_rate"]
+    tickers = ctx["tickers"]
+    weights = ctx["weights"]
+    prices = ctx["prices"]
+    instruments = ctx["instruments"]
+    native_panel = ctx["native_panel"]
+    portfolio_nav = ctx.get("portfolio_nav")
 
     st.markdown("## Performance vs Benchmark")
 
@@ -335,6 +343,176 @@ def render(ctx):
             **Maximum Drawdown** — largest observed peak-to-trough fall; 0 means a prior peak.
             """
         )
+
+    # ---- Investment performance from ledger cash flows ----
+    st.markdown("---")
+    st.markdown("### Investment Performance (TWR / XIRR)")
+    _flow_txns = [t for t in (st.session_state.get("ledger_txns") or [])
+                  if isinstance(t, dict)
+                  and t.get("type") in ("DEPOSIT", "WITHDRAWAL")]
+    if not _flow_txns:
+        st.info("No external cash flows recorded — record a Deposit to "
+                "separate investment performance from contributions. "
+                "Without flows, the growth chart above already shows "
+                "performance.")
+    else:
+        try:
+            from analytics.history import (
+                reconstruct_history as _recon,
+                twr_from_history as _twr_hist,
+                xirr_from_ledger as _xirr_led)
+            from analytics.persistence import transaction_from_dict as _tfd
+            from analytics.performance_cashflows import (
+                benchmark_with_flows as _bwf)
+            _txo = [_tfd(d) for d in st.session_state.ledger_txns]
+            _hist = _recon(prices, tickers, _txo, ccy.get("fx_hist"),
+                           base_ccy)
+            _twr = _twr_hist(_hist)
+            _nav_now = float(portfolio_nav) if portfolio_nav else float(
+                _hist["nav"].dropna().iloc[-1])
+            try:
+                _xirr = _xirr_led(_txo, _nav_now, date.today(),
+                                  ccy.get("fx_hist"), base_ccy)
+            except ValueError:
+                _xirr = None
+            w1, w2, w3 = st.columns(3)
+            w1.metric("TWR", fmt_pct(_twr["twr"]),
+                      help="Time-weighted return: external flows never "
+                           "count as performance.")
+            w2.metric("XIRR (annualised)",
+                      fmt_pct(_xirr["xirr"]) if _xirr else "—",
+                      help="Money-weighted return over external flows with "
+                           "current NAV as terminal value.")
+            _bench_cap = "Benchmark comparison needs the benchmark leg " \
+                "above; "
+            if bench_sym is not None and bench_prices is not None:
+                try:
+                    _bwf_vals = _bwf(
+                        {d.date() if hasattr(d, "date") else d: float(v)
+                         for d, v in bench_prices.items()},
+                        [(pd.Timestamp(d.get("date")).date(),
+                          float(d.get("quantity", 0.0))
+                          * float(d.get("price_native", 0.0)))
+                         for d in _flow_txns
+                         if d.get("type") == "DEPOSIT"],
+                        float(_hist["nav"].dropna().iloc[0]))
+                    _bwf_end = _bwf_vals[-1][1]
+                    w3.metric(f"{bench_sym} (flow-matched)",
+                              fmt_usd(_bwf_end),
+                              help="Same external deposits buy benchmark "
+                                   "units — a fair comparison for "
+                                   "cash-flow-heavy histories.")
+                    _bench_cap = ""
+                except (ValueError, KeyError, TypeError):
+                    w3.metric("Benchmark", "—")
+            else:
+                w3.metric("Benchmark", "—")
+            st.caption(
+                f"Window: {_hist.index[0].date()} to "
+                f"{_hist.index[-1].date()}. {_bench_cap}Portfolio TWR "
+                "measures investment skill; contributions are capital, "
+                "not return.")
+        except (ValueError, KeyError, TypeError) as e:
+            st.info(f"Cash-flow performance unavailable: {e}")
+
+    # ---- Return attribution (beginning-weight, buy-and-hold basis) ----
+    st.markdown("---")
+    st.markdown("### Return Attribution")
+    st.caption(
+        "Contribution = beginning weight × simple return over the selected "
+        "window (buy-and-hold basis). Foreign legs split into local, FX "
+        "and interaction via the exact identity "
+        "(1+R_local)(1+R_fx)−1 = R_base. Recorded income stays separate "
+        "from adjusted-price returns (no double counting).")
+    try:
+        from analytics.attribution import attribution_summary as _asum
+        from analytics.currency import rate_on_date as _rod
+        _a1, _a2 = st.columns(2)
+        with _a1:
+            _as = st.date_input(
+                "Attribution start", value=prices.index[0].date(),
+                min_value=prices.index[0].date(),
+                max_value=prices.index[-1].date(), key="pf_attr_start")
+        with _a2:
+            _ae = st.date_input(
+                "Attribution end", value=prices.index[-1].date(),
+                min_value=prices.index[0].date(),
+                max_value=prices.index[-1].date(), key="pf_attr_end")
+        if _as >= _ae:
+            st.warning("Attribution start must precede its end.")
+        else:
+            _w0 = np.asarray(weights, dtype=float)
+            _ps = {t: float(prices[t].loc[
+                prices.index[prices.index.date >= _as][0]]) for t in tickers}
+            _pe = {t: float(prices[t].loc[
+                prices.index[prices.index.date <= _ae][-1]]) for t in tickers}
+            _nat, _fxp = {}, {}
+            for _t in tickers:
+                try:
+                    _ccy = instruments[_t].native_currency
+                    _ni = native_panel[_t]
+                    _ns = float(_ni.loc[_ni.index[_ni.index.date >= _as][0]])
+                    _ne = float(_ni.loc[_ni.index[_ni.index.date <= _ae][-1]])
+                    _nat[_t] = (_ns, _ne)
+                    if _ccy != base_ccy and ccy.get("fx_hist") is not None:
+                        _fs = _rod(ccy["fx_hist"], _ccy, base_ccy, _as)
+                        _fe = _rod(ccy["fx_hist"], _ccy, base_ccy, _ae)
+                        if _fs is not None and _fe is not None:
+                            _fxp[_t] = (_fs, _fe)
+                except (ValueError, KeyError, IndexError, TypeError):
+                    continue
+            _inc = 0.0
+            for _d in (st.session_state.get("ledger_txns") or []):
+                if not isinstance(_d, dict) or _d.get("type") not in (
+                        "DIVIDEND", "INTEREST"):
+                    continue
+                try:
+                    _dd = pd.Timestamp(_d.get("date")).date()
+                except (ValueError, TypeError):
+                    continue
+                if _as <= _dd <= _ae and _d.get("purchase_fx"):
+                    _inc += float(_d.get("quantity", 0.0)) * float(
+                        _d.get("price_native", 0.0)) * float(
+                            _d.get("purchase_fx"))
+            _sum = _asum(dict(zip(tickers, _w0)), _ps, _pe, tickers,
+                         native_panels=_nat or None, fx_panels=_fxp or None,
+                         income_base=_inc)
+            _cdf = _sum["contributions"].copy()
+            _cdf["weight_start"] = _cdf["weight_start"].map("{:.1%}".format)
+            _cdf["return_simple"] = _cdf["return_simple"].map("{:+.2%}".format)
+            _cdf["contribution"] = _cdf["contribution"].map("{:+.2%}".format)
+            st.dataframe(_cdf, width="stretch")
+            _wl = _sum["winners_losers"]
+            c1, c2 = st.columns(2)
+            c1.metric("Top Contributor",
+                      f"{_wl['top'].index[0]} "
+                      f"{float(_wl['top'].iloc[0]):+.2%}")
+            c2.metric("Top Detractor",
+                      f"{_wl['bottom'].index[-1]} "
+                      f"{float(_wl['bottom'].iloc[-1]):+.2%}")
+            if _sum["fx"]:
+                _fxrows = [{
+                    "Ticker": _t,
+                    "Local": f"{v['local']:+.2%}",
+                    "FX": f"{v['fx']:+.2%}",
+                    "Base": f"{v['base']:+.2%}",
+                    "Local leg": f"{v['local_leg']:+.2%}",
+                    "FX leg": f"{v['fx_leg']:+.2%}",
+                } for _t, v in _sum["fx"].items()]
+                st.markdown("#### FX Attribution (exact identity)")
+                st.dataframe(pd.DataFrame(_fxrows), width="stretch",
+                             hide_index=True)
+            if _sum["income"]:
+                st.metric("Recorded Income (window)",
+                          fmt_usd(_sum["income"]),
+                          help="Ledger dividends + interest, base-converted "
+                               "at payment FX. Kept apart from price returns.")
+            st.caption(
+                f"Portfolio return over window: "
+                f"{_sum['portfolio_return']:+.2%} (contributions sum to "
+                "this on a buy-and-hold basis).")
+    except (ValueError, KeyError, TypeError, IndexError) as e:
+        st.info(f"Attribution unavailable: {e}")
 
 
 # ============================================================

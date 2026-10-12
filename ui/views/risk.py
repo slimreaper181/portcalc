@@ -8,6 +8,7 @@ context dict and renders into the active tab.
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -19,7 +20,7 @@ from analytics.var import (
     parametric_var,
     to_daily,
 )
-from ui.formatting import fmt_usd
+from ui.formatting import fmt_pct, fmt_usd
 from ui.theme import CHART_THEME
 
 
@@ -184,5 +185,62 @@ def render(ctx):
         )
         st.plotly_chart(fig_mc, width="stretch")
 
-
-# ============================================================
+    # ---- Advanced diagnostics (institutional, methodology-labelled) ----
+    with st.expander("Advanced Diagnostics", expanded=False):
+        st.caption("Parametric decompositions and distribution diagnostics "
+                   "on the same covariance/return inputs as above.")
+        try:
+            from analytics.risk_extra import (
+                component_var as _cvar,
+                diversification_benefit as _divben,
+                distribution_stats as _dist,
+                herfindahl as _herf,
+                marginal_var as _mvar,
+                omega_ratio as _omega,
+            )
+            _w = np.asarray(weights, dtype=float)
+            _tickers = list(ctx.get("tickers", [])) or [
+                f"a{i}" for i in range(len(_w))]
+            import pandas as _pd
+            _cov_l = _pd.DataFrame(np.asarray(cov.values if hasattr(
+                cov, "values") else cov), index=_tickers, columns=_tickers)
+            _pv = parametric_var(port_std_daily, 1.0, 0.95,
+                                 int(var_horizon))
+            _comp = _cvar(_w, _cov_l, _pv, portfolio_value)
+            _marg = _mvar(_w, _cov_l, _pv, portfolio_value)
+            _cd = pd.DataFrame({
+                "Component VaR": [fmt_usd(v) for v in _comp.values],
+                "Marginal VaR": [fmt_usd(v) for v in _marg.values]},
+                index=list(_comp.index))
+            st.dataframe(_cd, width="stretch")
+            st.caption(
+                f"Component VaR sums to {float(_comp.sum()):,.2f} vs total "
+                f"parametric VaR {fmt_usd(_pv * portfolio_value)} "
+                "(reconciliation by construction).")
+            _db = _divben(_w, _cov_l)
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Diversification Benefit",
+                      fmt_pct(_db["diversification_benefit"]),
+                      help="Weighted standalone volatility minus portfolio "
+                           "volatility (long-only, never negative).")
+            d2.metric("Herfindahl", f"{_herf(_w):.3f}",
+                      help="Sum of squared weights (1/N diversified → 1 "
+                           "concentrated).")
+            try:
+                _ds = _dist(port_daily_returns)
+                d3.metric(
+                    "Skew / Excess Kurtosis",
+                    f"{_ds['skewness']:.2f} / {_ds['excess_kurtosis']:.2f}",
+                    help="Population moments of daily log returns; kurtosis "
+                         "is excess (Fisher, normal = 0).")
+                st.metric("Omega Ratio (MAR 0%)",
+                          f"{_omega(np.asarray(port_daily_returns, dtype=float), 0.0):.2f}"
+                          if np.isfinite(_omega(np.asarray(
+                              port_daily_returns, dtype=float), 0.0))
+                          else "∞ (no downside)",
+                          help="Average gain above 0% per unit of average "
+                               "loss below 0%.")
+            except ValueError as e:
+                st.caption(f"Distribution diagnostics unavailable: {e}")
+        except ValueError as e:
+            st.warning(f"Advanced diagnostics unavailable: {e}")
