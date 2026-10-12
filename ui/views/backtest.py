@@ -20,6 +20,11 @@ from analytics.allocation import (
     estimation_window,
     maximum_diversification,
     simple_returns_from_prices,
+    validate_covariance,
+)
+from analytics.estimation import (
+    estimate_covariance,
+    estimate_mean_returns,
 )
 from analytics.backtest import (
     backtest_benchmark,
@@ -252,6 +257,22 @@ def render(ctx):
                 "Max weight per asset", 0.5, 1.0, 1.0, 0.05, format="%.2f",
                 key="wf_maxw")
 
+        we1, we2 = st.columns(2)
+        with we1:
+            wf_estimator = st.selectbox(
+                "Risk model",
+                ["sample", "ewma", "ledoit_wolf"], index=0, key="wf_risk",
+                format_func=lambda m: {"sample": "Sample",
+                                       "ewma": "EWMA",
+                                       "ledoit_wolf": "Ledoit-Wolf"}[m],
+                help="Covariance estimator inside every training window. "
+                     "Sample preserves historical results.")
+        with we2:
+            wf_ewma = st.slider(
+                "EWMA decay λ", 0.80, 0.99, 0.94, 0.01, key="wf_ewma",
+                disabled=(wf_estimator != "ewma"),
+                help="Applies to EWMA only (selector left).")
+
         wm1, wm2, wm3 = st.columns(3)
         with wm1:
             wf_m_mv = st.checkbox("Minimum Variance", value=True, key="wf_m_mv")
@@ -318,7 +339,8 @@ def render(ctx):
                    float(wf_minw), float(wf_maxw), tuple(_wf_methods),
                    str(wf_static_method), str(wf_drag_method),
                    repr(wf_bl_cfg), bool(wf_delta_bench), str(base_ccy),
-                   float(bt_capital), float(rf_rate), str(bench_sym_bt))
+                   float(bt_capital), float(rf_rate), str(bench_sym_bt),
+                   str(wf_estimator), float(wf_ewma))
         _wf_freq = {"Monthly": "monthly", "Quarterly": "quarterly",
                     "Semi-annual": "semi-annual",
                     "Annual": "annual"}[wf_freq_label]
@@ -374,7 +396,9 @@ def render(ctx):
                     rebalance_frequency=_wf_freq,
                     transaction_cost_bps=float(wf_costs),
                     base_currency=base_ccy, min_weight=float(wf_minw),
-                    max_weight=float(wf_maxw), risk_free_annual=float(rf_rate))
+                    max_weight=float(wf_maxw), risk_free_annual=float(rf_rate),
+                    estimator=str(wf_estimator),
+                    ewma_lambda=float(wf_ewma))
                 if _m == "black_litterman":
                     _bcfg.bl_views = list(wf_bl_cfg["views"])
                     _bcfg.bl_delta = float(wf_bl_cfg["delta"])
@@ -444,7 +468,9 @@ def render(ctx):
                         rebalance_frequency=_wf_freq, transaction_cost_bps=0.0,
                         base_currency=base_ccy, min_weight=float(wf_minw),
                         max_weight=float(wf_maxw),
-                        risk_free_annual=float(rf_rate))
+                        risk_free_annual=float(rf_rate),
+                        estimator=str(wf_estimator),
+                        ewma_lambda=float(wf_ewma))
                     if _dm[0] == "black_litterman":
                         _dcfg.bl_views = list(wf_bl_cfg["views"])
                         _dcfg.bl_delta = float(wf_bl_cfg["delta"])
@@ -933,6 +959,22 @@ def render(ctx):
                 "Test Costs (bps)", min_value=0.0, max_value=1000.0,
                 value=10.0, step=1.0, key="oos_costs")
 
+        oe1, oe2 = st.columns(2)
+        with oe1:
+            oos_estimator = st.selectbox(
+                "Risk model",
+                ["sample", "ewma", "ledoit_wolf"], index=0, key="oos_risk",
+                format_func=lambda m: {"sample": "Sample",
+                                       "ewma": "EWMA",
+                                       "ledoit_wolf": "Ledoit-Wolf"}[m],
+                help="Covariance estimator on the strict pre-test window. "
+                     "Sample preserves historical results.")
+        with oe2:
+            oos_ewma = st.slider(
+                "EWMA decay λ", 0.80, 0.99, 0.94, 0.01, key="oos_ewma",
+                disabled=(oos_estimator != "ewma"),
+                help="Applies to EWMA only (selector left).")
+
         os1, os2, os3 = st.columns(3)
         with os1:
             oos_eq = st.checkbox("Equal Weight", value=True, key="oos_eq")
@@ -1018,11 +1060,16 @@ def render(ctx):
 
         try:
             oos_rets = simple_returns_from_prices(oos_est, tickers)
-            oos_mu = annualised_mean_returns_simple(oos_rets)
-            oos_cov = annualised_covariance_simple(oos_rets)
+            oos_mu = estimate_mean_returns(oos_rets)
+            oos_cov = estimate_covariance(
+                oos_rets, method=oos_estimator,
+                ewma_lambda=float(oos_ewma))
+            oos_cov, _ = validate_covariance(oos_cov, tickers)
         except ValueError as e:
             st.error(f"Estimation statistics: {e}")
             return  # section-local return (was st.stop()): sibling tabs keep rendering
+        st.caption(f"Risk model: {oos_estimator} "
+                   f"(strict pre-test window, {len(oos_rets)} obs).")
 
         _oos_freq = {"Monthly": "monthly", "Quarterly": "quarterly",
                      "Semi-annual": "semi-annual", "Annual": "annual"}[oos_freq_label]

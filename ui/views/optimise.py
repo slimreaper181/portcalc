@@ -22,6 +22,16 @@ from analytics.allocation import (
     maximum_diversification,
     simple_returns_from_prices,
 )
+from analytics.estimation import (
+    ESTIMATOR_LABELS,
+    ESTIMATORS,
+    correlation_stability,
+    covariance_diagnostics,
+    estimate_covariance,
+    estimate_mean_returns,
+    estimation_window_slice,
+    ledoit_wolf_shrinkage,
+)
 from analytics.currency import currency_symbol
 from analytics.optimisation import (
     efficient_frontier,
@@ -351,15 +361,70 @@ def render(ctx):
                 "are re-solved here on the same simple basis (their cards above "
                 "use log-return inputs)."
             )
+            r1, r2, r3 = st.columns(3)
+            with r1:
+                risk_model = st.selectbox(
+                    "Risk model",
+                    list(ESTIMATORS), index=0, key="inst_risk_model",
+                    format_func=lambda m: ESTIMATOR_LABELS.get(m, m),
+                    help="Sample preserves all historical results. EWMA reacts "
+                         "faster to recent volatility. Ledoit-Wolf shrinks "
+                         "toward the scaled identity (stable in small samples).")
+            with r2:
+                ewma_lam = st.slider(
+                    "EWMA decay λ", 0.80, 0.99, 0.94, 0.01, key="inst_ewma",
+                    help="Higher λ = longer memory. Applies to EWMA only.",
+                    disabled=(risk_model != "ewma"))
+            with r3:
+                est_window = st.selectbox(
+                    "Estimation window",
+                    ["expanding", "1y", "2y", "3y", "5y"], index=0,
+                    key="inst_window",
+                    help="Trailing window of Base Currency history. Strictly "
+                         "past data only.")
             try:
-                simp_rets = simple_returns_from_prices(prices, tickers)
-                mu_simp = annualised_mean_returns_simple(simp_rets)
-                cov_simp = annualised_covariance_simple(simp_rets)
+                _px = estimation_window_slice(
+                    prices, prices.index[-1] + pd.Timedelta(days=1),
+                    est_window)
+                simp_rets = simple_returns_from_prices(_px, tickers)
+                mu_simp = estimate_mean_returns(simp_rets)
+                cov_simp = estimate_covariance(
+                    simp_rets, method=risk_model, ewma_lambda=float(ewma_lam))
             except ValueError as e:
                 st.error(f"Cannot build simple-return statistics: {e}")
                 simp_ok = False
             else:
                 simp_ok = True
+                _diag = covariance_diagnostics(cov_simp.values)
+                _dcols = st.columns(4)
+                _cond_txt = ("∞" if _diag["cond"] == float("inf")
+                             else ("n/a" if not np.isfinite(_diag["cond"])
+                                   else f"{_diag['cond']:.1f}"))
+                _dcols[0].metric("Condition №", _cond_txt,
+                                 help="Largest/smallest eigenvalue. High = "
+                                      "unstable minimum-variance weights.")
+                _dcols[1].metric("Min eigenvalue", f"{_diag['eig_min']:.2e}")
+                _dcols[2].metric("Max eigenvalue", f"{_diag['eig_max']:.2e}")
+                _dcols[3].metric("Effective rank",
+                                 f"{_diag['effective_rank']:.2f}",
+                                 help="Participation ratio: 1 = concentrated, "
+                                      "N = perfectly spread risk.")
+                _psd_note = ("PSD check passed."
+                             if _diag["psd_ok"] else
+                             "NOT positive semidefinite — allocations below "
+                             "may be unreliable.")
+                if risk_model == "ledoit_wolf":
+                    try:
+                        _sh = ledoit_wolf_shrinkage(simp_rets)
+                        st.caption(f"Risk model: Ledoit-Wolf "
+                                   f"(shrinkage δ={_sh:.2f}) · "
+                                   f"window {est_window} · {_psd_note}")
+                    except ValueError:
+                        st.caption(f"Risk model: Ledoit-Wolf · "
+                                   f"window {est_window} · {_psd_note}")
+                else:
+                    st.caption(f"Risk model: {ESTIMATOR_LABELS[risk_model]} · "
+                               f"window {est_window} · {_psd_note}")
 
             if simp_ok:
                 if opt_mode == "Risk-Based":
@@ -461,6 +526,76 @@ def render(ctx):
                     st.caption(
                         "RC Dispersion is the std of percentage risk contributions "
                         "(near zero = evenly spread risk, the risk-parity ideal).")
+
+                    with st.expander("Estimator comparison (same portfolio)",
+                                     expanded=False):
+                        st.caption(
+                            "Same Base Currency returns, three risk models: "
+                            "portfolio volatility plus MinVar / ERC / MaxDiv "
+                            "weights re-solved per estimator. Means are "
+                            "identical (sample mean throughout).")
+                        try:
+                            _cmp_rows: dict = {}
+                            _cmp_w: dict = {}
+                            for _em in ESTIMATORS:
+                                _cc = estimate_covariance(
+                                    simp_rets, method=_em,
+                                    ewma_lambda=float(ewma_lam))
+                                _pv = float(np.sqrt(max(
+                                    float(weights @ _cc.values @ weights),
+                                    0.0)))
+                                _mv = min_variance(
+                                    mu_simp.values, _cc.values, rf_rate,
+                                    min_w, max_w)
+                                _er = equal_risk_contribution(
+                                    tickers, mu_simp.values, _cc, rf_rate,
+                                    min_w, max_w)
+                                _md = maximum_diversification(
+                                    tickers, mu_simp.values, _cc, rf_rate,
+                                    min_w, max_w)
+                                _cmp_rows[ESTIMATOR_LABELS[_em]] = {
+                                    "Portfolio Vol":
+                                        f"{_pv:.2%}",
+                                    "MinVar Vol":
+                                        (f"{_mv.volatility:.2%}"
+                                         if _mv.success else "failed"),
+                                    "ERC Vol":
+                                        (f"{_er.volatility:.2%}"
+                                         if _er.success else "failed"),
+                                    "MaxDiv Vol":
+                                        (f"{_md.volatility:.2%}"
+                                         if _md.success else "failed"),
+                                }
+                                if _mv.success and _mv.weights is not None:
+                                    _cmp_w[ESTIMATOR_LABELS[_em]] = (
+                                        pd.Series(
+                                            np.asarray(_mv.weights,
+                                                       dtype=float),
+                                            index=tickers))
+                            st.dataframe(pd.DataFrame(_cmp_rows).T,
+                                         width="stretch")
+                            if _cmp_w:
+                                st.caption("MinVar weights by estimator")
+                                st.dataframe(
+                                    pd.DataFrame(_cmp_w).T.style.format(
+                                        "{:.1%}"),
+                                    width="stretch")
+                        except ValueError as e:
+                            st.warning(f"Estimator comparison unavailable: {e}")
+
+                        try:
+                            if len(simp_rets) >= 520:
+                                _stab = correlation_stability(
+                                    simp_rets.iloc[-252:], simp_rets)
+                                st.caption(
+                                    "Correlation stability — trailing 1y vs "
+                                    "full window: Frobenius "
+                                    f"{_stab['frob']:.3f} · max |Δ| "
+                                    f"{_stab['max_abs']:.3f} · mean |Δ| "
+                                    f"{_stab['mean_abs']:.3f}. Descriptive "
+                                    "only — not a recommendation.")
+                        except ValueError:
+                            pass
 
                     if opt_mode == "Compare":
                         st.markdown("#### Weight Comparison Chart")
