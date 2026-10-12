@@ -22,6 +22,12 @@ from analytics.allocation import (
     maximum_diversification,
     simple_returns_from_prices,
 )
+from analytics.constraints import (
+    OptimizationConstraints,
+    check_constraints,
+    max_single_name_shift,
+    turnover_fraction,
+)
 from analytics.estimation import (
     ESTIMATOR_LABELS,
     ESTIMATORS,
@@ -435,9 +441,9 @@ def render(ctx):
                     inst_methods = st.multiselect(
                         "Allocation methods",
                         ["Current", "Equal Weight", "Min Variance", "Max Sharpe",
-                         "Risk Parity", "Max Diversification", "Black-Litterman"],
+                          "Risk Parity", "Max Diversification", "Black-Litterman"],
                         default=["Current", "Equal Weight", "Risk Parity",
-                                 "Max Diversification"],
+                                  "Max Diversification"],
                         key="inst_methods",
                         help="Methods to compare side by side.")
                 bl_cfg, bl_err = None, None
@@ -447,7 +453,141 @@ def render(ctx):
                     if bl_err:
                         st.error(f"Black-Litterman inputs: {bl_err}")
 
+                # ---- Real-world constraints (Milestone 5) ----
+                _ccy_of = {}
+                for _t in tickers:
+                    _inst = (instruments or {}).get(_t)
+                    _nc = getattr(_inst, "native_currency", None)
+                    if _nc:
+                        _ccy_of[_t] = str(_nc).upper()
+                _ccys = sorted(set(_ccy_of.values()))
+                with st.expander("Real-world constraints", expanded=False):
+                    st.caption(
+                        "Practical portfolio design: per-asset bounds, "
+                        "turnover limit (one-way Σ|Δ|/2), cost-averse planning "
+                        "penalty, quote-currency caps, cash target and custom "
+                        "ERC risk budgets. Off = classic theoretical solves.")
+                    use_c = st.checkbox(
+                        "Apply constraints to institutional solves",
+                        value=False, key="inst_use_constraints")
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        to_limit = st.slider(
+                            "Turnover limit (one-way)", 0.0, 1.0, 0.25, 0.01,
+                            format="%.0f%%", key="inst_turnover",
+                            help="Relative to current weights.",
+                            disabled=not use_c)
+                    with c2:
+                        cost_bps = st.number_input(
+                            "Cost-aversion (bps)", min_value=0.0,
+                            max_value=500.0, value=0.0, step=5.0,
+                            key="inst_cost",
+                            help="Planning penalty per unit turnover — not "
+                                 "the exact backtest accounting.",
+                            disabled=not use_c)
+                    with c3:
+                        cash_t = st.slider(
+                            "Cash target", 0.0, 0.5, 0.0, 0.01, format="%.0f%%",
+                            key="inst_cash",
+                            help="Risky weights + cash = 100%.",
+                            disabled=not use_c)
+                    _bdf = pd.DataFrame({
+                        "Ticker": tickers,
+                        "Min": [float(min_w)] * len(tickers),
+                        "Max": [float(max_w)] * len(tickers)})
+                    bounds_ed = st.data_editor(
+                        _bdf, key="inst_bounds", width="stretch",
+                        hide_index=True, disabled=not use_c,
+                        help="Per-asset weight bounds (validated globally).")
+                    ccy_caps: dict = {}
+                    if _ccys and use_c:
+                        st.markdown("**Quote-currency caps** (Base-valued "
+                                    "risky weights)")
+                        _ccols = st.columns(max(len(_ccys), 1))
+                        for _i, _c in enumerate(_ccys):
+                            with _ccols[_i % max(len(_ccols), 1)]:
+                                _cap = st.slider(
+                                    f"{_c} ≤", 0.0, 1.0, 1.0, 0.05,
+                                    format="%.0f%%", key=f"inst_ccy_{_c}")
+                                if _cap < 1.0 - 1e-12:
+                                    ccy_caps[_c] = float(_cap)
+                    budgets = None
+                    if "Risk Parity" in inst_methods:
+                        _eq = 100.0 / len(tickers)
+                        _rdf = pd.DataFrame({
+                            "Ticker": tickers,
+                            "Budget %": [_eq] * len(tickers)})
+                        rb_ed = st.data_editor(
+                            _rdf, key="inst_budgets", width="stretch",
+                            hide_index=True, disabled=not use_c,
+                            help="Custom share of total risk per asset "
+                                 "(must sum to 100%). Equal = classic ERC.")
+                        try:
+                            _bv = pd.to_numeric(
+                                rb_ed["Budget %"],
+                                errors="coerce").values.astype(float) / 100.0
+                            if use_c and np.all(np.isfinite(_bv)) and not np.allclose(
+                                    _bv, 1.0 / len(tickers)):
+                                budgets = dict(zip(tickers, _bv))
+                        except (KeyError, ValueError, TypeError):
+                            budgets = None
+                _inst_c: OptimizationConstraints | None = None
+                if use_c:
+                    try:
+                        _pmin = dict(zip(
+                            bounds_ed["Ticker"].astype(str),
+                            pd.to_numeric(bounds_ed["Min"],
+                                          errors="coerce").astype(float)))
+                        _pmax = dict(zip(
+                            bounds_ed["Ticker"].astype(str),
+                            pd.to_numeric(bounds_ed["Max"],
+                                          errors="coerce").astype(float)))
+                    except (KeyError, ValueError, TypeError):
+                        _pmin, _pmax = {}, {}
+                    _inst_c = OptimizationConstraints(
+                        per_asset_min=_pmin, per_asset_max=_pmax,
+                        turnover_limit=float(to_limit),
+                        turnover_reference=np.asarray(weights, dtype=float),
+                        transaction_cost_bps=float(cost_bps),
+                        cash_target=float(cash_t),
+                        asset_currencies=[_ccy_of.get(t) for t in tickers],
+                        currency_caps=ccy_caps or None,
+                        risk_budgets=budgets)
+                    _cprobs = check_constraints(tickers, _inst_c, min_w, max_w)
+                    for _p in _cprobs:
+                        st.error(f"Constraint conflict — {_p}")
+                    if _cprobs:
+                        st.caption("Solves below still attempt honestly; "
+                                   "infeasible methods fail with messages, "
+                                   "never fallback weights.")
+
+                def _solve_inst(_m: str, _c):
+                    if _m == "Min Variance":
+                        return _optim_to_alloc(
+                            "Min Variance",
+                            min_variance(mu_simp.values, cov_simp.values,
+                                         rf_rate, min_w, max_w,
+                                         constraints=_c, tickers=tickers),
+                            tickers, mu_simp.values, cov_simp, rf_rate)
+                    if _m == "Max Sharpe":
+                        return _optim_to_alloc(
+                            "Max Sharpe",
+                            max_sharpe(mu_simp.values, cov_simp.values,
+                                       rf_rate, min_w, max_w,
+                                       constraints=_c, tickers=tickers),
+                            tickers, mu_simp.values, cov_simp, rf_rate)
+                    if _m == "Risk Parity":
+                        return equal_risk_contribution(
+                            tickers, mu_simp.values, cov_simp, rf_rate,
+                            min_w, max_w, constraints=_c)
+                    if _m == "Max Diversification":
+                        return maximum_diversification(
+                            tickers, mu_simp.values, cov_simp, rf_rate,
+                            min_w, max_w, constraints=_c)
+                    return None
+
                 inst_allocs: dict[str, AllocationResult] = {}
+                inst_plain: dict[str, AllocationResult] = {}
                 if "Current" in inst_methods:
                     inst_allocs["Current"] = _snapshot_alloc(
                         "Current", weights, tickers, mu_simp.values, cov_simp,
@@ -457,26 +597,12 @@ def render(ctx):
                         "Equal Weight", np.ones(len(tickers)) / len(tickers),
                         tickers, mu_simp.values, cov_simp, rf_rate,
                         "Equal weights (1/N).")
-                if "Min Variance" in inst_methods:
-                    inst_allocs["Min Variance"] = _optim_to_alloc(
-                        "Min Variance",
-                        min_variance(mu_simp.values, cov_simp.values, rf_rate,
-                                     min_w, max_w),
-                        tickers, mu_simp.values, cov_simp, rf_rate)
-                if "Max Sharpe" in inst_methods:
-                    inst_allocs["Max Sharpe"] = _optim_to_alloc(
-                        "Max Sharpe",
-                        max_sharpe(mu_simp.values, cov_simp.values, rf_rate,
-                                   min_w, max_w),
-                        tickers, mu_simp.values, cov_simp, rf_rate)
-                if "Risk Parity" in inst_methods:
-                    inst_allocs["Risk Parity"] = equal_risk_contribution(
-                        tickers, mu_simp.values, cov_simp, rf_rate,
-                        min_w, max_w)
-                if "Max Diversification" in inst_methods:
-                    inst_allocs["Max Diversification"] = maximum_diversification(
-                        tickers, mu_simp.values, cov_simp, rf_rate,
-                        min_w, max_w)
+                for _m in ("Min Variance", "Max Sharpe", "Risk Parity",
+                           "Max Diversification"):
+                    if _m in inst_methods:
+                        inst_allocs[_m] = _solve_inst(_m, _inst_c)
+                        if use_c:
+                            inst_plain[_m] = _solve_inst(_m, None)
                 bl_post = None
                 if "Black-Litterman" in inst_methods:
                     if bl_err or bl_cfg is None:
@@ -491,8 +617,40 @@ def render(ctx):
                         bl_post, bl_alloc = _run_bl_pipeline(
                             tickers, cov_simp, bl_cfg["ref"], weights,
                             bl_cfg["delta"], bl_cfg["tau"], bl_cfg["views"],
-                            rf_rate, min_w, max_w)
+                            rf_rate, min_w, max_w, constraints=_inst_c)
                         inst_allocs["Black-Litterman"] = bl_alloc
+                if use_c and inst_plain:
+                    st.markdown("#### Before / After Constraints")
+                    _w0 = np.asarray(weights, dtype=float)
+                    _brows = []
+                    for _m, _pa in inst_plain.items():
+                        _ca = inst_allocs.get(_m)
+                        if _pa is None or not _pa.success \
+                                or _ca is None or not _ca.success:
+                            _brows.append({
+                                "Method": _m,
+                                "Unconstrained Vol": (
+                                    f"{_pa.volatility:.2%}"
+                                    if _pa is not None and _pa.success
+                                    else "failed"),
+                                "Constrained Vol": (
+                                    f"{_ca.volatility:.2%}"
+                                    if _ca is not None and _ca.success
+                                    else "failed"),
+                                "Turnover vs Current": "n/a",
+                                "Max Shift": "n/a"})
+                            continue
+                        _cw = _ca.weights.values.astype(float)
+                        _brows.append({
+                            "Method": _m,
+                            "Unconstrained Vol": f"{_pa.volatility:.2%}",
+                            "Constrained Vol": f"{_ca.volatility:.2%}",
+                            "Turnover vs Current":
+                                f"{turnover_fraction(_cw, _w0):.2%}",
+                            "Max Shift":
+                                f"{max_single_name_shift(_cw, _w0):.2%}"})
+                    st.dataframe(pd.DataFrame(_brows).set_index("Method"),
+                                 width="stretch")
 
                 for _m, _a in inst_allocs.items():
                     if not _a.success:

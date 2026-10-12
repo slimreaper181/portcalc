@@ -103,7 +103,7 @@ def _bl_reference_weights(ref_choice: str, live_weights, tickers):
     return np.ones(len(tickers)) / len(tickers)
 
 def _run_bl_pipeline(tickers, cov_df, ref_choice, live_weights, delta, tau,
-                     views, rf_rate, min_w, max_w):
+                     views, rf_rate, min_w, max_w, constraints=None):
     """Run BL posterior + utility allocation. Returns (posterior, alloc)."""
     ref_w = _bl_reference_weights(ref_choice, live_weights, tickers)
     post = black_litterman_posterior(tickers, cov_df, ref_w, delta, tau, views)
@@ -115,5 +115,6 @@ def _run_bl_pipeline(tickers, cov_df, ref_choice, live_weights, delta, tau,
             risk_contributions=None, message=post.message)
         return post, alloc
     alloc = black_litterman_allocation(
-        tickers, post.posterior, cov_df, delta, rf_rate, min_w, max_w)
+        tickers, post.posterior, cov_df, delta, rf_rate, min_w, max_w,
+        constraints=constraints)
     return post, alloc
