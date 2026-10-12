@@ -985,6 +985,159 @@ def render(ctx):
                             "Order intents are descriptive research objects "
                             f"({len(_plan.intents)} legs). No execution, no "
                             "broker calls.")
+                        with st.expander("Execution simulation "
+                                         "(hypothetical fills)",
+                                         expanded=False):
+                            from analytics.execution import (
+                                SimConfig, SimQuote, apply_fills_sandbox,
+                                blotter_frame, cost_comparison,
+                                orders_from_intents, simulate_specs,
+                                simulation_summary)
+                            st.warning("SIMULATION ONLY — NO BROKER ORDERS "
+                                       "SENT. Fills are hypothetical.")
+                            s1, s2, s3, s4 = st.columns(4)
+                            with s1:
+                                _otype = st.selectbox(
+                                    "Order type", ["MARKET", "LIMIT"],
+                                    key="sim_otype",
+                                    help="LIMIT needs a price per leg below.")
+                            with s2:
+                                _slip = st.number_input(
+                                    "Slippage (bps)", min_value=0.0,
+                                    max_value=1000.0, value=5.0, step=1.0,
+                                    key="sim_slip")
+                            with s3:
+                                _cbps2 = st.number_input(
+                                    "Commission (bps)", min_value=0.0,
+                                    max_value=1000.0, value=0.0, step=1.0,
+                                    key="sim_cbps")
+                            with s4:
+                                _cflat = st.number_input(
+                                    "Commission flat (base)", min_value=0.0,
+                                    value=0.0, step=1.0, key="sim_cflat")
+                            try:
+                                _specs = orders_from_intents(
+                                    _plan.intents, order_type=_otype)
+                            except ValueError as e:
+                                st.error(f"Order specs: {e}")
+                                _specs = []
+                            _limits: dict = {}
+                            if _otype == "LIMIT" and _specs:
+                                st.caption("Limit prices (base per share).")
+                                _lcols = st.columns(max(1, len(_specs)))
+                                for _lc, _sp in zip(_lcols, _specs):
+                                    _def = None
+                                    _snap = (live_snapshot.get(
+                                        _sp["ticker"], {}) or {})
+                                    for _k in ("ask" if _sp["side"] == "BUY"
+                                               else "bid", "mark", "last"):
+                                        _v = _snap.get(_k)
+                                        if _v is not None and np.isfinite(
+                                                float(_v)):
+                                            _def = float(_v)
+                                            break
+                                    with _lc:
+                                        _limits[_sp["ticker"]] = st.number_input(
+                                            f"{_sp['ticker']} limit",
+                                            min_value=0.0,
+                                            value=float(_def or 0.0),
+                                            step=1.0,
+                                            key=f"sim_lim_{_sp['ticker']}")
+                                try:
+                                    _specs = orders_from_intents(
+                                        _plan.intents, order_type="LIMIT",
+                                        limits=_limits)
+                                except ValueError as e:
+                                    st.error(f"Limit specs: {e}")
+                                    _specs = []
+                            if _specs:
+                                _quotes = {}
+                                for _sp in _specs:
+                                    _snap = (live_snapshot.get(
+                                        _sp["ticker"], {}) or {})
+                                    _quotes[_sp["ticker"]] = SimQuote(
+                                        bid=_snap.get("bid"),
+                                        ask=_snap.get("ask"),
+                                        last=_snap.get("last"))
+                                try:
+                                    _orders = simulate_specs(
+                                        _specs, _quotes,
+                                        SimConfig(
+                                            slippage_bps=float(_slip),
+                                            commission_bps=float(_cbps2),
+                                            commission_flat=float(_cflat)))
+                                except ValueError as e:
+                                    st.error(f"Simulation: {e}")
+                                    _orders = []
+                                if _orders:
+                                    st.markdown("#### Blotter")
+                                    st.dataframe(
+                                        blotter_frame(_orders),
+                                        width="stretch", hide_index=True)
+                                    _sum = simulation_summary(_orders)
+                                    f1, f2, f3 = st.columns(3)
+                                    f1.metric(
+                                        "Filled",
+                                        f"{_sum['n_filled']}/{_sum['n_orders']}"
+                                        + (f" (+{_sum['n_partial']} partial)"
+                                           if _sum["n_partial"] else ""))
+                                    f2.metric("Simulated friction",
+                                              fmt_usd(_sum["total_friction"]),
+                                              help="Slippage + commissions.")
+                                    try:
+                                        _not = sum(
+                                            abs(float(_sp["quantity"])) * float(
+                                                _share_px.get(_sp["ticker"],
+                                                              0.0))
+                                            for _sp in _specs)
+                                        _cc = cost_comparison(
+                                            _sum["total_friction"],
+                                            float(_cbps), max(_not, 1e-9))
+                                        f3.metric(
+                                            "Modelled cost",
+                                            fmt_usd(_cc["modelled"]),
+                                            help="Planner assumption at "
+                                                 f"{float(_cbps):g} bps.")
+                                        st.caption(
+                                            f"Cost comparison — simulated "
+                                            f"{fmt_usd(_cc['simulated'])} vs "
+                                            f"modelled {fmt_usd(_cc['modelled'])} "
+                                            f"(Δ {fmt_usd(_cc['difference'])} on "
+                                            f"{fmt_usd(_cc['notional'])} notional). "
+                                            f"Both are estimates.")
+                                    except ValueError:
+                                        pass
+                                    if st.button(
+                                            "Apply fills to sandbox "
+                                            "(research copy)",
+                                            key="sim_sandbox"):
+                                        _hold = {
+                                            t: float(_cw[i]) * float(
+                                                portfolio_value) / float(
+                                                    _share_px.get(t, 1.0) or 1.0)
+                                            for i, t in enumerate(tickers)}
+                                        _nh, _nc = apply_fills_sandbox(
+                                            _hold, float(_pcash), _orders,
+                                            _share_px)
+                                        st.session_state["sim_sandbox"] = {
+                                            "holdings": _nh, "cash": _nc}
+                                    _sb = st.session_state.get("sim_sandbox")
+                                    if _sb:
+                                        st.caption(
+                                            "Sandbox holdings (research copy — "
+                                            "the real ledger is untouched).")
+                                        st.dataframe(
+                                            pd.DataFrame({
+                                                "Ticker": tickers,
+                                                "Sandbox Shares": [
+                                                    _sb["holdings"].get(t, 0.0)
+                                                    for t in tickers]}),
+                                            width="stretch", hide_index=True)
+                                        st.caption(
+                                            f"Sandbox cash: "
+                                            f"{fmt_usd(_sb['cash'])}.")
+                            else:
+                                st.caption("No actionable legs to simulate.")
 
 
     # ============================================================
