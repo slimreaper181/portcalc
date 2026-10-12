@@ -26,12 +26,15 @@ explicit ``now`` parameters (injectable in tests — never hidden clocks).
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from analytics.validation import validate_ticker_symbol
+
+logger = logging.getLogger("portcalc.live")
 
 # Freshness thresholds (documented policy, not guesses).
 FRESH_TRADE_SECONDS = 120      # last trade this fresh in-session → LIVE
@@ -503,8 +506,11 @@ def fetch_with_feed_fallback(symbols, credentials=None,
             return fetch_alpaca_quotes(symbols, credentials, feed, timeout), feed
         except _alp.AlpacaError as e:
             if getattr(e, "status", None) == 403:
+                logger.warning("Alpaca feed %s not entitled; trying next.",
+                               feed)
                 last = e
                 continue
+            logger.warning("Alpaca quote fetch failed: %s", e)
             raise
     raise last if last is not None else _alp.AlpacaError(
         "No feed available and no entitlement error recorded.")

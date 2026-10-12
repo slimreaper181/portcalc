@@ -621,6 +621,33 @@ def render(ctx):
                     st.dataframe(pd.DataFrame(_lrows), width="stretch",
                                  hide_index=True)
 
+    # ---- Watchlist (marks only — never holdings/P&L) ----
+    _wl = [w for w in (st.session_state.get("watchlist") or [])
+           if w not in tickers]
+    if _wl:
+        st.markdown("### Watchlist")
+        _wrows = []
+        for _w in _wl:
+            _m = (live_snapshot.get(_w, {}) or {})
+            _mk = _m.get("mark")
+            _dc = _m.get("day_change_pct")
+            _wrows.append({
+                "Symbol": _w,
+                "Mark": (f"{float(_mk):,.2f}"
+                         if _mk is not None else "—"),
+                "Day %": (f"{float(_dc):+.2%}"
+                          if _dc is not None else "—"),
+                "Bid / Ask": ((f"{_m.get('bid')} / {_m.get('ask')}")
+                              if _m.get("bid") is not None
+                              and _m.get("ask") is not None else "—"),
+                "Status": _m.get("status", "?"),
+            })
+        _wdf = pd.DataFrame(_wrows)
+        st.dataframe(_wdf, width="stretch", hide_index=True)
+        st.caption("Watchlist symbols are not holdings: marks and day moves "
+                   "only, no weight or P&L. Open any symbol in Security "
+                   "Detail.")
+
     # ---- Data quality, freshness, methodology ----
     with st.expander("Data Quality & Freshness"):
         _now = datetime.now(timezone.utc)

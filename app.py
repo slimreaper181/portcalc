@@ -736,7 +736,12 @@ with st.sidebar:
             "execution approximation; fractional shares; no market impact "
             "beyond explicit bps costs. Risk-free rate fixed at 5% across "
             "historical windows. French factors are US datasets. "
-            "TradingView charts are display-only.")
+            "TradingView charts are display-only. "
+            "Marks: fresh bid/ask mid, else last trade, else Yahoo "
+            "fallback (previous close when needed) — never invented. "
+            "Ledger: FIFO lots; fees adjust basis/proceeds; cash is "
+            "currency-keyed; negative cash rejected. TWR excludes external "
+            "flows; XIRR needs both flow signs. No orders are ever sent.")
 
 
 try:

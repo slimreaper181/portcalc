@@ -1,13 +1,39 @@
-# portcalc — Portfolio Research & Risk
+# portcalc — Live Portfolio Intelligence & Accounting Platform
 
 A modular Python portfolio research platform with a Streamlit web interface:
-institutional analytics (risk, optimisation, backtesting, walk-forward,
-factors) with purchase-date cost basis and USD/GBP/EUR multi-currency
-support.
+live marks and NAV, a transaction ledger with FIFO lots and cash accounting,
+TWR/XIRR performance, return attribution, a research-only rebalancing
+planner, plus institutional analytics (risk, optimisation, backtesting,
+walk-forward, factors) with purchase-date cost basis and USD/GBP/EUR
+multi-currency support.
 
 ## Features
 
-- **Live market data** via yfinance (prices, risk-free rate)
+- **Live market data** — quote model (bid/ask/last/previous close), explicit
+  mark policy (mid → last → fallback, never invented), freshness
+  (LIVE/DELAYED/STALE/CLOSED/FALLBACK), US session detection, feed fallback
+  (SIP→IEX), Yahoo fallback; no background threads, no auto-rerun loops
+- **Live portfolio** — NAV, Day P&L vs previous close, live weights, live
+  risk snapshot (historical estimates labelled as such)
+- **Transaction ledger** — BUY/SELL/DIVIDEND/FEE/DEPOSIT/WITHDRAWAL/INTEREST
+  with validation, deterministic entry ordering and stable IDs
+- **Multi-lot FIFO accounting** — open lots, realised P&L (native + base +
+  FX effect), weighted-average cost display, cash-exempt classic entries
+- **Cash accounts** — currency-keyed balances, negative-cash rejection,
+  full movement audit
+- **Performance from cash flows** — TWR (flows never count as return),
+  XIRR (structured failure when unsolvable), flow-matched benchmark legs
+- **Attribution** — beginning-weight contributions, winners/losers, exact
+  local×FX identity, separate recorded income
+- **Rebalancing planner** — optimiser/custom targets, cash-aware trades
+  with buffer/target/thresholds, cost estimates, before/after comparison,
+  OrderIntent objects; research-only, never executes
+- **Watchlist** — marks without holdings, opens in Security Detail
+- **Historical stress lab** — COVID/2022 presets + custom windows on real
+  data (current-composition hypothetical, labelled)
+- **Advanced risk** — component/marginal VaR (reconciled), diversification
+  benefit, Herfindahl, skew/excess kurtosis, Omega, capture ratios,
+  trailing rolling beta/correlation/tracking error
 - **Portfolio overview** — positions, cost basis, P&L, weights, insights,
   quote-currency exposure, dividends, data quality
 - **Risk analysis** — Parametric, Historical, and Monte Carlo VaR, CVaR,
@@ -19,8 +45,9 @@ support.
   scenarios (crash, bull, high-vol, custom), contributions, comparison
 - **Performance analytics** — benchmark comparison, drawdowns, rolling
   metrics, beta/alpha/tracking error, currency-aware benchmark
-- **Security detail** — position card, performance, risk relationship,
-  TradingView chart (display only), Alpaca live US prices with fallback
+- **Security detail** — live quote header, position card, lots, performance,
+  risk relationship, TradingView chart (display only), intraday display,
+  Alpaca live US prices with fallback
 - **Historical backtesting** — buy-and-hold, periodic rebalancing, exact
   transaction-cost accounting, three gated workflows (Historical, Static
   OOS, Walk-Forward)
@@ -32,8 +59,33 @@ support.
 - **Purchase dates & cost basis** — split-adjusted estimates, GBp
   normalisation, manual execution-price override
 - **Multi-currency** — USD/GBP/EUR base with date-matched historical FX
-- **Portfolio persistence** — versioned JSON import/export
-  (`portfolio.json`), analysis snapshot export
+- **Portfolio persistence** — schema v2 JSON (positions, ledger,
+  watchlist, settings) with v1 import compatibility and deterministic
+  aggregate→lot migration (`portfolio.json`), analysis snapshot export
+
+## Live Data & Accounting Methodology
+
+- **Mark policy:** fresh bid/ask midpoint → fresh last trade → aged legs
+  (labelled) → previous close → unavailable. Nothing invented.
+- **Freshness:** LIVE (≤120s in session), DELAYED, STALE (>30min),
+  CLOSED (session shut, last-known shown), FALLBACK (Yahoo).
+- **Cash:** currency-keyed; buys spend, sells/dividends add, fees/deposits/
+  withdrawals move the matching balance; negative cash rejected by default.
+- **FIFO:** sells consume oldest lots first; realised P&L = proceeds −
+  allocated cost − fees (native and base, plus FX effect identity).
+- **TWR:** sub-period linking around external flows (idle cash dilutes
+  honestly); **XIRR:** guarded solver with structured failure.
+- **Attribution:** contribution = beginning weight × simple return;
+  foreign legs split exactly into local/FX via
+  (1+R_local)(1+R_fx)−1 = R_base; recorded income stays separate from
+  adjusted-price returns.
+- **Planner:** first-order cost estimates on displayed notionals (the
+  historical simulator uses the exact fixed-point solver); net buys plus
+  costs draw deployable cash; shortfalls reported, never assumed.
+- **Ledger vs analytics:** the ledger is canonical for accounting (NAV,
+  lots, realised, cash, TWR/XIRR); aggregate positions remain the universe
+  definition for historical analytics (backtest/OOS/WF/factors on Yahoo
+  history). Live quotes never enter historical estimation.
 
 ## Project Structure
 
@@ -50,12 +102,14 @@ portcalc/
 │   ├── state.py            # Session defaults + result cache
 │   ├── insights.py         # Deterministic portfolio observations
 │   ├── bl.py               # Black-Litterman UI inputs
+│   ├── ledger.py           # Ledger session-state helpers
 │   └── views/              # One render module per research tab
 │       └── overview.py risk.py optimise.py scenarios.py
 │           performance.py security.py backtest.py factors.py
 ├── data/
 │   ├── __init__.py
-│   ├── market_data.py      # yfinance wrappers
+│   ├── market_data.py      # yfinance wrappers (+intraday, prev closes)
+│   ├── live_market.py      # Quotes, marks, store, ingestor, snapshot
 │   ├── pipeline.py         # Cached loaders + composed data plumbing
 │   ├── fx.py               # FX + instrument metadata
 │   ├── alpaca.py           # Live US prices (valuation only)
@@ -65,6 +119,7 @@ portcalc/
     ├── returns.py          # Log returns, mean, covariance, correlation
     ├── portfolio.py        # Portfolio metrics, Sharpe, risk contributions, CML
     ├── var.py              # Parametric, historical, Monte Carlo VaR + CVaR
+    ├── risk_extra.py       # Component/marginal VaR, skew, Omega, capture
     ├── optimisation.py     # SLSQP optimisation, efficient frontier, rebalancing
     ├── scenario.py         # Monte Carlo forward simulation, stress scenarios
     ├── allocation.py       # ERC, MaxDiv, Black-Litterman, OOS windows
@@ -73,6 +128,13 @@ portcalc/
     ├── currency.py         # FX maths (no look-ahead)
     ├── positions.py        # Cost basis, valuation, splits, dividends
     ├── performance.py      # Drawdowns, rolling metrics, benchmark stats
+    ├── performance_cashflows.py  # TWR/XIRR, flow-matched benchmark
+    ├── ledger.py           # Transactions, FIFO lots, cash, realised P&L
+    ├── persistence.py      # Schema v2, migration, import validation
+    ├── history.py          # Transaction-aware NAV reconstruction
+    ├── attribution.py      # Contributions, winners/losers, FX split
+    ├── rebalance_plan.py   # Research-only planner (no execution)
+    ├── stress.py           # Historical stress windows
     └── factors.py          # Factor regressions + attribution
 ```
 
