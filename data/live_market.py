@@ -631,12 +631,16 @@ def build_snapshot_marks(symbols: list[str], yahoo_current: dict,
     marks = build_mark_snapshot(quotes, now)
     out = {}
     for sym, m in marks.items():
+        q = quotes.get(sym)
         out[sym] = {"mark": m.mark, "method": m.method, "source": m.source,
                     "feed": m.feed, "status": m.status,
                     "age_seconds": m.age_seconds,
                     "day_change_pct": m.day_change_pct,
-                    "prev_close": (quotes[sym].previous_close
-                                   if quotes[sym] else None)}
+                    "prev_close": (q.previous_close if q else None),
+                    "last": (q.last_trade if q else None),
+                    "bid": (q.bid if q else None),
+                    "ask": (q.ask if q else None),
+                    "spread_bps": (q.spread_bps if q else None)}
     out["_status"] = {"feed": feed_used, "feed_note": feed_note,
                       "n_symbols": len(symbols),
                       "at": now.isoformat()}

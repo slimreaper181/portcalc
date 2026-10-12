@@ -228,6 +228,13 @@ def build_live_snapshot(tickers, yahoo_current, yahoo_prev_close=None):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def load_intraday(ticker: str, days: int = 1):
+    """Cached intraday closes for display only (never into analytics)."""
+    from data.market_data import fetch_intraday
+    return fetch_intraday(ticker, days)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def load_market_data(tickers: list[str], period: str):
     prices  = fetch_price_history(tickers, period=period)
     current = fetch_current_prices(tickers)
