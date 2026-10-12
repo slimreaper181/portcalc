@@ -1253,6 +1253,7 @@ ledger_cash = _ledger_view["cash"]
 # ---------------------------------------------------------------------------
 
 from data.pipeline import build_live_snapshot, load_previous_closes
+from data.ws_stream import get_stream_manager, overlay_stream_marks
 
 try:
     _prev_closes = load_previous_closes(tuple(tickers))
@@ -1267,6 +1268,28 @@ except Exception:
     live_snapshot = {"_status": {"feed": None,
                                  "feed_note": "snapshot unavailable",
                                  "n_symbols": 0, "at": ""}}
+
+# M3 — true streaming overlay: the manager owns one process-wide live
+# connection (holdings + watchlist + Security Detail ticker); fresher
+# stream quotes replace poll marks via the same mark policy, and the
+# stream status lands in the snapshot for the header strip. Any stream
+# failure degrades to the poll snapshot above — never breaks the run.
+try:
+    _stream_mgr = get_stream_manager()
+    _sec_pick = st.session_state.get("security_ticker")
+    _universe = list(tickers) + list(_watch_syms)
+    if _sec_pick and _sec_pick not in _universe:
+        _universe = _universe + [_sec_pick]
+    _stream_status = _stream_mgr.ensure(_universe)
+    live_snapshot = overlay_stream_marks(live_snapshot, _stream_mgr.store)
+    _st = dict(live_snapshot.get("_status", {}))
+    _st["stream_mode"] = _stream_status.get("mode")
+    _st["stream_note"] = _stream_status.get("note")
+    _st["stream_feed"] = _stream_status.get("feed")
+    _st["stream_age_s"] = _stream_status.get("newest_quote_age_s")
+    live_snapshot["_status"] = _st
+except Exception:
+    pass
 
 # Live securities value from marks (native marks × current FX) + cash = NAV.
 # Legacy Yahoo-based valuations above stay untouched for cost/P&L analytics.
@@ -1378,11 +1401,42 @@ _h3.metric("Cash", format_money(_cash_base, base_ccy),
            help="Currency-keyed cash from the transaction ledger.")
 _h4.metric("Base Currency", base_ccy)
 _live_note = live_snapshot.get("_status", {}).get("feed_note", "")
+_stream_mode = live_snapshot.get("_status", {}).get("stream_mode", "?")
+_stream_feed = live_snapshot.get("_status", {}).get("stream_feed")
+_stream_age = live_snapshot.get("_status", {}).get("stream_age_s")
+_stream_bit = f" · Stream: {_stream_mode}" + (
+    f" ({str(_stream_feed).upper()})" if _stream_feed else "") + (
+    f" · quote {_stream_age:.0f}s old"
+    if isinstance(_stream_age, (int, float)) else "")
 st.caption(f"Benchmark {str(_header_bench)} · Data through {_header_through} "
-           f"· Live: {_live_note}"
+           f"· Live: {_live_note}{_stream_bit}"
            + (" · Partial marks: " + ", ".join(live_incomplete)
               if live_incomplete else ""))
 st.markdown("---")
+
+
+@st.fragment(run_every=30)
+def _live_status_strip():
+    """Restrained live refresh: this fragment alone reruns every 30s.
+
+    Historical analytics live outside the fragment and never recompute
+    because of quote ticks; only this status line refreshes.
+    """
+    try:
+        _s = get_stream_manager().status()
+        _age_txt = (f"{_s['newest_quote_age_s']:.0f}s old"
+                    if isinstance(_s.get("newest_quote_age_s"),
+                                  (int, float)) else "no quotes yet")
+        _feed_txt = (f" · {str(_s['feed']).upper()}"
+                     if _s.get("feed") else "")
+        st.caption(f"Market data: **{_s['mode']}**{_feed_txt} · "
+                   f"{_age_txt} · {_s.get('note', '')} "
+                   f"({_s.get('n_symbols', 0)} symbols)")
+    except Exception:
+        pass
+
+
+_live_status_strip()
 
 # ---------------------------------------------------------------------------
 # Main tabs
