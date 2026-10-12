@@ -221,11 +221,17 @@ def apply_ledger(transactions: list[Transaction],
             return None
         return float(amount_native) * float(fx)
 
+    def _fee_base(amount_native: float, fx: float | None):
+        fb = _base(amount_native, fx)
+        if fb is not None:
+            state.fees_paid_base += fb
+
     for tx in txns:
         ccy = tx.currency
         if tx.type == "BUY":
             gross = tx.quantity * tx.price_native
             _move_cash(ccy, -(gross + tx.fee), tx)
+            _fee_base(tx.fee, tx.purchase_fx)
             fx = tx.purchase_fx
             cost_base = _base(gross + tx.fee, fx)
             state.open_lots.append(Lot(
@@ -246,6 +252,7 @@ def apply_ledger(transactions: list[Transaction],
                     "(shorting is not supported).")
             proceeds_native = tx.quantity * tx.price_native - tx.fee
             _move_cash(ccy, proceeds_native, tx)
+            _fee_base(tx.fee, tx.purchase_fx)
             fx = tx.purchase_fx
             need = tx.quantity
             cost_n, cost_b, base_known_leg, consumed = 0.0, 0.0, True, []
@@ -308,9 +315,7 @@ def apply_ledger(transactions: list[Transaction],
         elif tx.type == "FEE":
             # Standalone fee: pass quantity=fee, price=1.0 (amount=fee).
             _move_cash(ccy, -tx.fee, tx)
-            fb = _base(tx.fee, tx.purchase_fx)
-            if fb is not None:
-                state.fees_paid_base += fb
+            _fee_base(tx.fee, tx.purchase_fx)
         elif tx.type == "DEPOSIT":
             _move_cash(ccy, tx.quantity * tx.price_native, tx)
         elif tx.type == "WITHDRAWAL":
