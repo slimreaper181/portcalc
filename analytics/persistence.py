@@ -91,6 +91,9 @@ def transaction_to_dict(tx: Transaction) -> dict:
                         if tx.purchase_fx is not None else None),
         "notes": str(tx.notes or ""),
         "source": str(tx.source or "user"),
+        "move_cash": bool(tx.move_cash),
+        "created_at": (tx.created_at.isoformat()
+                       if isinstance(tx.created_at, datetime) else None),
     }
 
 
@@ -116,6 +119,14 @@ def transaction_from_dict(data: dict) -> Transaction:
             source=data.get("source", "user") or "user")
     except (TypeError, ValueError) as e:
         raise ValueError(f"Malformed transaction: {e}")
+    if "move_cash" in data:
+        tx.move_cash = bool(data.get("move_cash"))
+    _created = data.get("created_at")
+    if _created is not None:
+        try:
+            tx.created_at = datetime.fromisoformat(str(_created))
+        except ValueError as e:
+            raise ValueError(f"Bad created_at: {_created!r}.") from e
     return validate_transaction(tx)
 
 

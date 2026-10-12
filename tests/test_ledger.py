@@ -118,6 +118,39 @@ def test_duplicate_ids_rejected_and_order_deterministic():
         [l.transaction_id for l in st2.open_lots]
 
 
+def test_same_date_entry_order_beats_id_order():
+    # Programme 169: entry order (created_at) breaks same-date ties, so a
+    # same-day sell after buys applies (not rejected as oversell).
+    from datetime import datetime, timezone
+    t0 = datetime(2026, 3, 4, 10, 0, tzinfo=timezone.utc)
+    t1 = datetime(2026, 3, 4, 10, 5, tzinfo=timezone.utc)
+    b = _buy(4, "AAPL", 10, 100.0, tid="z-last-id")
+    b.created_at = t0
+    s = _tx(4, "SELL", "AAPL", 6, 110.0, tid="a-first-id")
+    s.created_at = t1
+    st = apply_ledger([_tx(1, "DEPOSIT", qty=99999, px=1.0), s, b])
+    assert open_shares_by_ticker(st) == {"AAPL": pytest.approx(4.0)}
+    assert st.realised[0].shares_sold == pytest.approx(6.0)
+
+
+def test_fifo_consumes_oldest_entry_first_same_day():
+    # Two same-day lots: the earlier-entered lot is consumed first even
+    # when its transaction id sorts later.
+    from datetime import datetime, timezone
+    t0 = datetime(2026, 3, 4, 10, 0, tzinfo=timezone.utc)
+    t1 = datetime(2026, 3, 4, 10, 5, tzinfo=timezone.utc)
+    b1 = _buy(4, "AAPL", 10, 100.0, tid="z-lot")
+    b1.created_at = t0
+    b2 = _buy(4, "AAPL", 10, 200.0, tid="a-lot")
+    b2.created_at = t1
+    st = apply_ledger([_tx(1, "DEPOSIT", qty=99999, px=1.0), b1, b2,
+                       _tx(5, "SELL", "AAPL", 5, 150.0, tid="s")])
+    (ev,) = st.realised
+    assert ev.lots_consumed == [("lot-z-lot", pytest.approx(5.0))]
+    assert ev.cost_native == pytest.approx(5 * 100.0)
+    assert open_shares_by_ticker(st) == {"AAPL": pytest.approx(15.0)}
+
+
 # ---------------------------------------------------------------------------
 # Fees / dividends / deposits / withdrawals / interest
 # ---------------------------------------------------------------------------
@@ -250,3 +283,24 @@ def test_full_flow_cash_lots_realised_unrealised_income_nav():
     nav = u["AAPL"]["market_base"] + st.cash["USD"]
     assert nav == pytest.approx(1875.0 + 8508.0)
     assert cost_by_ticker(st)["AAPL"][0] == pytest.approx(1600.0)
+
+
+def test_cash_exempt_classic_add_creates_lot_without_moving_cash():
+    dep = _tx(1, "DEPOSIT", qty=500.0, px=1.0)
+    agg = _buy(2, "AAPL", 10, 100.0, tid="agg1")
+    agg.move_cash = False
+    agg.source = "aggregate"
+    st = apply_ledger([dep, agg,
+                       _tx(3, "SELL", "AAPL", 4, 110.0, tid="s1")])
+    # Lot exists and sale realises against it; cash only reflects deposit
+    # and the full-form sell (the classic buy moved no cash).
+    assert open_shares_by_ticker(st) == {"AAPL": pytest.approx(6.0)}
+    assert st.cash == {"USD": pytest.approx(500.0 + 4 * 110.0)}
+    (ev,) = st.realised
+    assert ev.cost_native == pytest.approx(4 * 100.0)
+    assert ev.realised_pnl_native == pytest.approx(40.0)
+    with pytest.raises(ValueError, match="Cash-exempt"):
+        bad = _buy(2, "AAPL", 1, 1.0, tid="bad")
+        bad.move_cash = False
+        bad.type = "DIVIDEND"
+        validate_transaction(bad)

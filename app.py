@@ -25,7 +25,7 @@ Numerical conventions:
 
 import os
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import streamlit as st
@@ -35,14 +35,24 @@ from analytics.validation import (
     validate_shares,
     validate_ticker_symbol,
 )
-from analytics.currency import validate_base_currency
+from analytics.currency import rate_on_date, validate_base_currency
+from analytics.ledger import (
+    Transaction,
+    apply_ledger,
+    new_transaction_id,
+    open_shares_by_ticker,
+    validate_transaction,
+)
+from analytics.persistence import (
+    export_portfolio_v2,
+    validate_portfolio_import,
+)
+from data.market_data import fetch_current_prices
 from analytics.positions import (
-    export_portfolio,
     format_money,
     normalise_quote,
     position_from_dict,
     resolve_purchase_price,
-    validate_positions_import,
 )
 from data.fx import SUPPORTED_BASE_CURRENCIES, get_instrument
 from data.pipeline import (
@@ -65,6 +75,8 @@ from data.pipeline import (
 )
 from ui.errors import render_section
 from ui.feedback import flash, render_flash
+from ui.ledger import build_ledger_view, parse_session_transactions
+from analytics.persistence import transaction_to_dict
 from ui.views import backtest as views_backtest
 from ui.views import factors as views_factors
 from ui.views import performance as views_performance
@@ -170,6 +182,22 @@ def _complete_add_position(sym, shares, purchase_date, price_native,
     if sym in st.session_state.portfolio:
         st.warning(f"{sym} already held — updating it in place. Multiple "
                    "purchase lots are not supported yet.")
+    # Never silently drop cash-moving (full-form) lots through the classic
+    # aggregate path: those belong to the Transaction form.
+    try:
+        _existing, _err = parse_session_transactions(
+            st.session_state.ledger_txns)
+        _foreign = [t.transaction_id for t in _existing
+                    if t.ticker == sym and t.source not in ("aggregate",
+                                                            "migrate")]
+        if _err is None and _foreign:
+            st.warning(
+                f"{sym} has full-form ledger lots — update it with a Sell/Buy "
+                "in Record Transaction instead (classic update would orphan "
+                "their cash flows).")
+            return
+    except Exception:
+        pass
     st.session_state.portfolio[sym] = {
         "shares": float(shares),
         "purchase_date": (purchase_date.isoformat()
@@ -190,6 +218,39 @@ def _complete_add_position(sym, shares, purchase_date, price_native,
     st.session_state.data_loaded = False
     _label = {"estimate": "estimated close", "manual": "actual execution",
               "legacy": "legacy cost"}.get(source, source)
+    # Mirror into the ledger as a cash-exempt lot (classic aggregate adds
+    # carry no cash movement; full-form BUYs move cash). Replaces any prior
+    # lots for this ticker (single aggregate acquisition, like the dict).
+    try:
+        _keep = [t for t in st.session_state.ledger_txns
+                 if not (isinstance(t, dict)
+                         and str(t.get("ticker", "")).upper() == sym)]
+        _nccy = (inst.get("native_currency")
+                 if isinstance(inst, dict)
+                 else getattr(inst, "native_currency", None)) or "USD"
+        _base_now = st.session_state.get("base_currency", "USD")
+        _fx = 1.0 if _nccy == _base_now else None
+        if _fx is None:
+            try:
+                _fxh = load_fx_history()
+                _fx = rate_on_date(
+                    _fxh, _nccy, _base_now,
+                    purchase_date if hasattr(purchase_date, "isoformat")
+                    and purchase_date is not None else date.today())
+            except ValueError:
+                _fx = None
+        _lot = validate_transaction(Transaction(
+            transaction_id=new_transaction_id(),
+            date=(purchase_date if hasattr(purchase_date, "isoformat")
+                  and purchase_date is not None else date.today()),
+            type="BUY", ticker=sym, quantity=float(shares),
+            price_native=float(price_native), currency=_nccy, fee=0.0,
+            purchase_fx=_fx, notes=f"Classic add ({_label}).",
+            source="aggregate", move_cash=False))
+        _keep.append(transaction_to_dict(_lot))
+        st.session_state.ledger_txns = _keep
+    except (ValueError, AttributeError):
+        pass  # aggregate dict stays canonical; ledger keeps prior lots
     # Flash (not st.success): per-run deltas are dropped by st.rerun().
     flash(f"Added {sym} ({_label}).", "success")
     st.rerun()
@@ -374,11 +435,198 @@ with st.sidebar:
             to_remove.append(ticker)
 
     for t in to_remove:
+        # Lot-aware close: open ledger lots are sold at the current mark
+        # (cash-exempt, like classic adds) so realised P&L is recorded and
+        # no dangling lots survive. Failures block removal (no partials).
+        try:
+            _now_txns, _now_err = parse_session_transactions(
+                st.session_state.ledger_txns)
+            _open = 0.0
+            if _now_err is None and _now_txns:
+                _open = open_shares_by_ticker(
+                    apply_ledger(_now_txns)).get(t, 0.0)
+            if _open > 0:
+                _marks = fetch_current_prices([t])
+                _px = float(_marks.get(t, float("nan")))
+                _inst_rm = get_instrument(t)
+                _scale = float(_inst_rm.quote_scale or 1.0)
+                _nccy = _inst_rm.native_currency or "USD"
+                if not np.isfinite(_px) or _px <= 0:
+                    raise ValueError("no current mark available")
+                _base_now = st.session_state.get("base_currency", "USD")
+                _fx = 1.0 if _nccy == _base_now else None
+                if _fx is None:
+                    _fx = rate_on_date(load_fx_history(), _nccy, _base_now,
+                                       date.today())
+                _close = validate_transaction(Transaction(
+                    transaction_id=new_transaction_id(), date=date.today(),
+                    type="SELL", ticker=t, quantity=float(_open),
+                    price_native=float(_px) * _scale, currency=_nccy,
+                    fee=0.0, purchase_fx=_fx,
+                    notes="Holding removed — closed at current mark.",
+                    source="remove-close", move_cash=False))
+                _keep = list(st.session_state.ledger_txns) + [
+                    transaction_to_dict(_close)]
+                # Validate the resulting ledger before mutating anything.
+                _check, _check_err = parse_session_transactions(_keep)
+                if _check_err is None:
+                    apply_ledger(_check)
+                else:
+                    raise ValueError(_check_err)
+                st.session_state.ledger_txns = _keep
+                flash(f"Removed {t} — {float(_open):g} shares closed at "
+                      f"~{float(_px) * _scale:,.2f} {_nccy} (realised "
+                      "recorded, cash untouched).", "info")
+            else:
+                flash(f"Removed {t}.", "info")
+        except (ValueError, AttributeError):
+            st.warning(f"Could not close {t}'s ledger lots safely — "
+                       "holding kept. Use a Sell transaction instead.")
+            continue
         del st.session_state.portfolio[t]
         save_portfolio(st.session_state.portfolio)
         st.session_state.data_loaded = False
-        flash(f"Removed {t}.", "info")
         st.rerun()
+
+    st.markdown('<div class="pc-kicker">TRANSACTIONS</div>',
+                unsafe_allow_html=True)
+    with st.expander("Record transaction", expanded=False):
+        st.caption(
+            "Full-form flows move cash (BUY spends, SELL/DIVIDEND add). "
+            "Classic Adds above are cash-exempt shortcuts.")
+        tx_type = st.selectbox(
+            "Type", ["BUY", "SELL", "DIVIDEND", "FEE", "DEPOSIT",
+                     "WITHDRAWAL", "INTEREST"],
+            key="tx_type",
+            help="DIVIDEND/INTEREST record cash income. DEPOSIT/WITHDRAWAL "
+                 "are external flows (never investment return).")
+        tx_date = st.date_input(
+            "Date", value=date.today(), max_value=date.today(), key="tx_date")
+        _needs_ticker = tx_type in ("BUY", "SELL", "DIVIDEND", "INTEREST")
+        tx_ticker = (st.text_input("Ticker", key="tx_ticker").upper().strip()
+                     if _needs_ticker else "")
+        if tx_type in ("DEPOSIT", "WITHDRAWAL"):
+            tx_qty = st.number_input("Amount", min_value=0.0, step=100.0,
+                                     key="tx_qty")
+            tx_price, _show_price = 1.0, False
+        elif tx_type == "FEE":
+            tx_qty = st.number_input("Fee amount", min_value=0.0, step=1.0,
+                                     key="tx_qty")
+            tx_price, _show_price = 1.0, False
+        elif tx_type in ("DIVIDEND", "INTEREST"):
+            tx_qty = st.number_input("Shares entitled", min_value=0.0,
+                                     step=1.0, key="tx_qty")
+            tx_price = st.number_input("Per-share amount (native)",
+                                       min_value=0.0, step=0.1,
+                                       key="tx_price")
+            _show_price = True
+        else:
+            tx_qty = st.number_input("Shares", min_value=0.0, step=0.5,
+                                     key="tx_qty")
+            tx_price = st.number_input("Execution price (native)",
+                                       min_value=0.0, step=0.5,
+                                       key="tx_price")
+            _show_price = True
+        tx_ccy = st.selectbox("Currency", ["USD", "GBP", "EUR"], key="tx_ccy",
+                              help="Native transaction currency = cash "
+                                   "currency moved.")
+        tx_fee = st.number_input("Fee (native)", min_value=0.0, step=1.0,
+                                 key="tx_fee") \
+            if tx_type in ("BUY", "SELL") else 0.0
+        if tx_type == "BUY" and tx_ticker:
+            if st.button("Estimate price from history", key="tx_estimate"):
+                try:
+                    _e_inst = get_instrument(
+                        validate_ticker_symbol(tx_ticker))
+                    _e_raw = load_raw_history(
+                        validate_ticker_symbol(tx_ticker))
+                    _e_res = resolve_purchase_price(
+                        _e_raw, load_splits(
+                            validate_ticker_symbol(tx_ticker)),
+                        tx_date, date.today())
+                    if _e_res["status"] == "ok":
+                        st.session_state.tx_price = float(normalise_quote(
+                            _e_res["price"], _e_inst.quote_scale))
+                        st.rerun()
+                    else:
+                        st.warning(
+                            "No estimate: "
+                            + _e_res.get("message", "unavailable"))
+                except ValueError as e:
+                    st.error(str(e))
+        if tx_type == "SELL" and tx_ticker:
+            try:
+                _pv_txns, _pv_err = parse_session_transactions(
+                    st.session_state.ledger_txns)
+                _avail = open_shares_by_ticker(
+                    apply_ledger(_pv_txns)).get(tx_ticker, 0.0) \
+                    if _pv_err is None and _pv_txns else 0.0
+                st.caption(f"Available: {_avail:g} shares of {tx_ticker}.")
+            except ValueError:
+                st.caption("Ledger preview unavailable.")
+        if st.button("Record Transaction", key="tx_save"):
+            try:
+                _sym = (validate_ticker_symbol(tx_ticker)
+                        if _needs_ticker else None)
+                _base_now = st.session_state.get("base_currency", "USD")
+                _fx = 1.0 if tx_ccy == _base_now else None
+                if _fx is None:
+                    try:
+                        _fx = rate_on_date(load_fx_history(), tx_ccy,
+                                           _base_now, tx_date)
+                    except ValueError:
+                        _fx = None
+                _ntx = validate_transaction(Transaction(
+                    transaction_id=new_transaction_id(), date=tx_date,
+                    type=tx_type, ticker=_sym,
+                    quantity=float(tx_qty),
+                    price_native=float(tx_price) if _show_price else 1.0,
+                    currency=tx_ccy, fee=float(tx_fee), purchase_fx=_fx,
+                    notes="", source="user", move_cash=True,
+                    created_at=datetime.now(timezone.utc)))
+                _all, _parse_err = parse_session_transactions(
+                    st.session_state.ledger_txns)
+                if _parse_err is not None:
+                    raise ValueError(_parse_err)
+                _trial = _all + [_ntx]
+                _st = apply_ledger(_trial)  # validates cash/sell limits first
+                st.session_state.ledger_txns = [
+                    transaction_to_dict(t) for t in _trial]
+                _extra = ""
+                if tx_type == "SELL":
+                    _hit = [e for e in _st.realised
+                            if e.transaction_id == _ntx.transaction_id]
+                    if _hit:
+                        _extra = (f" Realised "
+                                  f"{_hit[0].realised_pnl_native:+,.2f} "
+                                  f"{tx_ccy} (est.).")
+                flash(f"Recorded {tx_type} {_extra}".rstrip() + ".", "success")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+    st.markdown('<div class="pc-kicker">WATCHLIST</div>',
+                unsafe_allow_html=True)
+    _wl_new = st.text_input("Add symbol", key="wl_new",
+                            placeholder="e.g. TSLA").upper().strip()
+    if st.button("Add to watchlist", key="wl_add"):
+        try:
+            _wl_sym = validate_ticker_symbol(_wl_new)
+            if _wl_sym not in st.session_state.watchlist:
+                st.session_state.watchlist = sorted(
+                    st.session_state.watchlist + [_wl_sym])
+                flash(f"Watching {_wl_sym}.", "success")
+            st.rerun()
+        except ValueError as e:
+            st.error(str(e))
+    for _w in list(st.session_state.watchlist):
+        _c1, _c2 = st.columns([3, 1])
+        _c1.markdown(f"**{_w}**")
+        if _c2.button("✕", key=f"wl_rm_{_w}"):
+            st.session_state.watchlist = [
+                x for x in st.session_state.watchlist if x != _w]
+            flash(f"Stopped watching {_w}.", "info")
+            st.rerun()
 
     st.markdown('<div class="pc-kicker">DATA</div>',
                 unsafe_allow_html=True)
@@ -403,16 +651,22 @@ with st.sidebar:
 
     st.markdown('<div class="pc-kicker">FILES</div>',
                 unsafe_allow_html=True)
-    # --- Export / Import (positions + settings only, never secrets) ---
+    # --- Export / Import (schema v2: positions + ledger + watchlist) ---
     with st.expander("Import / export / reset", expanded=False):
         st.markdown("### Portfolio Data")
         try:
-            _export_doc = export_portfolio(
+            _exp_txns, _exp_err = parse_session_transactions(
+                st.session_state.ledger_txns)
+            if _exp_err is not None:
+                raise ValueError(_exp_err)
+            _export_doc = export_portfolio_v2(
                 st.session_state.portfolio,
-                st.session_state.get("base_currency", "USD"))
+                st.session_state.get("base_currency", "USD"),
+                _exp_txns, list(st.session_state.watchlist),
+                {"benchmark": st.session_state.get("bt_benchmark", "SPY")})
             st.download_button(
                 "Export Portfolio (JSON)", data=json.dumps(_export_doc, indent=2),
-                file_name="portcalc-portfolio.json", mime="application/json",
+                file_name="portcalc-portfolio-v2.json", mime="application/json",
                 key="export_json")
         except ValueError as e:
             st.warning(f"Export unavailable: {e}")
@@ -422,20 +676,31 @@ with st.sidebar:
             if st.button("Replace portfolio with import", key="import_apply"):
                 try:
                     _doc = json.load(_uploaded)
-                    _imp_positions, _imp_base = validate_positions_import(_doc)
+                    _imp = validate_portfolio_import(_doc)
                 except (ValueError, json.JSONDecodeError) as e:
                     st.error(f"Import rejected: {e}")
                 except Exception:
                     st.error("Import rejected: unreadable file.")
                 else:
-                    st.session_state.portfolio = _imp_positions
-                    if _imp_base in SUPPORTED_BASE_CURRENCIES:
-                        st.session_state.base_currency = _imp_base
-                        save_settings({"base_currency": _imp_base})
+                    # Import REPLACES all state (Programme 176: no merges,
+                    # so re-importing can never duplicate ledger entries).
+                    st.session_state.portfolio = _imp.positions
+                    st.session_state.ledger_txns = [
+                        transaction_to_dict(t) for t in _imp.transactions]
+                    st.session_state.watchlist = list(_imp.watchlist)
+                    st.session_state.ledger_cleared = False
+                    if _imp_base := _imp.base_currency:
+                        if _imp_base in SUPPORTED_BASE_CURRENCIES:
+                            st.session_state.base_currency = _imp_base
+                            save_settings({"base_currency": _imp_base})
+                    if _imp.settings.get("benchmark"):
+                        st.session_state.bt_benchmark = str(
+                            _imp.settings["benchmark"])
                     save_portfolio(st.session_state.portfolio)
                     st.session_state.data_loaded = False
-                    flash(f"Imported {len(_imp_positions)} positions "
-                          f"(base {_imp_base}).", "success")
+                    flash(f"Imported {len(_imp.positions)} positions, "
+                          f"{len(_imp.transactions)} transactions "
+                          f"(base {_imp.base_currency}).", "success")
                     st.rerun()
 
         # --- Reset with intentional confirmation ---
@@ -443,15 +708,20 @@ with st.sidebar:
             st.session_state.confirm_reset = True
             st.rerun()
         if st.session_state.get("confirm_reset"):
-            st.warning("Delete ALL positions? This cannot be undone.")
+            st.warning("Delete ALL positions, transactions, cash and "
+                       "watchlist? This cannot be undone.")
             _r1, _r2 = st.columns(2)
             with _r1:
                 if st.button("Confirm reset", key="reset_confirm"):
                     st.session_state.portfolio = {}
+                    st.session_state.ledger_txns = []
+                    st.session_state.watchlist = []
+                    st.session_state.ledger_cleared = False
                     save_portfolio(st.session_state.portfolio)
                     st.session_state.confirm_reset = False
                     st.session_state.data_loaded = False
-                    flash("Portfolio reset — all positions removed.", "warning")
+                    flash("Portfolio reset — positions, ledger and "
+                          "watchlist removed.", "warning")
                     st.rerun()
             with _r2:
                 if st.button("Cancel", key="reset_cancel"):
@@ -555,61 +825,18 @@ pos_by_ticker = positions
 # Task 9 — ledger build (migration + FX resolution + derived state)
 # ---------------------------------------------------------------------------
 
-from analytics.ledger import (
-    apply_ledger,
-    average_cost_per_share,
-    open_shares_by_ticker,
-    unrealised_by_ticker,
-)
-from analytics.persistence import (
-    migrate_v1_to_ledger,
-    rebase_ledger_fx,
-    transaction_from_dict,
-    transaction_to_dict,
-)
-
-ledger_notes: list = []
-ledger_error: str | None = None
-_ledger_raw = [t for t in st.session_state.ledger_txns
-               if isinstance(t, dict)]
-if not _ledger_raw and not st.session_state.ledger_cleared \
-        and st.session_state.portfolio:
-    # Deterministic auto-migration: aggregate positions → opening BUYs.
-    _mig, _skipped = migrate_v1_to_ledger(st.session_state.portfolio)
-    _ledger_raw = [transaction_to_dict(t) for t in _mig]
-    st.session_state.ledger_txns = _ledger_raw
-    if _skipped:
-        ledger_notes.append(
-            "Migration skipped undated entries (reported, never invented): "
-            + ", ".join(_skipped) + ".")
-_ledger_txns = []
-for _d in _ledger_raw:
-    try:
-        _ledger_txns.append(transaction_from_dict(_d))
-    except ValueError as e:
-        ledger_error = f"Ledger entry rejected: {e}"
-        _ledger_txns = []
-        break
-if ledger_error is None and _ledger_txns:
-    # Fill unknown FX legs from date-matched history (base-aware); user
-    # legs are preserved. Base switches recompute presentation only.
-    _adj, _unresolved = rebase_ledger_fx(
-        _ledger_txns, base_ccy, ccy.get("fx_hist"), only_missing=True)
-    _ledger_txns = _adj
-    if _unresolved:
-        ledger_notes.append(
-            "Purchase-date FX unavailable for "
-            f"{len(_unresolved)} ledger leg(s); base cost stays unknown "
-            "there (never assumed).")
-try:
-    ledger_state = apply_ledger(_ledger_txns) if (
-        ledger_error is None and _ledger_txns) else None
-except ValueError as e:
-    ledger_error = f"Ledger inconsistent: {e}"
-    ledger_state = None
-ledger_open_shares = open_shares_by_ticker(ledger_state) \
-    if ledger_state else {}
-ledger_cash = dict(ledger_state.cash) if ledger_state else {}
+_ledger_view = build_ledger_view(
+    st.session_state.ledger_txns, st.session_state.portfolio, base_ccy,
+    ccy.get("fx_hist"), cleared=st.session_state.ledger_cleared)
+if _ledger_view["migrated"]:
+    st.session_state.ledger_txns = [
+        transaction_to_dict(t) for t in _ledger_view["transactions"]]
+ledger_notes: list = list(_ledger_view["notes"])
+ledger_error: str | None = _ledger_view["error"]
+_ledger_txns = _ledger_view["transactions"]
+ledger_state = _ledger_view["state"]
+ledger_open_shares = _ledger_view["open_shares"]
+ledger_cash = _ledger_view["cash"]
 
 # ---------------------------------------------------------------------------
 # Task 9 — live mark snapshot (one consistent read for all current cards)

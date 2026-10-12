@@ -38,7 +38,7 @@ from __future__ import annotations
 import math
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 TX_TYPES = ("BUY", "SELL", "DIVIDEND", "FEE", "DEPOSIT", "WITHDRAWAL",
             "INTEREST")
@@ -62,6 +62,9 @@ class Transaction:
     purchase_fx: float | None = None  # native→base at txn date
     notes: str = ""
     source: str = "user"  # user | aggregate | import | migrate
+    move_cash: bool = True  # False: lot-only entry (classic aggregate adds
+    # carry no cash movement; full-form flows always move cash)
+    created_at: datetime | None = None  # entry timestamp (same-date order)
 
 
 @dataclass
@@ -80,6 +83,7 @@ class Lot:
     cost_basis_base: float | None  # remaining base cost (None if FX unknown)
     source: str
     transaction_id: str
+    created_at: datetime | None = None  # entry order tiebreak (same-date lots)
 
 
 @dataclass
@@ -175,11 +179,22 @@ def validate_transaction(tx: Transaction) -> Transaction:
     tx.quantity = float(tx.quantity)
     tx.price_native = float(tx.price_native)
     tx.fee = float(tx.fee)
+    if not isinstance(tx.move_cash, bool):
+        raise ValueError("move_cash must be true/false.")
+    if not tx.move_cash and tx.type not in ("BUY", "SELL"):
+        raise ValueError("Cash-exempt entries are only valid for BUY/SELL.")
     return tx
 
 
 def _order_key(tx: Transaction):
-    return (tx.date, tx.transaction_id)
+    # Deterministic: date, then entry timestamp (preserves same-day entry
+    # order), then id (stable for migrated/imported batches without times).
+    created = tx.created_at
+    if not isinstance(created, datetime):
+        created = datetime.min.replace(tzinfo=timezone.utc)
+    elif created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return (tx.date, created, tx.transaction_id)
 
 
 def _open_shares(open_lots: list, ticker: str) -> float:
@@ -230,7 +245,8 @@ def apply_ledger(transactions: list[Transaction],
         ccy = tx.currency
         if tx.type == "BUY":
             gross = tx.quantity * tx.price_native
-            _move_cash(ccy, -(gross + tx.fee), tx)
+            if tx.move_cash:
+                _move_cash(ccy, -(gross + tx.fee), tx)
             _fee_base(tx.fee, tx.purchase_fx)
             fx = tx.purchase_fx
             cost_base = _base(gross + tx.fee, fx)
@@ -242,7 +258,8 @@ def apply_ledger(transactions: list[Transaction],
                 native_currency=ccy, purchase_fx=fx,
                 cost_basis_native=gross + tx.fee,
                 cost_basis_base=cost_base,
-                source=tx.source, transaction_id=tx.transaction_id))
+                source=tx.source, transaction_id=tx.transaction_id,
+                created_at=tx.created_at))
         elif tx.type == "SELL":
             avail = _open_shares(state.open_lots, tx.ticker)
             if tx.quantity > avail + 1e-9:
@@ -251,14 +268,24 @@ def apply_ledger(transactions: list[Transaction],
                     f"{tx.ticker} but only {avail:g} shares are available "
                     "(shorting is not supported).")
             proceeds_native = tx.quantity * tx.price_native - tx.fee
-            _move_cash(ccy, proceeds_native, tx)
+            if tx.move_cash:
+                _move_cash(ccy, proceeds_native, tx)
             _fee_base(tx.fee, tx.purchase_fx)
             fx = tx.purchase_fx
             need = tx.quantity
             cost_n, cost_b, base_known_leg, consumed = 0.0, 0.0, True, []
+
+            def _lot_key(lot):
+                created = lot.created_at
+                if not isinstance(created, datetime):
+                    created = datetime.min.replace(tzinfo=timezone.utc)
+                elif created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                return (lot.purchase_date, created, lot.lot_id)
+
             for lot in sorted(
                     [l for l in state.open_lots if l.ticker == tx.ticker],
-                    key=lambda l: (l.purchase_date, l.lot_id)):
+                    key=_lot_key):
                 if need <= 1e-12:
                     break
                 take = min(lot.shares_remaining, need)
@@ -399,4 +426,5 @@ def _copy_tx(tx: Transaction) -> Transaction:
         transaction_id=tx.transaction_id, date=tx.date, type=tx.type,
         ticker=tx.ticker, quantity=tx.quantity, price_native=tx.price_native,
         currency=tx.currency, fee=tx.fee, purchase_fx=tx.purchase_fx,
-        notes=tx.notes, source=tx.source)
+        notes=tx.notes, source=tx.source, move_cash=tx.move_cash,
+        created_at=tx.created_at)
