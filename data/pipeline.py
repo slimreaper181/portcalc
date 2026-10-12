@@ -181,6 +181,52 @@ def build_core_analytics(
         "rc": rc,
     }
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_previous_closes(tickers):
+    """Cached previous official daily closes (Day-P&L baseline)."""
+    from data.market_data import fetch_previous_closes
+    return fetch_previous_closes(list(tickers))
+
+
+def build_live_snapshot(tickers, yahoo_current, yahoo_prev_close=None):
+    """One consistent live-mark snapshot (never raises).
+
+    Tries Alpaca credentials silently (absent → Yahoo fallback for every
+    symbol, labelled). Returns JSON-safe ``{symbol: mark-dict}`` plus a
+    ``_status`` summary. Historical panels are untouched — marks feed
+    current display/NAV only.
+    """
+    from data import live_market as _lm
+    try:
+        from data.alpaca import get_alpaca_credentials
+        try:
+            creds = get_alpaca_credentials()
+        except Exception:
+            creds = None
+    except Exception:
+        creds = None
+    try:
+        return _lm.build_snapshot_marks(
+            list(tickers), dict(yahoo_current or {}),
+            dict(yahoo_prev_close or {}), credentials=creds)
+    except Exception:
+        out = {}
+        for t in list(tickers or []):
+            try:
+                px = float((yahoo_current or {}).get(t, float("nan")))
+            except (TypeError, ValueError):
+                px = float("nan")
+            import math
+            out[t] = {"mark": px if math.isfinite(px) else None,
+                      "method": "Yahoo fallback", "source": "Yahoo",
+                      "feed": None, "status": "FALLBACK",
+                      "age_seconds": None, "day_change_pct": None,
+                      "prev_close": None}
+        out["_status"] = {"feed": None, "feed_note": "Yahoo fallback",
+                          "n_symbols": len(out), "at": ""}
+        return out
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_market_data(tickers: list[str], period: str):
     prices  = fetch_price_history(tickers, period=period)

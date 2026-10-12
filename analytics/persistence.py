@@ -205,6 +205,46 @@ def validate_portfolio_import(data: dict) -> PortfolioDocument:
                              settings={str(k): v for k, v in settings.items()})
 
 
+def rebase_ledger_fx(transactions: list, new_base: str,
+                   fx_history, limit: int = 30,
+                   only_missing: bool = True) -> tuple[list, list]:
+    """Recompute stored native→base FX for a base-currency switch.
+
+    Native economics (quantity/price/currency) are never mutated — only the
+    presentation ``purchase_fx`` legs are recomputed via date-matched
+    historical FX (``rate_on_date``). With ``only_missing`` (default),
+    user-recorded legs are preserved and only unknown legs resolve; pass
+    False to recompute every non-base leg. Unresolvable legs become None
+    (base unknown, disclosed downstream — never invented).
+    Returns ``(adjusted_transactions, unresolved_ids)``.
+    """
+    from analytics.currency import rate_on_date
+    new_base = validate_base_currency(new_base)
+    out, unresolved = [], []
+    for tx in transactions or []:
+        if not isinstance(tx, Transaction):
+            continue
+        if tx.currency == new_base:
+            tx.purchase_fx = 1.0
+            out.append(tx)
+            continue
+        if only_missing and tx.purchase_fx is not None:
+            out.append(tx)
+            continue
+        rate = None
+        try:
+            if fx_history is not None:
+                rate = rate_on_date(fx_history, tx.currency, new_base,
+                                    tx.date, limit=limit)
+        except ValueError:
+            rate = None
+        tx.purchase_fx = rate
+        if rate is None:
+            unresolved.append(tx.transaction_id)
+        out.append(tx)
+    return out, unresolved
+
+
 def migrate_v1_to_ledger(positions: dict) -> tuple[list, list]:
     """Aggregate v1 positions → synthetic opening BUY transactions.
 

@@ -208,6 +208,14 @@ if "base_currency" not in st.session_state:
 if "data_loaded" not in st.session_state:
     st.session_state.data_loaded = False
 
+# Task 9 ledger/watchlist session state (JSON-safe shapes only).
+if "ledger_txns" not in st.session_state:
+    st.session_state.ledger_txns = []
+if "watchlist" not in st.session_state:
+    st.session_state.watchlist = []
+if "ledger_cleared" not in st.session_state:
+    st.session_state.ledger_cleared = False
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -543,6 +551,128 @@ except ValueError as e:
 val_by_ticker = {v.ticker: v for v in valuations}
 pos_by_ticker = positions
 
+# ---------------------------------------------------------------------------
+# Task 9 — ledger build (migration + FX resolution + derived state)
+# ---------------------------------------------------------------------------
+
+from analytics.ledger import (
+    apply_ledger,
+    average_cost_per_share,
+    open_shares_by_ticker,
+    unrealised_by_ticker,
+)
+from analytics.persistence import (
+    migrate_v1_to_ledger,
+    rebase_ledger_fx,
+    transaction_from_dict,
+    transaction_to_dict,
+)
+
+ledger_notes: list = []
+ledger_error: str | None = None
+_ledger_raw = [t for t in st.session_state.ledger_txns
+               if isinstance(t, dict)]
+if not _ledger_raw and not st.session_state.ledger_cleared \
+        and st.session_state.portfolio:
+    # Deterministic auto-migration: aggregate positions → opening BUYs.
+    _mig, _skipped = migrate_v1_to_ledger(st.session_state.portfolio)
+    _ledger_raw = [transaction_to_dict(t) for t in _mig]
+    st.session_state.ledger_txns = _ledger_raw
+    if _skipped:
+        ledger_notes.append(
+            "Migration skipped undated entries (reported, never invented): "
+            + ", ".join(_skipped) + ".")
+_ledger_txns = []
+for _d in _ledger_raw:
+    try:
+        _ledger_txns.append(transaction_from_dict(_d))
+    except ValueError as e:
+        ledger_error = f"Ledger entry rejected: {e}"
+        _ledger_txns = []
+        break
+if ledger_error is None and _ledger_txns:
+    # Fill unknown FX legs from date-matched history (base-aware); user
+    # legs are preserved. Base switches recompute presentation only.
+    _adj, _unresolved = rebase_ledger_fx(
+        _ledger_txns, base_ccy, ccy.get("fx_hist"), only_missing=True)
+    _ledger_txns = _adj
+    if _unresolved:
+        ledger_notes.append(
+            "Purchase-date FX unavailable for "
+            f"{len(_unresolved)} ledger leg(s); base cost stays unknown "
+            "there (never assumed).")
+try:
+    ledger_state = apply_ledger(_ledger_txns) if (
+        ledger_error is None and _ledger_txns) else None
+except ValueError as e:
+    ledger_error = f"Ledger inconsistent: {e}"
+    ledger_state = None
+ledger_open_shares = open_shares_by_ticker(ledger_state) \
+    if ledger_state else {}
+ledger_cash = dict(ledger_state.cash) if ledger_state else {}
+
+# ---------------------------------------------------------------------------
+# Task 9 — live mark snapshot (one consistent read for all current cards)
+# ---------------------------------------------------------------------------
+
+from data.pipeline import build_live_snapshot, load_previous_closes
+
+try:
+    _prev_closes = load_previous_closes(tuple(tickers))
+except ValueError:
+    _prev_closes = {}
+try:
+    _watch_syms = [w for w in st.session_state.watchlist
+                   if w not in tickers]
+    live_snapshot = build_live_snapshot(
+        tickers + _watch_syms, current_prices, _prev_closes)
+except Exception:
+    live_snapshot = {"_status": {"feed": None,
+                                 "feed_note": "snapshot unavailable",
+                                 "n_symbols": 0, "at": ""}}
+
+# Live securities value from marks (native marks × current FX) + cash = NAV.
+# Legacy Yahoo-based valuations above stay untouched for cost/P&L analytics.
+live_holdings: dict = {}
+live_day_pnl_native: dict = {}
+for _t in tickers:
+    _m = live_snapshot.get(_t, {})
+    _mark = _m.get("mark")
+    _sh = float(ledger_open_shares.get(
+        _t, st.session_state.portfolio.get(_t, {}).get("shares", 0.0)) or 0.0)
+    _inst = ccy["instruments"][_t]
+    _fx_now = ccy["fx_now"].get(_inst.native_currency)
+    if _mark is None or not np.isfinite(float(_mark)) or _sh <= 0 \
+            or _fx_now is None or not np.isfinite(float(_fx_now)) \
+            or float(_fx_now) <= 0:
+        live_holdings[_t] = {"native_value": None, "base_value": None,
+                             "day_pnl_base": None, "shares": _sh}
+        continue
+    _native_value = _sh * float(_mark) * float(_inst.quote_scale)
+    live_holdings[_t] = {
+        "native_value": _native_value,
+        "base_value": _native_value * float(_fx_now),
+        "shares": _sh,
+        "day_pnl_base": None,
+    }
+    _prev = _m.get("prev_close")
+    if _prev is not None and float(_prev) > 0:
+        _day_native = (float(_mark) - float(_prev)) * _sh \
+            * float(_inst.quote_scale)
+        live_holdings[_t]["day_pnl_base"] = _day_native * float(_fx_now)
+_cash_base = 0.0
+for _ccy, _bal in ledger_cash.items():
+    _r = ccy["fx_now"].get(_ccy)
+    if _r is not None and np.isfinite(float(_r)) and float(_r) > 0:
+        _cash_base += float(_bal) * float(_r)
+_live_sec_base = sum(v["base_value"] for v in live_holdings.values()
+                    if v["base_value"] is not None)
+portfolio_nav = _live_sec_base + _cash_base
+day_pnl_base = sum(v["day_pnl_base"] for v in live_holdings.values()
+                   if v["day_pnl_base"] is not None)
+live_incomplete = [t for t, v in live_holdings.items()
+                   if v["base_value"] is None]
+
 # Shared render context for ui/views tabs (single source of shell state).
 # Overview may return an updated dict (history-period rebuild) merged back.
 ctx = {
@@ -575,13 +705,23 @@ ctx = {
     "instruments": instruments,
     "native_panel": native_panel,
     "core": core,
+    "live_snapshot": live_snapshot,
+    "live_holdings": live_holdings,
+    "ledger_state": ledger_state,
+    "ledger_error": ledger_error,
+    "ledger_notes": ledger_notes,
+    "ledger_cash": ledger_cash,
+    "portfolio_nav": portfolio_nav,
+    "day_pnl_base": day_pnl_base,
+    "live_incomplete": live_incomplete,
+    "watchlist": list(st.session_state.watchlist),
 }
 
 # ---------------------------------------------------------------------------
 # Application shell header (compact context — details live in the tabs)
 # ---------------------------------------------------------------------------
 
-from ui.formatting import format_date, format_money
+from ui.formatting import format_date, format_money, format_signed_money
 
 _header_bench = st.session_state.get("bt_benchmark", "SPY")
 try:
@@ -591,10 +731,20 @@ except Exception:
 st.markdown("## Portfolio Calc")
 st.caption("Portfolio Research & Risk")
 _h1, _h2, _h3, _h4 = st.columns(4)
-_h1.metric("Portfolio Value", format_money(portfolio_value, base_ccy))
-_h2.metric("Base Currency", base_ccy)
-_h3.metric("Benchmark", str(_header_bench))
-_h4.metric("Data Through", _header_through)
+_h1.metric("NAV", format_money(portfolio_nav, base_ccy),
+           help="Live securities value (mark prices) + cash.")
+_h2.metric("Day P&L", format_signed_money(day_pnl_base, base_ccy)
+           if live_holdings else "—",
+           help="Mark vs previous official close (pre/post-market marks "
+                "compared against the last close; see methodology).")
+_h3.metric("Cash", format_money(_cash_base, base_ccy),
+           help="Currency-keyed cash from the transaction ledger.")
+_h4.metric("Base Currency", base_ccy)
+_live_note = live_snapshot.get("_status", {}).get("feed_note", "")
+st.caption(f"Benchmark {str(_header_bench)} · Data through {_header_through} "
+           f"· Live: {_live_note}"
+           + (" · Partial marks: " + ", ".join(live_incomplete)
+              if live_incomplete else ""))
 st.markdown("---")
 
 # ---------------------------------------------------------------------------

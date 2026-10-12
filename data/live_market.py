@@ -571,3 +571,73 @@ def build_mark_snapshot(quotes: dict[str, Quote | None],
             age_seconds=(quote.age_seconds(now) if quote else None),
             day_change_pct=(quote.day_change_pct if quote else None))
     return out
+
+
+def build_snapshot_marks(symbols: list[str], yahoo_current: dict,
+                         yahoo_prev_close: dict | None = None,
+                         credentials=None,
+                         now: datetime | None = None) -> dict:
+    """One consistent mark snapshot for a symbol set (never raises).
+
+    Tries Alpaca trades+quotes (feed fallback SIP→IEX) when credentials are
+    available, merges last-trade legs, and falls back per symbol to Yahoo
+    (explicit FALLBACK status). Returns symbol → plain mark dicts
+    (JSON-safe for session state) plus a ``_status`` summary entry.
+    """
+    from data import alpaca as _alp
+
+    now = now or datetime.now(timezone.utc)
+    symbols = [validate_ticker_symbol(s) for s in (symbols or [])]
+    yahoo_current = dict(yahoo_current or {})
+    yahoo_prev_close = dict(yahoo_prev_close or {})
+    quotes: dict[str, Quote] = {}
+    feed_used, feed_note = None, "Yahoo fallback"
+    trades: dict = {}
+    if credentials is not None:
+        try:
+            trades = _alp.fetch_latest_trades(symbols, credentials)
+        except (_alp.AlpacaError, ValueError):
+            trades = {}
+        try:
+            qmap, feed_used = fetch_with_feed_fallback(symbols, credentials)
+            feed_note = f"Alpaca {feed_used.upper()}"
+        except (_alp.AlpacaError, ValueError):
+            qmap = {}
+        for sym, q in qmap.items():
+            trade = trades.get(sym) if isinstance(trades, dict) else None
+            quotes[sym] = Quote(
+                symbol=sym, bid=q.bid, bid_size=q.bid_size, ask=q.ask,
+                ask_size=q.ask_size, quote_timestamp=q.quote_timestamp,
+                last_trade=(trade.price if trade else None),
+                last_trade_timestamp=(trade.timestamp if trade else None),
+                last_trade_size=None,
+                previous_close=(float(yahoo_prev_close[sym])
+                                if yahoo_prev_close.get(sym) not in (None,)
+                                and math.isfinite(float(
+                                    yahoo_prev_close.get(sym, float("nan"))))
+                                else None),
+                source="Alpaca", feed=q.feed or feed_used,
+                received_at=now)
+    for sym in symbols:
+        if sym in quotes:
+            continue
+        prev = yahoo_prev_close.get(sym)
+        quotes[sym] = yahoo_fallback_quote(
+            sym, yahoo_current.get(sym),
+            previous_close=prev if prev is not None and math.isfinite(
+                float(prev)) else None,
+            received_at=now) or Quote(symbol=sym, source="unknown",
+                                      received_at=now)
+    marks = build_mark_snapshot(quotes, now)
+    out = {}
+    for sym, m in marks.items():
+        out[sym] = {"mark": m.mark, "method": m.method, "source": m.source,
+                    "feed": m.feed, "status": m.status,
+                    "age_seconds": m.age_seconds,
+                    "day_change_pct": m.day_change_pct,
+                    "prev_close": (quotes[sym].previous_close
+                                   if quotes[sym] else None)}
+    out["_status"] = {"feed": feed_used, "feed_note": feed_note,
+                      "n_symbols": len(symbols),
+                      "at": now.isoformat()}
+    return out
