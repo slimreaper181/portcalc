@@ -35,6 +35,7 @@ from data.pipeline import (
 )
 from ui.formatting import fmt_pct, fmt_usd, style_matrix
 from ui.feedback import flash
+from ui.views import accounting as views_accounting
 from ui.theme import CHART_THEME
 
 
@@ -550,76 +551,9 @@ def render(ctx):
         except (ValueError, KeyError, TypeError) as e:
             st.info(f"Live risk snapshot unavailable: {e}")
 
-    # ---- Transactions & open lots ----
+    # ---- Transactions & open lots (Accounting 2.0 surface) ----
     with st.expander("Transactions & Open Lots", expanded=False):
-        _tx_all = [t for t in (st.session_state.get("ledger_txns") or [])
-                   if isinstance(t, dict)]
-        if not _tx_all:
-            st.caption("No ledger transactions yet — record one in the "
-                       "sidebar, or add a holding (auto-migrated).")
-        else:
-            _f1, _f2 = st.columns(2)
-            with _f1:
-                _ft = st.selectbox(
-                    "Ticker filter", ["All"] + sorted(
-                        {str(t.get("ticker") or "") for t in _tx_all
-                         if t.get("ticker")}),
-                    key="ov_tx_ticker")
-            with _f2:
-                _fy = st.selectbox(
-                    "Type filter",
-                    ["All", "BUY", "SELL", "DIVIDEND", "FEE", "DEPOSIT",
-                     "WITHDRAWAL", "INTEREST"],
-                    key="ov_tx_type")
-            _rows = []
-            for _d in sorted(_tx_all,
-                             key=lambda d: (str(d.get("date", "")),
-                                            str(d.get("transaction_id", "")))):
-                if _ft != "All" and _d.get("ticker") != _ft:
-                    continue
-                if _fy != "All" and _d.get("type") != _fy:
-                    continue
-                _rows.append({
-                    "Date": str(_d.get("date", ""))[:10],
-                    "Type": _d.get("type"), "Ticker": _d.get("ticker") or "—",
-                    "Qty": _d.get("quantity"), "Price": _d.get("price_native"),
-                    "Ccy": _d.get("currency"), "Fee": _d.get("fee"),
-                    "Src": _d.get("source"),
-                })
-            st.dataframe(pd.DataFrame(_rows), width="stretch",
-                         hide_index=True)
-            st.caption("Delete corrects the ledger (derived lots/P&L/cash "
-                       "rebuild deterministically; never hand-edited).")
-            for _d in _tx_all:
-                _tid = str(_d.get("transaction_id", ""))
-                if st.button(f"Delete {_d.get('date','')} "
-                             f"{_d.get('type','')} {_tid[:6]}…",
-                             key=f"tx_del_{_tid}"):
-                    st.session_state.ledger_txns = [
-                        x for x in st.session_state.ledger_txns
-                        if not (isinstance(x, dict)
-                                and x.get("transaction_id") == _tid)]
-                    flash("Transaction deleted — ledger rebuilt.", "info")
-                    st.rerun()
-        if ledger_state is not None and ledger_state.open_lots:
-            st.markdown("#### Open Lots")
-            for _t in tickers:
-                _lots = [l for l in ledger_state.open_lots
-                         if l.ticker == _t]
-                if not _lots:
-                    continue
-                with st.expander(f"{_t} — {len(_lots)} lot(s)",
-                                 expanded=False):
-                    _lrows = [{
-                        "Bought": l.purchase_date.isoformat()
-                        if hasattr(l.purchase_date, "isoformat") else "—",
-                        "Shares": round(l.shares_remaining, 6),
-                        f"Cost ({l.native_currency})":
-                            round(l.cost_basis_native, 2),
-                        "Source": l.source,
-                    } for l in _lots]
-                    st.dataframe(pd.DataFrame(_lrows), width="stretch",
-                                 hide_index=True)
+        views_accounting.render_ledger_section(ctx)
 
     # ---- Watchlist (marks only — never holdings/P&L) ----
     _wl = [w for w in (st.session_state.get("watchlist") or [])

@@ -50,6 +50,7 @@ from analytics.persistence import (
 )
 from storage import database as ws_db
 from storage import repositories as ws_repo
+from storage.database import workspace_db_path
 from ui.workspace import (
     legacy_seed_state,
     workspace_signature,
@@ -101,13 +102,6 @@ from ui.views import risk as views_risk
 PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio.json")
 SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
 
-
-def workspace_db_path() -> str:
-    """Workspace database location (PORTCALC_DB overrides for tests)."""
-    override = os.environ.get("PORTCALC_DB")
-    if override:
-        return override
-    return os.path.join(os.path.dirname(__file__), "portcalc.db")
 
 DEFAULT_PORTFOLIO = {
     "AAPL":  {"shares": 10, "avg_cost": 150.0},
@@ -924,7 +918,9 @@ with st.sidebar:
                     type=tx_type, ticker=_sym,
                     quantity=float(tx_qty),
                     price_native=float(tx_price) if _show_price else 1.0,
-                    currency=tx_ccy, fee=float(tx_fee), purchase_fx=_fx,
+                    currency=tx_ccy,
+                    fee=float(tx_qty) if tx_type == "FEE"
+                    else float(tx_fee), purchase_fx=_fx,
                     notes="", source="user", move_cash=True,
                     created_at=datetime.now(timezone.utc)))
                 _all, _parse_err = parse_session_transactions(

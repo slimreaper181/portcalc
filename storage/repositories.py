@@ -239,6 +239,50 @@ def _row_to_tx(row: sqlite3.Row):
         "created_at": row["created_at"]})
 
 
+def replace_ledger_with_audit(conn: sqlite3.Connection,
+                                portfolio_id: str,
+                                transactions) -> dict:
+    """Replace a ledger AND record CREATE/UPDATE/DELETE revisions.
+
+    Diffs the new ledger against stored rows by stable transaction id
+    (payloads compared as JSON-safe dicts): identical ids with changed
+    payloads → UPDATE (before+after); new ids → CREATE; missing ids →
+    DELETE. A byte-identical replace records nothing. Validation runs
+    first — failures write neither rows nor revisions (atomic).
+    """
+    from analytics.ledger import Transaction, validate_transaction
+    from analytics.persistence import transaction_to_dict
+    from storage import database as _db
+    get_portfolio(conn, portfolio_id)
+    if not isinstance(transactions, list) or any(
+            not isinstance(t, Transaction) for t in transactions):
+        raise ValueError("Transactions must be a list of Transaction.")
+    fresh = list(transactions)
+    for tx in fresh:
+        validate_transaction(tx)  # raises before anything is touched
+    old_rows = {t.transaction_id: transaction_to_dict(t)
+                for t in list_transactions(conn, portfolio_id)}
+    new_rows = {t.transaction_id: transaction_to_dict(t) for t in fresh}
+    counts = {"created": 0, "updated": 0, "deleted": 0}
+    with _db.atomic(conn=conn):
+        for tid, payload in new_rows.items():
+            if tid not in old_rows:
+                record_revision(conn, portfolio_id, tid, "CREATE",
+                                None, payload)
+                counts["created"] += 1
+            elif payload != old_rows[tid]:
+                record_revision(conn, portfolio_id, tid, "UPDATE",
+                                old_rows[tid], payload)
+                counts["updated"] += 1
+        for tid, payload in old_rows.items():
+            if tid not in new_rows:
+                record_revision(conn, portfolio_id, tid, "DELETE",
+                                payload, None)
+                counts["deleted"] += 1
+        replace_transactions(conn, portfolio_id, fresh)
+    return counts
+
+
 def replace_transactions(conn: sqlite3.Connection, portfolio_id: str,
                          transactions) -> int:
     """Replace a portfolio's whole ledger atomically (validated first).
@@ -592,7 +636,7 @@ def save_workspace(conn: sqlite3.Connection, portfolio_id: str, *,
         raise ValueError("Risk-free rate must be between 0 and 1.")
     with _db.atomic(conn=conn):
         replace_positions(conn, portfolio_id, positions or {})
-        replace_transactions(conn, portfolio_id, list(transactions))
+        replace_ledger_with_audit(conn, portfolio_id, list(transactions))
         set_watchlist(conn, portfolio_id, clean_watch)
         updates: dict = {}
         if base_currency is not None:

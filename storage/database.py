@@ -25,6 +25,20 @@ def default_db_path() -> str:
         return str(Path(__file__).resolve().parent.parent / ".portcalc.db")
 
 
+def workspace_db_path() -> str:
+    """Workspace database location (PORTCALC_DB overrides for tests).
+
+    Default is a repo-local ``portcalc.db`` (git-ignored) so a checkout
+    just works; set PORTCALC_DB to point at an application-data
+    directory instead. Never stores credentials — schema has no
+    secrets table by construction (tested).
+    """
+    override = os.environ.get("PORTCALC_DB", "").strip()
+    if override:
+        return override
+    return str(Path(__file__).resolve().parent.parent / "portcalc.db")
+
+
 def connect(path: str | None = None) -> sqlite3.Connection:
     """Open the database (creating + migrating schema as needed)."""
     db_path = path or default_db_path()
