@@ -271,6 +271,9 @@ def migrate_v1_to_ledger(positions: dict) -> tuple[list, list]:
     lack a dated execution price (never invented). Deterministic ids
     (``mig-v1-{TICKER}-{k}``); purchase FX stays None (resolved later via
     purchase-date FX with an estimated label, or cost stays unknown).
+    Migrated lots are cash-exempt (``move_cash=False``): legacy aggregates
+    never had tracked cash, so forcing cash movement would strand every
+    migrated ledger in negative cash. Full-form flows always move cash.
     """
     txns, skipped = [], []
     for k, (ticker, data) in enumerate(sorted((positions or {}).items())):
@@ -294,5 +297,5 @@ def migrate_v1_to_ledger(positions: dict) -> tuple[list, list]:
             price_native=float(pos.purchase_price_native),
             currency=pos.native_currency, fee=0.0, purchase_fx=None,
             notes="Migrated aggregate position (estimated cost basis).",
-            source="migrate")))
+            source="migrate", move_cash=False)))
     return txns, skipped

@@ -96,6 +96,26 @@ def test_migration_equivalence_and_skips():
     assert open_shares_by_ticker(st)["BARC.L"] == pytest.approx(100.0)
 
 
+def test_migrated_lots_are_cash_exempt():
+    # Legacy aggregates never had tracked cash: migrated BUYs must apply
+    # on an empty ledger without stranding it in negative cash.
+    positions = {"AAPL": _pos()}
+    txns, skipped = migrate_v1_to_ledger(positions)
+    assert skipped == []
+    assert txns[0].move_cash is False
+    st = apply_ledger(txns)  # no deposit, no allow-flag: must succeed
+    assert open_shares_by_ticker(st) == {"AAPL": pytest.approx(10.0)}
+    assert st.cash == {}
+    # A later full-form sell still realises against the migrated lot.
+    sell = Transaction(transaction_id="s", date=date(2026, 9, 1),
+                       type="SELL", ticker="AAPL", quantity=4.0,
+                       price_native=320.0, currency="USD", purchase_fx=1.0)
+    st2 = apply_ledger(txns + [sell])
+    assert open_shares_by_ticker(st2) == {"AAPL": pytest.approx(6.0)}
+    assert st2.cash == {"USD": pytest.approx(4 * 320.0)}
+    assert st2.realised[0].cost_native == pytest.approx(4 * 305.26)
+
+
 def test_transaction_dict_roundtrip_precision():
     from datetime import datetime, timezone
     tx = Transaction(transaction_id="p1", date=date(2026, 8, 13), type="BUY",
