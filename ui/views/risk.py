@@ -32,6 +32,7 @@ def render(ctx):
     port_vol = ctx["port_vol"]
     portfolio_value = ctx["portfolio_value"]
     weights = ctx["weights"]
+    ccy = ctx["ccy"]
 
     st.markdown("## Risk Analysis")
 
@@ -223,24 +224,98 @@ def render(ctx):
                       fmt_pct(_db["diversification_benefit"]),
                       help="Weighted standalone volatility minus portfolio "
                            "volatility (long-only, never negative).")
-            d2.metric("Herfindahl", f"{_herf(_w):.3f}",
+            _herf_v = _herf(_w)
+            d2.metric("Herfindahl", f"{_herf_v:.3f}",
                       help="Sum of squared weights (1/N diversified → 1 "
                            "concentrated).")
+            d3.metric("Effective Holdings",
+                      f"{1.0 / _herf_v:.2f}" if _herf_v > 0 else "—",
+                      help="1 / Herfindahl: holding count of an equally "
+                           "weighted portfolio with the same concentration.")
             try:
                 _ds = _dist(port_daily_returns)
-                d3.metric(
+                _sk1, _sk2 = st.columns(2)
+                _sk1.metric(
                     "Skew / Excess Kurtosis",
                     f"{_ds['skewness']:.2f} / {_ds['excess_kurtosis']:.2f}",
                     help="Population moments of daily log returns; kurtosis "
                          "is excess (Fisher, normal = 0).")
-                st.metric("Omega Ratio (MAR 0%)",
-                          f"{_omega(np.asarray(port_daily_returns, dtype=float), 0.0):.2f}"
-                          if np.isfinite(_omega(np.asarray(
-                              port_daily_returns, dtype=float), 0.0))
-                          else "∞ (no downside)",
-                          help="Average gain above 0% per unit of average "
-                               "loss below 0%.")
+                with _sk2:
+                    _mar = st.number_input(
+                        "Omega MAR (%)", value=0.0, step=0.5,
+                        key="risk_omega_mar",
+                        help="Minimum acceptable return threshold for the "
+                             "Omega ratio.")
+                _om = _omega(np.asarray(port_daily_returns, dtype=float),
+                             float(_mar) / 100.0)
+                st.metric(f"Omega Ratio (MAR {float(_mar):.1f}%)",
+                          f"{_om:.2f}" if np.isfinite(_om) else "∞",
+                          help="Average gain above the threshold per unit of "
+                               "average loss below it (+∞ when no downside).")
             except ValueError as e:
                 st.caption(f"Distribution diagnostics unavailable: {e}")
         except ValueError as e:
             st.warning(f"Advanced diagnostics unavailable: {e}")
+
+    # ---- Benchmark-relative & rolling risk (trailing only) ----
+    with st.expander("Benchmark & Rolling Risk", expanded=False):
+        st.caption("Trailing windows only — no future leakage. Benchmark "
+                   "comes from the same cached loader as Performance.")
+        _bt = st.text_input("Benchmark ticker", value=st.session_state.get(
+            "bench_ticker", "SPY"), key="risk_bench",
+            help="Any Yahoo Finance ticker.")
+        _rw = st.selectbox("Rolling window (trading days)", [63, 126, 252],
+                           index=0, key="risk_rollwin")
+        try:
+            from analytics.performance import log_returns_from_prices as _lrp
+            from analytics.risk_extra import (
+                rolling_beta as _rbeta, rolling_correlation as _rcorr,
+                rolling_tracking_error as _rte,
+                upside_downside_capture as _cap)
+            from data.pipeline import (
+                base_benchmark_series as _bbs, load_benchmark_data as _lbd)
+            from analytics.validation import (
+                validate_ticker_symbol as _vts)
+            _bsym = _vts(_bt)
+            _bp = _bbs(_lbd(_bsym, "2y"), _bsym,
+                       st.session_state.get("base_currency", "USD"),
+                       ccy.get("fx_hist"))
+        except ValueError as e:
+            st.warning(f"Benchmark unavailable: {e}")
+            _bp = None
+        if _bp is not None:
+            try:
+                _br = _lrp(_bp)
+                _pr = pd.Series(port_daily_returns).dropna()
+                _common = pd.DataFrame(
+                    {"p": _pr, "b": _br}).dropna()
+                if len(_common) < int(_rw):
+                    st.info("Insufficient overlap for the rolling window.")
+                else:
+                    _beta = _rbeta(_common["p"], _common["b"], int(_rw))
+                    _te = _rte(_common["p"], _common["b"], int(_rw))
+                    _cap = _cap(_common["p"], _common["b"])
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Trailing Beta",
+                              f"{float(_beta.dropna().iloc[-1]):.2f}",
+                              help="cov(portfolio, benchmark)/var(benchmark) "
+                                   "over the trailing window.")
+                    c2.metric("Tracking Error (ann.)",
+                              f"{float(_te.dropna().iloc[-1]):.2%}")
+                    c3.metric(
+                        "Up / Down Capture",
+                        f"{_cap['upside_capture']:.2f} / "
+                        f"{_cap['downside_capture']:.2f}",
+                        help="Mean portfolio return per unit of benchmark "
+                             "return on benchmark-up/down days.")
+                    fig_beta = go.Figure()
+                    fig_beta.add_trace(go.Scatter(
+                        x=_beta.index, y=_beta.values, mode="lines",
+                        name="Rolling Beta",
+                        line=dict(color="#58a6ff", width=2)))
+                    fig_beta.update_layout(
+                        **CHART_THEME, title=f"Trailing Beta vs {_bsym}",
+                        xaxis_title="Date", yaxis_title="Beta")
+                    st.plotly_chart(fig_beta, width="stretch")
+            except ValueError as e:
+                st.warning(f"Rolling risk unavailable: {e}")
