@@ -22,6 +22,9 @@ THRESHOLDS = {
     "drawdown_watch": 0.10,        # max drawdown magnitude → watch
     "fx_concentration": 0.70,      # top quotation currency above → info
     "effective_min": 3.0,          # effective holdings below → watch
+    "cash_weight_info": 0.10,      # cash share of NAV above → info
+    "day_pnl_info": 0.005,         # |day P&L| / NAV above → info
+    "cost_drag_info": 0.0,         # any positive drag reported → info
 }
 
 _ADVICE_RE = re.compile(
@@ -45,7 +48,7 @@ def _pct(x: float) -> str:
     return f"{float(x):.1%}"
 
 
-def build_insights(facts: dict) -> list:
+def build_insights(facts: dict, limit: int = MAX_INSIGHTS) -> list:
     """Build ordered observations from a facts dict (pure)."""
     f = dict(facts or {})
     out: list = []
@@ -106,6 +109,35 @@ def build_insights(facts: dict) -> list:
         add("watch", "diversification",
             f"Effective holdings: {float(eff):.1f} on {int(n)} names — "
             "capital is concentrated in a few positions.")
+    cw = f.get("cash_weight")
+    if cw is not None and float(cw) >= THRESHOLDS["cash_weight_info"]:
+        add("info", "cash",
+            f"Cash represents {_pct(cw)} of NAV.")
+    dp, nav = f.get("day_pnl"), f.get("nav")
+    if dp is not None and nav:
+        ratio = float(dp) / float(nav) if float(nav) != 0 else 0.0
+        if abs(ratio) >= THRESHOLDS["day_pnl_info"]:
+            direction = "higher" if ratio > 0 else "lower"
+            add("info", "day move",
+                f"Day P&L is {ratio:+.2%} of NAV — marks moved {direction} "
+                "since the previous close.")
+    tc, tc_share = f.get("top_contributor"), f.get("top_contributor_share")
+    if tc is not None and tc_share is not None:
+        add("info", "attribution",
+            f"{tc} added {float(tc_share):+.2%} to the analysed period "
+            "return (largest contributor).")
+    td, td_share = f.get("top_detractor"), f.get("top_detractor_share")
+    if td is not None and td_share is not None:
+        add("info", "attribution",
+            f"{td} detracted {abs(float(td_share)):.2%} from the analysed "
+            "period return (largest detractor).")
+    drag, drag_m = f.get("cost_drag"), f.get("cost_drag_method")
+    if drag is not None and float(drag) > THRESHOLDS["cost_drag_info"]:
+        add("info", "costs",
+            f"Rebalancing costs dragged {drag_m or 'the strategy'} by "
+            f"{float(drag):,.2f} versus its zero-cost twin (compounding "
+            "included).")
     sev_rank = {"notable": 0, "watch": 1, "info": 2}
     out.sort(key=lambda i: sev_rank.get(i.severity, 3))
-    return out[:MAX_INSIGHTS]
+    limit = max(int(limit or 0), 0) or MAX_INSIGHTS
+    return out[:limit]

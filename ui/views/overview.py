@@ -34,6 +34,7 @@ from data.pipeline import (
     resolve_valuation_prices,
 )
 from ui.formatting import fmt_pct, fmt_usd, style_matrix
+from ui.feedback import flash
 from ui.theme import CHART_THEME
 
 
@@ -68,6 +69,14 @@ def render(ctx):
     port_daily_returns = ctx["port_daily_returns"]
     val_by_ticker = ctx["val_by_ticker"]
     native_panel = ctx["native_panel"]
+    live_snapshot = ctx.get("live_snapshot", {})
+    live_holdings = ctx.get("live_holdings", {})
+    ledger_state = ctx.get("ledger_state")
+    ledger_error = ctx.get("ledger_error")
+    ledger_notes = ctx.get("ledger_notes", [])
+    ledger_cash = ctx.get("ledger_cash", {})
+    portfolio_nav = ctx.get("portfolio_nav")
+    day_pnl_base = ctx.get("day_pnl_base")
 
     st.markdown("## Portfolio Overview")
 
@@ -189,6 +198,19 @@ def render(ctx):
                              if _dd_stat else None),
         }
         try:
+            _cash_b = 0.0
+            for _ccy, _bal in (ledger_cash or {}).items():
+                _r = (ccy.get("fx_now", {}) or {}).get(_ccy)
+                if _r is not None and np.isfinite(float(_r)) \
+                        and float(_r) > 0:
+                    _cash_b += float(_bal) * float(_r)
+            if portfolio_nav:
+                _facts["cash_weight"] = _cash_b / float(portfolio_nav)
+            _facts["day_pnl"] = day_pnl_base
+            _facts["nav"] = portfolio_nav
+        except Exception:
+            pass
+        try:
             from analytics.allocation import (
                 effective_number_of_holdings as _eff_n)
             _facts["effective_holdings"] = float(_eff_n(_wvals))
@@ -204,16 +226,65 @@ def render(ctx):
                 _facts["max_corr_value"] = float(_cm[_ij])
             except Exception:
                 pass
-        _insights = build_insights(_facts)
+        _insights = build_insights(_facts, limit=8)
     except Exception:
         _insights = []
     if _insights:
         st.markdown("### Portfolio Insights")
-        for _ins in _insights:
+        for _ins in _insights[:5]:
             _icon = {"notable": "🔶", "watch": "🔸"}.get(_ins.severity, "ℹ️")
             st.markdown(f"{_icon} {_ins.text}")
+        if len(_insights) > 5:
+            with st.expander("More diagnostics", expanded=False):
+                for _ins in _insights[5:]:
+                    _icon = {"notable": "🔶", "watch": "🔸"}.get(
+                        _ins.severity, "ℹ️")
+                    st.markdown(f"{_icon} {_ins.text}")
         st.caption("Deterministic observations from current analytics — "
                    "not investment advice.")
+
+    # ---- Ledger P&L accounting (Programme 43: separated components) ----
+    if ledger_state is not None:
+        from analytics.ledger import unrealised_by_ticker as _unr
+        _marks_native, _fx_now = {}, {}
+        try:
+            for _t in tickers:
+                _mm = (live_snapshot.get(_t, {}) or {}).get("mark")
+                _sc = float(ccy["instruments"][_t].quote_scale or 1.0)
+                if _mm is not None and np.isfinite(float(_mm)):
+                    _marks_native[_t] = float(_mm) * _sc
+            _fx_now = {k: float(v) for k, v in ccy.get("fx_now", {}).items()
+                       if v is not None and np.isfinite(float(v))
+                       and float(v) > 0}
+            _unr_map = _unr(ledger_state, _marks_native, _fx_now, base_ccy)
+            _unr_tot = sum(r["unrealised_base"] for r in _unr_map.values()
+                           if r["unrealised_base"] is not None)
+            _unr_known = all(r["unrealised_base"] is not None
+                             for r in _unr_map.values())
+        except (ValueError, KeyError, TypeError):
+            _unr_tot, _unr_known = None, False
+        _real_tot = sum(e.realised_pnl_base for e in ledger_state.realised
+                        if e.realised_pnl_base is not None)
+        _div_tot = (ledger_state.dividend_income_base or 0.0) + \
+            (ledger_state.interest_income_base or 0.0)
+        _fee_tot = ledger_state.fees_paid_base or 0.0
+        _total = ((_unr_tot or 0.0) + _real_tot + _div_tot - _fee_tot
+                  if _unr_tot is not None else None)
+        st.markdown("### Investment P&L (ledger basis, live marks)")
+        p1, p2, p3, p4, p5 = st.columns(5)
+        p1.metric("Unrealised", fmt_usd(_unr_tot) if _unr_known else "—")
+        p2.metric("Realised", fmt_usd(_real_tot))
+        p3.metric("Income", fmt_usd(_div_tot))
+        p4.metric("Fees", fmt_usd(-_fee_tot))
+        p5.metric("Total", fmt_usd(_total) if _total is not None else "—")
+        st.caption(
+            "Unrealised from open lots at live marks; realised from closed "
+            "FIFO lots; income = recorded dividends + interest; fees reduce "
+            "the total. Deposits/withdrawals are capital, never return.")
+    elif ledger_error:
+        st.warning(f"Ledger unavailable: {ledger_error}")
+    for _note in (ledger_notes or []):
+        st.caption(_note)
 
     st.markdown("---")
 
@@ -245,6 +316,10 @@ def render(ctx):
                  else float("nan"))
         _cost = (_v.base_cost_basis
                  if _v.base_cost_basis is not None else float("nan"))
+        _mk = (live_snapshot.get(_v.ticker, {}) or {})
+        _mark = _mk.get("mark")
+        _dayp = _mk.get("day_change_pct")
+        _feed = _mk.get("source") or _v.price_source
         rows.append({
             "Ticker": _v.ticker,
             "Shares": _v.shares,
@@ -252,6 +327,13 @@ def render(ctx):
             "Buy Px": _buy_px,
             "Now Px": format_money(_v.native_current_price,
                                    _v.native_currency),
+            "Mark": (format_money(_mark, _v.native_currency)
+                     if _mark is not None and np.isfinite(float(_mark))
+                     else "—"),
+            "Day %": (float(_dayp) if _dayp is not None
+                      and np.isfinite(float(_dayp)) else float("nan")),
+            "Feed": f"{_feed} ({_mk.get('status', '?')})"
+            if _mk else _v.price_source,
             "Source": _v.price_source,
             "Ccy": _v.native_currency,
             f"Cost ({base_ccy})": _cost,
@@ -268,6 +350,7 @@ def render(ctx):
             f"Value ({base_ccy})": _sym + "{:,.2f}",
             f"P&L ({base_ccy})": _sym + "{:+,.2f}",
             "P&L (%)": "{:+.2f}%",
+            "Day %": "{:+.2f}%",
             "Weight": "{:.1%}",
         }, na_rep="—")
         .map(lambda v: "color: #3fb950" if isinstance(v, (int, float)) and v > 0
@@ -343,6 +426,200 @@ def render(ctx):
                 s2.metric("Change", f"{_sr['pct_change']:+.2%}")
             except ValueError as e:
                 st.error(str(e))
+
+        if any(_shocks.values()):
+            try:
+                _sr = fx_shock_portfolio(
+                    {k: v for k, v in _expo.items()}, _shocks, base_ccy)
+                s1, s2 = st.columns(2)
+                s1.metric("Shocked Value", fmt_usd(_sr["shocked_total"]))
+                s2.metric("Change", f"{_sr['pct_change']:+.2%}")
+            except ValueError as e:
+                st.error(str(e))
+
+    # ---- Cash (ledger-derived, currency-keyed) ----
+    st.markdown("### Cash")
+    if ledger_cash:
+        _crow = []
+        for _ccy, _bal in sorted(ledger_cash.items()):
+            _r = (ccy.get("fx_now", {}) or {}).get(_ccy)
+            _beq = (float(_bal) * float(_r)
+                    if _r is not None and np.isfinite(float(_r))
+                    and float(_r) > 0 else None)
+            _crow.append({
+                "Currency": _ccy, "Balance": float(_bal),
+                f"Base ({base_ccy})": _beq,
+                "NAV Weight": (float(_beq) / float(portfolio_nav)
+                               if _beq is not None and portfolio_nav
+                               else float("nan")),
+            })
+        _cdf = pd.DataFrame(_crow)
+        st.dataframe(
+            _cdf.style.format({
+                "Balance": "{:,.2f}",
+                f"Base ({base_ccy})": _sym + "{:,.2f}",
+                "NAV Weight": "{:.1%}",
+            }, na_rep="—"),
+            width="stretch", hide_index=True)
+        st.caption("Cash moves only through ledger flows (deposits, sells, "
+                   "dividends, fees, withdrawals). Classic aggregate adds "
+                   "carry no cash movement.")
+    else:
+        st.caption("No cash tracked yet — record a Deposit in Transactions "
+                   "to start cash accounting.")
+
+    # ---- Time-weighted / money-weighted performance (ledger flows) ----
+    _user_flows = [t for t in (st.session_state.get("ledger_txns") or [])
+                   if isinstance(t, dict)
+                   and t.get("type") in ("DEPOSIT", "WITHDRAWAL")]
+    if _user_flows and ledger_state is not None:
+        st.markdown("### Performance From Cash Flows")
+        try:
+            from analytics.history import (
+                reconstruct_history as _recon,
+                twr_from_history as _twr_hist,
+                xirr_from_ledger as _xirr_led)
+            from analytics.persistence import transaction_from_dict as _tfd
+            _txo = [_tfd(d) for d in st.session_state.ledger_txns]
+            _hist = _recon(ccy["base_panel"], tickers, _txo,
+                           ccy.get("fx_hist"), base_ccy)
+            _twr = _twr_hist(_hist)
+            _nav_now = float(portfolio_nav) if portfolio_nav else 0.0
+            _xirr = None
+            try:
+                _xirr = _xirr_led(
+                    _txo, _nav_now, date.today(), ccy.get("fx_hist"),
+                    base_ccy) if _nav_now > 0 else None
+            except ValueError:
+                _xirr = None
+            t1, t2, t3 = st.columns(3)
+            t1.metric("TWR (since funding)",
+                      fmt_pct(_twr["twr"]),
+                      help="Time-weighted return: deposits/withdrawals never "
+                           "count as performance.")
+            t2.metric("XIRR (annualised)",
+                      fmt_pct(_xirr["xirr"]) if _xirr else "—",
+                      help="Money-weighted return over external flows plus "
+                           "current NAV as terminal value.")
+            _dep_tot = sum(float(d.get("quantity", 0.0))
+                           * float(d.get("price_native", 0.0))
+                           for d in _user_flows
+                           if d.get("type") == "DEPOSIT")
+            t3.metric("Net Contributions", fmt_usd(_dep_tot))
+            st.caption(
+                f"Window: {_hist.index[0].date()} to "
+                f"{_hist.index[-1].date()}. Investment performance vs "
+                "capital contributions, kept strictly separate.")
+        except (ValueError, KeyError, TypeError) as e:
+            st.info(f"Cash-flow performance unavailable: {e}")
+
+    # ---- Live risk snapshot (live exposure × historical estimates) ----
+    with st.expander("Live Risk Snapshot", expanded=False):
+        st.caption(
+            "Current live weights/NAV combined with historical risk "
+            "estimates — no covariance is refit on live ticks.")
+        try:
+            _live_vals = np.array([
+                (live_holdings.get(t, {}) or {}).get("base_value") or 0.0
+                for t in tickers], dtype=float)
+            _live_tot = float(_live_vals.sum())
+            if _live_tot > 0:
+                _lw = _live_vals / _live_tot
+                _top = tickers[int(np.argmax(_lw))]
+                from analytics.allocation import (
+                    risk_contributions_simple as _rcs)
+                from analytics.var import to_daily as _to_d
+                from analytics.var import parametric_var as _pvar
+                _lrc = _rcs(_lw, cov, tickers)
+                _lrc_top = str(_lrc.idxmax())
+                _var_pct = 1.645 * float(_to_d(port_vol))
+                r1, r2, r3 = st.columns(3)
+                r1.metric("NAV", fmt_usd(portfolio_nav))
+                r2.metric("Largest Weight",
+                          f"{_top} {float(_lw.max()):.1%}")
+                r3.metric("Largest Risk Contributor",
+                          f"{_lrc_top} {float(_lrc.max()):.1%}")
+                r4, r5 = st.columns(2)
+                r4.metric("Monetary VaR (95%, 1d, parametric)",
+                          fmt_usd(_var_pct * float(portfolio_nav or 0.0)),
+                          help="Fixed historical VaR % × live NAV; the "
+                               "distribution is not recomputed per tick.")
+                r5.metric("Volatility (hist. ann.)", fmt_pct(port_vol))
+            else:
+                st.info("No live values to snapshot.")
+        except (ValueError, KeyError, TypeError) as e:
+            st.info(f"Live risk snapshot unavailable: {e}")
+
+    # ---- Transactions & open lots ----
+    with st.expander("Transactions & Open Lots", expanded=False):
+        _tx_all = [t for t in (st.session_state.get("ledger_txns") or [])
+                   if isinstance(t, dict)]
+        if not _tx_all:
+            st.caption("No ledger transactions yet — record one in the "
+                       "sidebar, or add a holding (auto-migrated).")
+        else:
+            _f1, _f2 = st.columns(2)
+            with _f1:
+                _ft = st.selectbox(
+                    "Ticker filter", ["All"] + sorted(
+                        {str(t.get("ticker") or "") for t in _tx_all
+                         if t.get("ticker")}),
+                    key="ov_tx_ticker")
+            with _f2:
+                _fy = st.selectbox(
+                    "Type filter",
+                    ["All", "BUY", "SELL", "DIVIDEND", "FEE", "DEPOSIT",
+                     "WITHDRAWAL", "INTEREST"],
+                    key="ov_tx_type")
+            _rows = []
+            for _d in sorted(_tx_all,
+                             key=lambda d: (str(d.get("date", "")),
+                                            str(d.get("transaction_id", "")))):
+                if _ft != "All" and _d.get("ticker") != _ft:
+                    continue
+                if _fy != "All" and _d.get("type") != _fy:
+                    continue
+                _rows.append({
+                    "Date": str(_d.get("date", ""))[:10],
+                    "Type": _d.get("type"), "Ticker": _d.get("ticker") or "—",
+                    "Qty": _d.get("quantity"), "Price": _d.get("price_native"),
+                    "Ccy": _d.get("currency"), "Fee": _d.get("fee"),
+                    "Src": _d.get("source"),
+                })
+            st.dataframe(pd.DataFrame(_rows), width="stretch",
+                         hide_index=True)
+            st.caption("Delete corrects the ledger (derived lots/P&L/cash "
+                       "rebuild deterministically; never hand-edited).")
+            for _d in _tx_all:
+                _tid = str(_d.get("transaction_id", ""))
+                if st.button(f"Delete {_d.get('date','')} "
+                             f"{_d.get('type','')} {_tid[:6]}…",
+                             key=f"tx_del_{_tid}"):
+                    st.session_state.ledger_txns = [
+                        x for x in st.session_state.ledger_txns
+                        if not (isinstance(x, dict)
+                                and x.get("transaction_id") == _tid)]
+                    flash("Transaction deleted — ledger rebuilt.", "info")
+                    st.rerun()
+        if ledger_state is not None and ledger_state.open_lots:
+            st.markdown("#### Open Lots")
+            for _t in tickers:
+                _lots = [l for l in ledger_state.open_lots
+                         if l.ticker == _t]
+                if not _lots:
+                    continue
+                with st.expander(f"{_t} — {len(_lots)} lot(s)",
+                                 expanded=False):
+                    _lrows = [{
+                        "Bought": l.purchase_date.isoformat()
+                        if hasattr(l.purchase_date, "isoformat") else "—",
+                        "Shares": round(l.shares_remaining, 6),
+                        f"Cost ({l.native_currency})":
+                            round(l.cost_basis_native, 2),
+                        "Source": l.source,
+                    } for l in _lots]
+                    st.dataframe(pd.DataFrame(_lrows), width="stretch",
+                                 hide_index=True)
 
     # ---- Data quality, freshness, methodology ----
     with st.expander("Data Quality & Freshness"):

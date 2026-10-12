@@ -88,6 +88,27 @@ def test_insights_capped_ordered_and_advice_free():
     assert build_insights(None) == []
 
 
+def test_insights_cash_day_attribution_drag():
+    out = build_insights({"cash_weight": 0.18, "day_pnl": 120.0,
+                          "nav": 10000.0, "top_contributor": "NVDA",
+                          "top_contributor_share": 0.031,
+                          "top_detractor": "INTC",
+                          "top_detractor_share": -0.012,
+                          "cost_drag": 47.18,
+                          "cost_drag_method": "ERC"}, limit=8)
+    texts = " | ".join(i.text for i in out)
+    assert "Cash represents 18.0%" in texts
+    assert "Day P&L is +1.20%" in texts
+    assert "NVDA added +3.10%" in texts
+    assert "INTC detracted 1.20%" in texts
+    assert "47.18" in texts and "ERC" in texts
+    for word in ("buy", "sell", "should", "recommendation"):
+        assert word not in texts.lower()
+    capped = build_insights({"cash_weight": 0.5, "day_pnl": 999.0,
+                             "nav": 1000.0}, limit=1)
+    assert len(capped) == 1
+
+
 def test_charts_return_figures():
     df = pd.DataFrame({"A": [1.0, 2.0, 3.0], "B": [2.0, 1.0, 2.5]},
                       index=pd.bdate_range("2024-01-01", periods=3))
