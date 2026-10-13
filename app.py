@@ -1446,7 +1446,16 @@ def _live_status_strip():
 _live_status_strip()
 
 # ---------------------------------------------------------------------------
-# Main tabs
+# Main tabs — M9 navigation audit decision: keep the familiar 9-tab
+# workstation (Overview / Risk / Optimise / Scenario / Performance /
+# Security / Backtest / Factors / Research). A grouped OVERVIEW-PORTFOLIO-
+# RISK-STRATEGY-RESEARCH hierarchy was considered, but the flat tab strip
+# preserves muscle memory, keeps deep links stable, and each tab already
+# groups its own modes internally (Optimise: Classical/Risk-Based/BL/
+# Compare/Plan; Backtest: Historical/OOS/Walk-Forward + Robustness Lab;
+# Scenario: Monte Carlo/Historical stress). Portfolio accounting lives in
+# Overview (Holdings/Transactions/Lots/Cash/Watchlist); saved analyses live
+# in Research with per-view "Save to Research" entry points.
 # ---------------------------------------------------------------------------
 
 tab_overview, tab_risk, tab_optimise, tab_scenario, tab_perf, tab_security, tab_backtest, tab_factors, tab_research = st.tabs([
