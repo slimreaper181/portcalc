@@ -841,7 +841,6 @@ def render(ctx):
                     except ValueError:
                         _ref_win = None
                     if _ref_win is not None:
-                        from analytics.backtest import backtest_rebalanced
                         _ref = backtest_rebalanced(
                             _ref_win, np.ones(len(tickers)) / len(tickers),
                             float(bt_capital), "quarterly", 10.0,

@@ -177,10 +177,9 @@ def render(ctx):
                 conn2, _ = _db()
                 try:
                     ws_repo.set_analysis_notes(conn2, row.analysis_id, notes)
-                    conn2.execute(
-                        "UPDATE saved_analyses SET tags = ? WHERE "
-                        "analysis_id = ?",
-                        (",".join(parse_tags(tags)), row.analysis_id))
+                    ws_repo.set_analysis_tags(
+                        conn2, row.analysis_id,
+                        ",".join(parse_tags(tags)))
                 finally:
                     conn2.close()
             except ValueError as e:

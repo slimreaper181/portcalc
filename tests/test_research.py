@@ -191,6 +191,25 @@ def test_rerun_backtest_stress_robustness_types():
     assert rout["metrics"]["n_cells"] == 1
 
 
+def test_analysis_tags_use_repository_path():
+    # Audit regression: tag updates must go through storage.repositories
+    # (no direct SQL from views).
+    import inspect
+    import ui.views.research as _rv
+    src = inspect.getsource(_rv)
+    assert "conn2.execute" not in src and "conn.execute" not in src
+    assert "set_analysis_tags" in src
+    conn = _mem()
+    p = repo.create_portfolio(conn, "Main")
+    a = repo.save_analysis(conn, p.portfolio_id, "Q1", "oos", {}, {},
+                           tags="Risk")
+    assert repo.get_analysis(conn, a.analysis_id).tags == "Risk"
+    repo.set_analysis_tags(conn, a.analysis_id, "Risk,Quarterly")
+    assert repo.get_analysis(conn, a.analysis_id).tags == "Risk,Quarterly"
+    with pytest.raises(ValueError):
+        repo.set_analysis_tags(conn, "missing-id", "x")
+
+
 def test_app_wires_research_tab_and_clone_opt_in():
     import pathlib
     app_src = pathlib.Path(__file__).resolve().parent.parent.joinpath(

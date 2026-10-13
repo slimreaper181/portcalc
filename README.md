@@ -33,7 +33,9 @@ multi-currency support.
 - **Live market data** — quote model (bid/ask/last/previous close), explicit
   mark policy (mid → last → fallback, never invented), freshness
   (LIVE/DELAYED/STALE/CLOSED/FALLBACK), US session detection, feed fallback
-  (SIP→IEX), Yahoo fallback; no background threads, no auto-rerun loops
+  (SIP→IEX), Yahoo fallback; the poll path uses no background threads and
+  no auto-rerun loops (streaming uses one daemon worker thread plus a 30s
+  status-only fragment that never recomputes historical analytics)
 - **Live portfolio** — NAV, Day P&L vs previous close, live weights, live
   risk snapshot (historical estimates labelled as such)
 - **Transaction ledger** — BUY/SELL/DIVIDEND/FEE/DEPOSIT/WITHDRAWAL/INTEREST
@@ -340,7 +342,8 @@ into backtest wealth paths (which use adjusted prices).
   (10s cache) where configured.
 - Estimated purchase close: raw close on the selected trading date,
   split-adjusted to current shares; execution-time/fills excluded.
-- Single acquisition date per position; FIFO/LIFO not modelled.
+  Classic sidebar adds remain single-aggregate shortcuts; full-form ledger
+  transactions support multiple lots with FIFO accounting.
 - Dividend estimates: cash amounts × shares × payment-date FX, only for
   payments after purchase; broker-exact entitlement not claimed.
 - Currency conversion via Yahoo FX (`GBPUSD=X`, `EURUSD=X`), USD-routed;
@@ -351,8 +354,8 @@ into backtest wealth paths (which use adjusted prices).
   bias); rebalances execute at the next eligible close (approximation);
   static out-of-sample weights are never re-estimated in-test.
 - TradingView charts show native market quotation, display only.
-- Data model notes for future work: positions are single-lot aggregates
+- Data model notes: classic sidebar positions are single-lot aggregates
   (`purchase_date` may be null, prices are per current split-adjusted
-  share); cash balances, multi-lot tax lots and realised-P&L ledgers are
-  not modelled yet, so those extensions need no redesign of the analytics
-  layer, only new position kinds and ledger views.
+  share); the transaction ledger additionally models currency-keyed cash
+  balances, multi-lot FIFO lots and realised-P&L lots ledgers with an
+  immutable revision audit trail.

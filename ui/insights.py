@@ -32,7 +32,10 @@ _ADVICE_RE = re.compile(
 
 
 def _assert_no_advice(text: str) -> None:
-    assert not _ADVICE_RE.search(text.lower()), text
+    # ValueError (not assert): this is a production invariant that must hold
+    # under `python -O` as well, where assert statements are stripped.
+    if _ADVICE_RE.search(text.lower()):
+        raise ValueError(f"Insight text failed advice screening: {text!r}")
 
 
 @dataclass

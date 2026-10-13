@@ -352,7 +352,14 @@ def _workspace_switch_to(portfolio_id: str) -> None:
     st.session_state["_ws_pid"] = portfolio_id
     for _k in ("portfolio", "ledger_txns", "watchlist", "base_currency",
                "bt_benchmark", "ws_switcher", "_ws_hash", "pending_buy",
-               "confirm_reset"):
+               "confirm_reset", "wf_results", "robust_res", "robust_cache",
+               "sim_sandbox"):
+        st.session_state.pop(_k, None)
+    # Per-analysis recomputation state is keyed dynamically (rs_fresh_<id>):
+    # drop every such key so the newly active portfolio never shows the
+    # previous portfolio's Saved-vs-Recomputed artefacts.
+    for _k in [k for k in list(st.session_state.keys())
+               if isinstance(k, str) and k.startswith("rs_fresh_")]:
         st.session_state.pop(_k, None)
     st.session_state.data_loaded = False
 

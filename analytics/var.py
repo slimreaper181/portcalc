@@ -12,7 +12,7 @@ Return-type conventions (read carefully)
   is interpreted as P&L it is converted to a simple return with
   ``simple = exp(log) - 1``.
 * All ``*_var`` functions return a **positive currency amount**
-  (potential loss in USD).
+  (potential loss in the portfolio Base Currency of ``portfolio_value``).
 """
 
 import numpy as np

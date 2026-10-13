@@ -472,6 +472,21 @@ def set_analysis_notes(conn: sqlite3.Connection, analysis_id: str,
     return get_analysis(conn, analysis_id)
 
 
+def set_analysis_tags(conn: sqlite3.Connection, analysis_id: str,
+                      tags: str) -> SavedAnalysis:
+    """Replace the comma-separated tag string (stored as plain text).
+
+    Callers normalise (split/strip/de-dupe) before storing; the repository
+    keeps the single authorised UPDATE path for this column so views never
+    issue direct SQL against ``saved_analyses``.
+    """
+    get_analysis(conn, analysis_id)
+    conn.execute("UPDATE saved_analyses SET tags = ?, updated_at = ? "
+                 "WHERE analysis_id = ?", (str(tags or ""), _now(),
+                                           analysis_id))
+    return get_analysis(conn, analysis_id)
+
+
 def delete_analysis(conn: sqlite3.Connection, analysis_id: str) -> None:
     """Delete one saved analysis (missing ids raise)."""
     get_analysis(conn, analysis_id)
