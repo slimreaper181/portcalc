@@ -20,6 +20,11 @@ from analytics.allocation import (
     estimation_window,
     maximum_diversification,
     simple_returns_from_prices,
+    validate_covariance,
+)
+from analytics.estimation import (
+    estimate_covariance,
+    estimate_mean_returns,
 )
 from analytics.backtest import (
     backtest_benchmark,
@@ -37,6 +42,18 @@ from analytics.performance import (
     rolling_annualised_return,
     rolling_sharpe,
     rolling_volatility,
+)
+from analytics.robustness import (
+    RobustnessCell,
+    RobustnessConfig,
+    RobustnessResult,
+    breakeven_cost,
+    cost_sensitivity_frame,
+    grid_size,
+    grid_to_csv,
+    robustness_scorecard,
+    run_robustness_grid,
+    sharpe_heatmap_frame,
 )
 from analytics.validation import validate_ticker_symbol
 from analytics.walkforward import (
@@ -252,6 +269,22 @@ def render(ctx):
                 "Max weight per asset", 0.5, 1.0, 1.0, 0.05, format="%.2f",
                 key="wf_maxw")
 
+        we1, we2 = st.columns(2)
+        with we1:
+            wf_estimator = st.selectbox(
+                "Risk model",
+                ["sample", "ewma", "ledoit_wolf"], index=0, key="wf_risk",
+                format_func=lambda m: {"sample": "Sample",
+                                       "ewma": "EWMA",
+                                       "ledoit_wolf": "Ledoit-Wolf"}[m],
+                help="Covariance estimator inside every training window. "
+                     "Sample preserves historical results.")
+        with we2:
+            wf_ewma = st.slider(
+                "EWMA decay λ", 0.80, 0.99, 0.94, 0.01, key="wf_ewma",
+                disabled=(wf_estimator != "ewma"),
+                help="Applies to EWMA only (selector left).")
+
         wm1, wm2, wm3 = st.columns(3)
         with wm1:
             wf_m_mv = st.checkbox("Minimum Variance", value=True, key="wf_m_mv")
@@ -318,7 +351,8 @@ def render(ctx):
                    float(wf_minw), float(wf_maxw), tuple(_wf_methods),
                    str(wf_static_method), str(wf_drag_method),
                    repr(wf_bl_cfg), bool(wf_delta_bench), str(base_ccy),
-                   float(bt_capital), float(rf_rate), str(bench_sym_bt))
+                   float(bt_capital), float(rf_rate), str(bench_sym_bt),
+                   str(wf_estimator), float(wf_ewma))
         _wf_freq = {"Monthly": "monthly", "Quarterly": "quarterly",
                     "Semi-annual": "semi-annual",
                     "Annual": "annual"}[wf_freq_label]
@@ -374,7 +408,9 @@ def render(ctx):
                     rebalance_frequency=_wf_freq,
                     transaction_cost_bps=float(wf_costs),
                     base_currency=base_ccy, min_weight=float(wf_minw),
-                    max_weight=float(wf_maxw), risk_free_annual=float(rf_rate))
+                    max_weight=float(wf_maxw), risk_free_annual=float(rf_rate),
+                    estimator=str(wf_estimator),
+                    ewma_lambda=float(wf_ewma))
                 if _m == "black_litterman":
                     _bcfg.bl_views = list(wf_bl_cfg["views"])
                     _bcfg.bl_delta = float(wf_bl_cfg["delta"])
@@ -444,7 +480,9 @@ def render(ctx):
                         rebalance_frequency=_wf_freq, transaction_cost_bps=0.0,
                         base_currency=base_ccy, min_weight=float(wf_minw),
                         max_weight=float(wf_maxw),
-                        risk_free_annual=float(rf_rate))
+                        risk_free_annual=float(rf_rate),
+                        estimator=str(wf_estimator),
+                        ewma_lambda=float(wf_ewma))
                     if _dm[0] == "black_litterman":
                         _dcfg.bl_views = list(wf_bl_cfg["views"])
                         _dcfg.bl_delta = float(wf_bl_cfg["delta"])
@@ -636,6 +674,224 @@ def render(ctx):
                     f"{fmt_usd(_wf_all[_wf_static_name].metrics['final_value'])} "
                     f"vs walk-forward {fmt_usd(_wfd['final_value'])} — the gap "
                     f"answers whether re-estimating helped.")
+            # ---- Save to Research (Milestone 8: walk-forward) ----
+            try:
+                from ui.views.research import save_analysis_button as _save_wf
+                _wf_cfg = {
+                    "tickers": list(tickers),
+                    "methods": list(_wf_methods),
+                    "test_start": str(pd.Timestamp(wf_start).date()),
+                    "test_end": str(pd.Timestamp(wf_end).date()),
+                    "lookback_years": float(wf_lookback),
+                    "window_type": str(wf_window).lower(),
+                    "frequency": str(_wf_freq),
+                    "costs_bps": float(wf_costs),
+                    "capital": float(bt_capital),
+                    "min_w": float(wf_minw),
+                    "max_w": float(wf_maxw),
+                    "estimator": str(wf_estimator),
+                    "ewma_lambda": float(wf_ewma),
+                    "rf": float(rf_rate),
+                    "base_ccy": str(base_ccy),
+                }
+                _wf_res: dict = {"methods": {}}
+                for _nm, _r in _wf_dyn.items():
+                    try:
+                        _wf_res["methods"][_nm] = {"metrics": {
+                            k: float(_r.metrics[k]) for k in
+                            ("final_value", "cagr", "sharpe",
+                             "annualised_volatility", "max_drawdown",
+                             "total_costs")
+                            if k in _r.metrics}}
+                    except (ValueError, TypeError, KeyError, AttributeError):
+                        continue
+                _save_wf("walkforward", _wf_cfg, _wf_res, key="wf_save",
+                         label="Save to Research")
+            except Exception:
+                pass
+
+        # ---- Walk-Forward Robustness Lab (Milestone 6) ----
+        st.markdown("---")
+        st.markdown("### Walk-Forward Robustness Lab")
+        st.caption(
+            "Systematic grid over lookbacks × frequencies × risk models × "
+            "costs around the engine above (which is reused unchanged — "
+            "strict date < execution in every cell). Descriptive robustness "
+            "statistics only: no composite scores, no recommendations.")
+        _rl_methods = st.multiselect(
+            "Methods", ["min_variance", "max_sharpe", "erc",
+                        "max_diversification"],
+            default=["min_variance", "erc"], key="rl_methods",
+            format_func=lambda m: WALK_FORWARD_LABELS.get(m, m),
+            help="BL excluded here (view complexity) — run it above.")
+        _rl1, _rl2, _rl3, _rl4 = st.columns(4)
+        with _rl1:
+            _rl_look = st.multiselect(
+                "Lookbacks (y)", [1, 2, 3, 5], default=[1, 3], key="rl_look")
+        with _rl2:
+            _rl_freq = st.multiselect(
+                "Frequencies", ["Monthly", "Quarterly", "Annual"],
+                default=["Quarterly", "Annual"], key="rl_freq")
+        with _rl3:
+            _rl_est = st.multiselect(
+                "Risk models", ["sample", "ewma", "ledoit_wolf"],
+                default=["sample"], key="rl_est",
+                format_func=lambda m: {"sample": "Sample", "ewma": "EWMA",
+                                       "ledoit_wolf": "Ledoit-Wolf"}[m])
+        with _rl4:
+            _rl_costs = st.multiselect(
+                "Costs (bps)", [0, 5, 10, 25, 50], default=[0, 10, 50],
+                key="rl_costs")
+        try:
+            _rl_cfg = RobustnessConfig(
+                methods=tuple(_rl_methods),
+                lookbacks=tuple(float(x) for x in _rl_look),
+                frequencies=tuple(str(f).lower() for f in _rl_freq),
+                estimators=tuple(_rl_est), costs_bps=tuple(float(c) for c in
+                                                           _rl_costs),
+                window_type=str(wf_window).lower(),
+                test_start=wf_start, test_end=wf_end,
+                base_currency=base_ccy, min_weight=float(wf_minw),
+                max_weight=float(wf_maxw),
+                risk_free_annual=float(rf_rate))
+            _rl_n = grid_size(_rl_cfg, tickers)
+            st.caption(f"Grid size: **{_rl_n}** configurations "
+                       f"({len(_rl_methods)} methods × {len(_rl_look)} "
+                       f"lookbacks × {len(_rl_freq)} frequencies × "
+                       f"{len(_rl_est)} risk models × {len(_rl_costs)} costs).")
+            _rl_go = st.button("Run Robustness Grid", key="rl_run")
+        except ValueError as e:
+            st.error(f"Robustness grid: {e}")
+            _rl_go = False
+        if _rl_go:
+            try:
+                _rl_need = (pd.Timestamp(wf_start) - pd.DateOffset(
+                    years=int(max(float(x) for x in _rl_look)) + 1)).date()
+                _rl_base = base_price_panel(
+                    bt_full.loc[pd.Timestamp(_rl_need):pd.Timestamp(wf_end)],
+                    tickers, instruments, ccy.get("fx_hist"), base_ccy)
+            except ValueError as e:
+                st.error(f"Base-currency panel: {e}")
+                _rl_base = None
+            if _rl_base is not None:
+                if "robust_cache" not in st.session_state:
+                    st.session_state["robust_cache"] = {}
+                _prog = st.progress(0, text="Starting grid…")
+                def _cb(i, n):
+                    _prog.progress(i / n, text=f"{i} / {n} configurations")
+                _rl_res = run_robustness_grid(
+                    _rl_base, tickers, _rl_cfg, float(bt_capital),
+                    cache=st.session_state["robust_cache"], progress_cb=_cb)
+                _prog.empty()
+                st.session_state["robust_res"] = {
+                    "cells": [c.__dict__ for c in _rl_res.cells],
+                    "key": _rl_n}
+                if _rl_res.n_cached:
+                    st.caption(f"Cache: {_rl_res.n_cached} identical "
+                               "configuration(s) reused, not recomputed.")
+        _rl_cached = st.session_state.get("robust_res")
+        if _rl_cached:
+            _cells = [RobustnessCell(**d) for d in _rl_cached["cells"]]
+            _ok = [c for c in _cells if c.success]
+            if not _ok:
+                st.error("No grid configuration completed — see Status "
+                         "column for reasons; nothing was invented.")
+            else:
+                _rl_result = RobustnessResult(
+                    cells=_cells,
+                    scorecard=robustness_scorecard(_cells))
+                st.markdown("#### Result Matrix")
+                st.dataframe(_rl_result.frame(), width="stretch",
+                             hide_index=True)
+                st.markdown("#### Robustness Scorecard")
+                st.dataframe(_rl_result.scorecard, width="stretch",
+                             hide_index=True)
+                st.caption("Medians, worst/best Sharpe, dispersion, median "
+                           "turnover, worst drawdown — descriptive only.")
+                _hm_method = st.selectbox(
+                    "Heatmap method",
+                    sorted({c.method for c in _ok}), key="rl_hm",
+                    format_func=lambda m: WALK_FORWARD_LABELS.get(m, m))
+                _hm = sharpe_heatmap_frame(_cells, _hm_method)
+                if not _hm.empty:
+                    st.markdown("#### Sharpe by Lookback × Frequency")
+                    _fig = go.Figure(data=go.Heatmap(
+                        z=_hm.values, x=[str(c) for c in _hm.columns],
+                        y=[str(i) for i in _hm.index],
+                        colorscale="RdYlGn", zmid=0,
+                        hovertemplate="Lookback %{y}y · %{x}<br>"
+                                      "Sharpe %{z:.2f}<extra></extra>"))
+                    _fig.update_layout(title="Mean Sharpe",
+                                       xaxis_title="Frequency",
+                                       yaxis_title="Lookback (y)")
+                    st.plotly_chart(_fig, width="stretch")
+                _cs = cost_sensitivity_frame(_cells, _hm_method)
+                if not _cs.empty:
+                    st.markdown("#### Cost Sensitivity")
+                    st.dataframe(_cs, width="stretch", hide_index=True)
+                    _ref_win = None
+                    try:
+                        _ref_base = base_price_panel(
+                            bt_full.loc[pd.Timestamp(wf_start):
+                                        pd.Timestamp(wf_end)],
+                            tickers, instruments, ccy.get("fx_hist"), base_ccy)
+                        _ref_win, _ = prepare_backtest_data(
+                            _ref_base, tickers, pd.Timestamp(wf_start),
+                            pd.Timestamp(wf_end))
+                    except ValueError:
+                        _ref_win = None
+                    if _ref_win is not None:
+                        _ref = backtest_rebalanced(
+                            _ref_win, np.ones(len(tickers)) / len(tickers),
+                            float(bt_capital), "quarterly", 10.0,
+                            float(rf_rate), name="static-ref")
+                        _be = breakeven_cost(
+                            list(zip(_cs["Cost (bps)"],
+                                     _cs["Mean Sharpe"])),
+                            float(_ref.metrics["sharpe"]))
+                        if _be["breakeven_bps"] is None:
+                            st.caption(f"Cost break-even vs static equal-weight "
+                                       f"(Sharpe {_ref.metrics['sharpe']:.2f}): "
+                                       f"{_be['note']}.")
+                        else:
+                            st.caption(f"Cost break-even vs static equal-weight "
+                                       f"(Sharpe {_ref.metrics['sharpe']:.2f}): "
+                                       f"≈ {_be['breakeven_bps']:.1f} bps "
+                                       f"(bracket {_be['bracket'][0]:g}–"
+                                       f"{_be['bracket'][1]:g} bps, "
+                                       f"{_be['note']}).")
+                st.download_button(
+                    "Download robustness matrix (CSV)",
+                    data=grid_to_csv(_rl_result).encode("utf-8"),
+                    file_name="robustness-grid.csv",
+                    mime="text/csv", key="rl_dl")
+                # ---- Save to Research (Milestone 8: robustness) ----
+                try:
+                    from ui.views.research import (
+                        save_analysis_button as _save_rl)
+                    _rl_save_cfg = {
+                        "tickers": list(tickers),
+                        "methods": list(_rl_cfg.methods),
+                        "lookbacks": [float(x) for x in _rl_cfg.lookbacks],
+                        "frequencies": list(_rl_cfg.frequencies),
+                        "estimators": list(_rl_cfg.estimators),
+                        "costs_bps": [float(c) for c in _rl_cfg.costs_bps],
+                        "window_type": str(_rl_cfg.window_type),
+                        "test_start": str(pd.Timestamp(wf_start).date()),
+                        "test_end": str(pd.Timestamp(wf_end).date()),
+                        "capital": float(bt_capital),
+                        "rf": float(rf_rate),
+                        "base_ccy": str(base_ccy),
+                    }
+                    _rl_save_res = {"metrics": {
+                        "n_cells": len(_cells),
+                        "n_ok": len(_ok)},
+                        "scorecard": _rl_result.scorecard.to_dict(
+                            orient="records")[:50]}
+                    _save_rl("robustness", _rl_save_cfg, _rl_save_res,
+                             key="rl_save", label="Save to Research")
+                except Exception:
+                    pass
 
     if bt_mode == "Historical":
         # ---- Prepare the common-date window (real data only) ----
@@ -757,6 +1013,37 @@ def render(ctx):
             "cost-modelled). CAGR uses actual calendar elapsed time; "
             "Annualised Return is the log-space mean and is kept separate."
         )
+        # ---- Save to Research (Milestone 8: static backtest) ----
+        try:
+            from ui.views.research import save_analysis_button as _save_bt
+            _bt_cfg = {
+                "tickers": list(tickers),
+                "weights": [float(x) for x in
+                            np.asarray(weights, dtype=float)],
+                "start": str(pd.Timestamp(bt_start).date()),
+                "end": str(pd.Timestamp(bt_end).date()),
+                "capital": float(bt_capital),
+                "costs_bps": float(bt_costs),
+                "frequency": str(_freq),
+                "benchmark": str(bench_sym_bt or ""),
+                "rf": float(rf_rate),
+                "base_ccy": str(base_ccy),
+            }
+            _bt_res: dict = {"methods": {}}
+            for _nm, _r in _results.items():
+                try:
+                    _bt_res["methods"][_nm] = {"metrics": {
+                        k: float(_r.metrics[k]) for k in
+                        ("final_value", "cagr", "sharpe",
+                         "annualised_volatility", "max_drawdown",
+                         "total_costs")
+                        if k in _r.metrics}}
+                except (ValueError, TypeError, KeyError):
+                    continue
+            _save_bt("backtest", _bt_cfg, _bt_res, key="bt_save",
+                     label="Save to Research")
+        except Exception:
+            pass
 
         # ---- Drawdown (selected strategy vs benchmark) ----
         st.markdown("---")
@@ -933,6 +1220,22 @@ def render(ctx):
                 "Test Costs (bps)", min_value=0.0, max_value=1000.0,
                 value=10.0, step=1.0, key="oos_costs")
 
+        oe1, oe2 = st.columns(2)
+        with oe1:
+            oos_estimator = st.selectbox(
+                "Risk model",
+                ["sample", "ewma", "ledoit_wolf"], index=0, key="oos_risk",
+                format_func=lambda m: {"sample": "Sample",
+                                       "ewma": "EWMA",
+                                       "ledoit_wolf": "Ledoit-Wolf"}[m],
+                help="Covariance estimator on the strict pre-test window. "
+                     "Sample preserves historical results.")
+        with oe2:
+            oos_ewma = st.slider(
+                "EWMA decay λ", 0.80, 0.99, 0.94, 0.01, key="oos_ewma",
+                disabled=(oos_estimator != "ewma"),
+                help="Applies to EWMA only (selector left).")
+
         os1, os2, os3 = st.columns(3)
         with os1:
             oos_eq = st.checkbox("Equal Weight", value=True, key="oos_eq")
@@ -1018,11 +1321,16 @@ def render(ctx):
 
         try:
             oos_rets = simple_returns_from_prices(oos_est, tickers)
-            oos_mu = annualised_mean_returns_simple(oos_rets)
-            oos_cov = annualised_covariance_simple(oos_rets)
+            oos_mu = estimate_mean_returns(oos_rets)
+            oos_cov = estimate_covariance(
+                oos_rets, method=oos_estimator,
+                ewma_lambda=float(oos_ewma))
+            oos_cov, _ = validate_covariance(oos_cov, tickers)
         except ValueError as e:
             st.error(f"Estimation statistics: {e}")
             return  # section-local return (was st.stop()): sibling tabs keep rendering
+        st.caption(f"Risk model: {oos_estimator} "
+                   f"(strict pre-test window, {len(oos_rets)} obs).")
 
         _oos_freq = {"Monthly": "monthly", "Quarterly": "quarterly",
                      "Semi-annual": "semi-annual", "Annual": "annual"}[oos_freq_label]
@@ -1144,6 +1452,42 @@ def render(ctx):
             "cost-modelled). Frozen estimation weights were never re-estimated "
             "during the test."
         )
+        # ---- Save to Research (Milestone 8: OOS) ----
+        try:
+            from ui.views.research import save_analysis_button as _save_oos
+            _oos_methods = [m for m, on in (
+                ("equal_weight", oos_eq), ("min_variance", oos_mv),
+                ("max_sharpe", oos_ms), ("erc", oos_erc),
+                ("max_diversification", oos_md),
+                ("black_litterman", oos_bl)) if on]
+            _oos_cfg = {
+                "tickers": list(tickers),
+                "methods": _oos_methods,
+                "test_start": str(pd.Timestamp(oos_start).date()),
+                "test_end": str(pd.Timestamp(bt_end).date()),
+                "lookback_years": float(oos_lookback),
+                "frequency": str(_oos_freq),
+                "costs_bps": float(oos_costs),
+                "capital": float(_oos_cap),
+                "estimator": str(oos_estimator),
+                "ewma_lambda": float(oos_ewma),
+                "rf": float(rf_rate),
+                "base_ccy": str(base_ccy),
+            }
+            _oos_res: dict = {"methods": {}}
+            for _nm, _r in oos_results.items():
+                try:
+                    _oos_res["methods"][_nm] = {"metrics": {
+                        k: float(_r.metrics[k]) for k in
+                        ("final_value", "cagr", "sharpe",
+                         "annualised_volatility", "max_drawdown")
+                        if k in _r.metrics}}
+                except (ValueError, TypeError, KeyError):
+                    continue
+            _save_oos("oos", _oos_cfg, _oos_res, key="oos_save",
+                      label="Save to Research")
+        except Exception:
+            pass
 
 
     # ============================================================

@@ -409,7 +409,11 @@ class StreamIngestor:
                ) -> bool:
         """Apply one quote message; out-of-order messages never regress state.
 
-        Returns True when the store now holds this message's observation.
+        Legs merge newest-wins: a trade-only message keeps the stored
+        bid/ask book (and vice versa), so a random trade print can never
+        wipe fresher bid/ask legs — the mark policy keeps seeing the
+        best available observation per leg. A message with nothing newer
+        in any leg is dropped (False) without touching the store.
         Unknown/malformed symbols are ignored (False), never raised.
         """
         if not isinstance(message, dict):
@@ -434,6 +438,13 @@ class StreamIngestor:
             feed=message.get("feed"),
             received_at=now if now.tzinfo else now.replace(tzinfo=timezone.utc),
         )
+        held = self.store.get(sym)
+        if held is not None:
+            quote = self._merge_legs(held, quote)
+            if quote is None:
+                self.stats.messages += 1
+                self.stats.dropped_stale += 1
+                return False
         self.stats.messages += 1
         stored = self.store.update(quote)
         if stored:
@@ -441,6 +452,53 @@ class StreamIngestor:
         else:
             self.stats.dropped_stale += 1
         return stored
+
+    @staticmethod
+    def _leg_newer(old_ts, new_ts) -> bool:
+        """Per-leg timestamp precedence (unknown timing → latest wins)."""
+        def _aware(ts):
+            if ts is None:
+                return None
+            return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+        old, new = _aware(old_ts), _aware(new_ts)
+        if new is None and old is None:
+            return True
+        if new is None:
+            return False
+        if old is None:
+            return True
+        return new >= old
+
+    @classmethod
+    def _merge_legs(cls, held: Quote, new: Quote) -> Quote | None:
+        """Newest-wins leg merge → merged Quote, or None when fully stale."""
+        book_new = cls._leg_newer(held.quote_timestamp,
+                                  new.quote_timestamp)
+        last_new = cls._leg_newer(held.last_trade_timestamp,
+                                  new.last_trade_timestamp)
+        use_book = (new.bid is not None and new.ask is not None
+                    and book_new)
+        use_last = new.last_trade is not None and last_new
+        if not use_book and not use_last:
+            return None
+        return Quote(
+            symbol=new.symbol,
+            last_trade=new.last_trade if use_last else held.last_trade,
+            last_trade_size=(new.last_trade_size if use_last
+                             else held.last_trade_size),
+            last_trade_timestamp=(new.last_trade_timestamp if use_last
+                                  else held.last_trade_timestamp),
+            bid=new.bid if use_book else held.bid,
+            bid_size=new.bid_size if use_book else held.bid_size,
+            ask=new.ask if use_book else held.ask,
+            ask_size=new.ask_size if use_book else held.ask_size,
+            quote_timestamp=(new.quote_timestamp if use_book
+                             else held.quote_timestamp),
+            previous_close=(new.previous_close
+                            if new.previous_close is not None
+                            else held.previous_close),
+            source=new.source, feed=new.feed or held.feed,
+            received_at=new.received_at)
 
 
 # ---------------------------------------------------------------------------

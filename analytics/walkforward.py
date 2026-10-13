@@ -61,8 +61,6 @@ import numpy as np
 import pandas as pd
 
 from .allocation import (
-    annualised_covariance_simple,
-    annualised_mean_returns_simple,
     black_litterman_allocation,
     black_litterman_posterior,
     diversification_ratio,
@@ -76,6 +74,12 @@ from .allocation import (
     validate_reference_weights,
     validate_tau,
     estimation_window,
+)
+from .estimation import (
+    estimate_covariance,
+    estimate_mean_returns,
+    validate_estimator,
+    validate_ewma_lambda,
 )
 from .backtest import (
     REBALANCE_FREQUENCIES,
@@ -169,6 +173,10 @@ class WalkForwardConfig:
     max_weight: float = 1.0
     risk_free_annual: float = 0.05
     min_est_rows: int = 60
+    # Risk model (Milestone 4): covariance estimator for every training
+    # window. Default "sample" preserves all pre-M4 results bit-for-bit.
+    estimator: str = "sample"
+    ewma_lambda: float = 0.94
     # Black-Litterman only (views fixed through the test — see warning):
     bl_views: list = field(default_factory=list)
     bl_ref: str = "equal"  # "equal" | "retrospective_current"
@@ -219,6 +227,8 @@ class WalkForwardConfig:
         validate_weight_bounds(len(tickers), self.min_weight, self.max_weight)
         if not np.isfinite(self.risk_free_annual):
             raise ValueError("Risk-free rate must be finite.")
+        self.estimator = validate_estimator(self.estimator)
+        self.ewma_lambda = validate_ewma_lambda(self.ewma_lambda)
         try:
             min_rows = int(self.min_est_rows)
         except (TypeError, ValueError):
@@ -396,11 +406,19 @@ def earliest_feasible_test_start(
 # Per-event estimation (base-currency returns → optimiser)
 # ---------------------------------------------------------------------------
 
-def _estimation_stats(est: pd.DataFrame, tickers: list[str]):
-    """Simple-return mean/covariance in annual units + validation."""
+def _estimation_stats(est: pd.DataFrame, tickers: list[str],
+                      estimator: str = "sample",
+                      ewma_lambda: float = 0.94):
+    """Simple-return mean/covariance in annual units + validation.
+
+    ``estimator`` selects the risk model (sample/EWMA/Ledoit-Wolf); the mean
+    stays the sample mean and ``est`` must already be the strict
+    ``date < D`` training slice (no look-ahead by caller).
+    """
     rets = simple_returns_from_prices(est, tickers)
-    mu = annualised_mean_returns_simple(rets)
-    cov = annualised_covariance_simple(rets)
+    mu = estimate_mean_returns(rets)
+    cov = estimate_covariance(rets, method=estimator,
+                              ewma_lambda=ewma_lambda)
     cov_df, _ = validate_covariance(cov, tickers)
     return rets, mu, cov_df
 
@@ -416,6 +434,8 @@ def estimate_event_weights(
     bl_ref_weights: np.ndarray | None = None,
     bl_delta: float = 2.5,
     bl_tau: float = 0.05,
+    estimator: str = "sample",
+    ewma_lambda: float = 0.94,
 ) -> tuple[pd.Series | None, dict, str]:
     """Target weights from one estimation window (no look-ahead by caller).
 
@@ -442,7 +462,13 @@ def estimate_event_weights(
                 "Equal weights violate the configured weight bounds.")
         return pd.Series(w, index=tickers), dict(blank), "Equal weights."
     try:
-        _rets, mu, cov_df = _estimation_stats(est, tickers)
+        estimator = validate_estimator(estimator)
+        ewma_lambda = validate_ewma_lambda(ewma_lambda)
+    except ValueError as e:
+        return None, blank, f"Risk model configuration failed: {e}"
+    try:
+        _rets, mu, cov_df = _estimation_stats(
+            est, tickers, estimator=estimator, ewma_lambda=ewma_lambda)
     except ValueError as e:
         return None, blank, f"Estimation statistics failed: {e}"
     mu_arr = mu.values
@@ -877,10 +903,12 @@ def _default_estimator(config: WalkForwardConfig, tickers: list[str],
                 config.min_weight, config.max_weight,
                 bl_views=list(config.bl_views or []),
                 bl_ref_weights=ref_fixed, bl_delta=delta,
-                bl_tau=config.bl_tau)
+                bl_tau=config.bl_tau,
+                estimator=config.estimator, ewma_lambda=config.ewma_lambda)
         return estimate_event_weights(
             est, tickers, config.method, config.risk_free_annual,
-            config.min_weight, config.max_weight)
+            config.min_weight, config.max_weight,
+            estimator=config.estimator, ewma_lambda=config.ewma_lambda)
 
     return _estimate
 

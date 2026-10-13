@@ -20,6 +20,15 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
+from .constraints import (
+    OptimizationConstraints,
+    budget_total,
+    check_constraints,
+    penalised_objective,
+    slsqp_fragments,
+    turnover_fraction,
+    turnover_reference,
+)
 from .validation import validate_weight_bounds
 
 
@@ -41,14 +50,85 @@ class OptimResult:
     message: str
 
 
-def _make_constraints(n: int) -> list[dict]:
-    """Weights sum to 1 constraint."""
-    return [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
+def _make_constraints(n: int, total: float = 1.0) -> list[dict]:
+    """Weights sum to ``total`` (1 minus cash target) constraint."""
+    return [{"type": "eq", "fun": lambda w, t=total: np.sum(w) - t}]
 
 
 def _make_bounds(n: int, min_weight: float = 0.0, max_weight: float = 1.0) -> list[tuple]:
     """Per-asset weight bounds."""
     return [(min_weight, max_weight)] * n
+
+
+def _resolve_engine_constraints(n: int, tickers, min_weight: float,
+                                max_weight: float,
+                                constraints: OptimizationConstraints | None,
+                                label: str):
+    """Shared pre-flight: feasibility explainer + SLSQP fragments + total.
+
+    Returns ``(bounds, extra_cons, total, cash, turnover, problems)``;
+    ``extra_cons`` never carries the non-smooth turnover inequality (the
+    turnover cap travels separately so solvers can use the kink-free
+    auxiliary reformulation). ``problems`` is non-empty when infeasible.
+    """
+    import dataclasses as _dc
+    eff = constraints
+    if eff is not None and eff.risk_budgets is not None:
+        # Risk budgets belong to the ERC family; classical objectives ignore
+        # them (documented) rather than failing on a foreign field.
+        eff = _dc.replace(eff, risk_budgets=None)
+    tick_list = list(tickers) if tickers is not None else [f"A{i}" for i in range(n)]
+    needs_labels = (
+        eff is not None and eff.has_any()
+        and (eff.per_asset_min or eff.per_asset_max
+             or (eff.currency_caps and eff.asset_currencies is None)))
+    if needs_labels and tickers is None:
+        return None, None, 1.0, 0.0, None, [
+            f"{label}: ticker-labelled constraints need the ticker universe."]
+    try:
+        problems = check_constraints(tick_list, eff,
+                                     min_weight, max_weight)
+    except ValueError as e:
+        return None, None, 1.0, 0.0, None, [f"{label}: {e}"]
+    if problems:
+        return None, None, 1.0, 0.0, None, \
+            [f"{label}: {p}" for p in problems]
+    try:
+        bounds, extra = slsqp_fragments(tick_list, eff,
+                                        min_weight, max_weight,
+                                        include_turnover=False)
+        total = budget_total(eff)
+    except ValueError as e:
+        return None, None, 1.0, 0.0, None, [f"{label}: {e}"]
+    turnover = None
+    if eff is not None and eff.turnover_limit is not None:
+        try:
+            ref = turnover_reference(eff, n)
+            turnover = (ref, float(eff.turnover_limit))
+        except ValueError as e:
+            return None, None, 1.0, 0.0, None, [f"{label}: {e}"]
+    cash = 1.0 - total
+    return bounds, extra, total, cash, turnover, []
+
+
+def _run_solve(fun, n: int, bounds, cons, x0, turnover):
+    """Direct SLSQP, or the kink-free auxiliary reformulation on turnover.
+
+    ``cons`` is the full SLSQP fragment list (budget/currency/target —
+    never the raw turnover inequality, which the auxiliary form replaces).
+    """
+    if turnover is None:
+        return minimize(fun=fun, x0=np.asarray(x0, dtype=float),
+                        method="SLSQP", bounds=bounds, constraints=cons,
+                        options={"ftol": 1e-12, "maxiter": 1000})
+    from .constraints import solve_with_turnover
+    ref, limit = turnover
+    return solve_with_turnover(fun, n, bounds, cons, ref, limit, x0)
+
+
+def _take_solve_weights(res, n: int):
+    from .constraints import _take_weights
+    return _take_weights(res, n)
 
 
 def _port_ret(w, mu):
@@ -105,12 +185,15 @@ def feasible_return_range(
     mu: np.ndarray,
     min_weight: float = 0.0,
     max_weight: float = 1.0,
+    total: float = 1.0,
+    cash_rf: float = 0.0,
 ) -> tuple[float, float]:
     """Feasible [min, max] portfolio return under per-asset box bounds.
 
     With simplex + box constraints the return extremes are attained at
     vertices; allocating as much as possible to the lowest/highest-return
-    assets gives the exact bounds via a greedy fill.
+    assets gives the exact bounds via a greedy fill. ``total`` is the risky
+    budget (1 minus cash) and ``cash_rf`` the cash sleeve's return.
     """
     mu_arr = np.asarray(mu, dtype=float)
     n = mu_arr.shape[0]
@@ -121,7 +204,7 @@ def feasible_return_range(
         if highest:
             order = order[::-1]
         w = np.full(n, min_weight)
-        remaining = 1.0 - min_weight * n
+        remaining = total - min_weight * n
         for i in order:
             room = max_weight - min_weight
             add = min(room, remaining)
@@ -129,7 +212,7 @@ def feasible_return_range(
             remaining -= add
             if remaining <= 1e-12:
                 break
-        return float(w @ mu_arr)
+        return float(w @ mu_arr) + cash_rf
 
     lo = _extreme(False)
     hi = _extreme(True)
@@ -141,13 +224,15 @@ def feasible_volatility_range(
     cov: np.ndarray,
     min_weight: float = 0.0,
     max_weight: float = 1.0,
+    total: float = 1.0,
 ) -> tuple[float, float]:
     """Feasible [min, max] annualised volatility under box bounds.
 
     The minimum comes from the min-variance solve; the maximum is found by
     maximising volatility (concave-down objective over a polytope, so the
     optimum is at a vertex) from several deterministic starts, seeded with
-    concentrated single-asset-tilted portfolios.
+    concentrated single-asset-tilted portfolios. Volatility is homogeneous
+    of degree 1, so a cash-reduced risky budget ``total`` scales the range.
     """
     mu_arr, cov_arr, n = _check_inputs(mu, cov)
     validate_weight_bounds(n, min_weight, max_weight)
@@ -199,7 +284,15 @@ def feasible_volatility_range(
     # Guard against a degenerate zero range for UI sliders.
     if hi - lo < 1e-4:
         hi = lo + 1e-4
-    return float(lo), float(hi)
+    return float(lo * total), float(hi * total)
+
+
+def _cash_stats(w, mu_arr, cov_arr, rf: float, cash: float):
+    """Cash-aware portfolio stats: risky sleeve + cash at the risk-free rate."""
+    ret = _port_ret(w, mu_arr) + cash * rf
+    vol = _port_vol(w, cov_arr)
+    sr = (ret - rf) / vol if vol > 0 else 0.0
+    return ret, vol, sr
 
 
 def min_variance(
@@ -208,6 +301,8 @@ def min_variance(
     rf: float = 0.05,
     min_weight: float = 0.0,
     max_weight: float = 1.0,
+    constraints: OptimizationConstraints | None = None,
+    tickers: list[str] | None = None,
 ) -> OptimResult:
     """
     Find the minimum variance portfolio.
@@ -218,6 +313,11 @@ def min_variance(
         rf:         Risk-free rate (for Sharpe calculation).
         min_weight: Minimum weight per asset.
         max_weight: Maximum weight per asset.
+        constraints: Optional real-world constraints (per-asset bounds,
+            turnover limit, cost-aversion penalty, currency caps, cash
+            target). Ticker-keyed fields need ``tickers``.
+        tickers:    Canonical universe matching mu/cov order (only required
+            for ticker-keyed constraints).
 
     Returns:
         OptimResult with optimal weights (``success=False``, ``weights=None``
@@ -227,29 +327,29 @@ def min_variance(
     failed = _validate_bounds_or_failure(n, min_weight, max_weight)
     if failed is not None:
         return failed
-    w0 = np.ones(n) / n
+    bounds, extra, total, cash, turnover, problems = \
+        _resolve_engine_constraints(
+            n, tickers, min_weight, max_weight, constraints, "Min-variance")
+    if problems:
+        return _failure(n, problems[0])
+    w0 = np.full(n, total / n)
 
     try:
-        res = minimize(
-            fun=lambda w: _port_vol(w, cov_arr),
-            x0=w0,
-            method="SLSQP",
-            bounds=_make_bounds(n, min_weight, max_weight),
-            constraints=_make_constraints(n),
-            options={"ftol": 1e-12, "maxiter": 1000},
-        )
+        res = _run_solve(
+            penalised_objective(
+                lambda w: _port_vol(w, cov_arr), constraints, n),
+            n, bounds, extra, w0, turnover)
     except Exception as e:  # never leak solver exceptions to the UI
         return _failure(n, f"Min-variance optimisation failed: {e}")
 
-    w = np.asarray(res.x, dtype=float)
-    if not res.success or not np.all(np.isfinite(w)):
-        msg = res.message if isinstance(res.message, str) else str(res.message)
+    w = _take_solve_weights(res, n)
+    if w is None or not getattr(res, "success", False):
+        msg = getattr(res, "message", "?")
+        msg = msg if isinstance(msg, str) else str(msg)
         bad = _failure(n, f"Min-variance did not converge: {msg}")
         return bad
 
-    ret = _port_ret(w, mu_arr)
-    vol = _port_vol(w, cov_arr)
-    sr = (ret - rf) / vol if vol > 0 else 0.0
+    ret, vol, sr = _cash_stats(w, mu_arr, cov_arr, rf, cash)
     return OptimResult(weights=w, expected_return=ret, volatility=vol, sharpe=sr,
                        success=True, message="Converged")
 
@@ -260,6 +360,8 @@ def max_sharpe(
     rf: float = 0.05,
     min_weight: float = 0.0,
     max_weight: float = 1.0,
+    constraints: OptimizationConstraints | None = None,
+    tickers: list[str] | None = None,
 ) -> OptimResult:
     """
     Find the maximum Sharpe ratio portfolio.
@@ -270,6 +372,9 @@ def max_sharpe(
         rf:         Risk-free rate.
         min_weight: Minimum weight per asset.
         max_weight: Maximum weight per asset.
+        constraints: Optional real-world constraints (see :func:`min_variance`).
+        tickers:    Canonical universe (only required for ticker-keyed
+            constraints).
 
     Returns:
         OptimResult with optimal weights (``success=False``, ``weights=None``
@@ -279,33 +384,32 @@ def max_sharpe(
     failed = _validate_bounds_or_failure(n, min_weight, max_weight)
     if failed is not None:
         return failed
-    w0 = np.ones(n) / n
+    bounds, extra, total, cash, turnover, problems = \
+        _resolve_engine_constraints(
+            n, tickers, min_weight, max_weight, constraints, "Max-Sharpe")
+    if problems:
+        return _failure(n, problems[0])
+    w0 = np.full(n, total / n)
 
     def neg_sharpe(w):
-        ret = _port_ret(w, mu_arr)
+        ret = _port_ret(w, mu_arr) + cash * rf
         vol = _port_vol(w, cov_arr)
         return -(ret - rf) / vol if vol > 0 else 0.0
 
     try:
-        res = minimize(
-            fun=neg_sharpe,
-            x0=w0,
-            method="SLSQP",
-            bounds=_make_bounds(n, min_weight, max_weight),
-            constraints=_make_constraints(n),
-            options={"ftol": 1e-12, "maxiter": 1000},
-        )
+        res = _run_solve(
+            penalised_objective(neg_sharpe, constraints, n),
+            n, bounds, extra, w0, turnover)
     except Exception as e:
         return _failure(n, f"Max-Sharpe optimisation failed: {e}")
 
-    w = np.asarray(res.x, dtype=float)
-    if not res.success or not np.all(np.isfinite(w)):
-        msg = res.message if isinstance(res.message, str) else str(res.message)
+    w = _take_solve_weights(res, n)
+    if w is None or not getattr(res, "success", False):
+        msg = getattr(res, "message", "?")
+        msg = msg if isinstance(msg, str) else str(msg)
         return _failure(n, f"Max-Sharpe did not converge: {msg}")
 
-    ret = _port_ret(w, mu_arr)
-    vol = _port_vol(w, cov_arr)
-    sr = (ret - rf) / vol if vol > 0 else 0.0
+    ret, vol, sr = _cash_stats(w, mu_arr, cov_arr, rf, cash)
     return OptimResult(weights=w, expected_return=ret, volatility=vol, sharpe=sr,
                        success=True, message="Converged")
 
@@ -317,13 +421,16 @@ def target_return(
     rf: float = 0.05,
     min_weight: float = 0.0,
     max_weight: float = 1.0,
+    constraints: OptimizationConstraints | None = None,
+    tickers: list[str] | None = None,
 ) -> OptimResult:
     """
     Minimise variance subject to achieving a target return.
 
     The target is checked against the feasible return range first; an
     infeasible target returns ``success=False`` with a message instead of
-    running a doomed optimisation.
+    running a doomed optimisation. With a cash target the portfolio return
+    includes ``cash × rf``.
 
     Args:
         mu:         Annualised mean returns vector (canonical order).
@@ -332,6 +439,9 @@ def target_return(
         rf:         Risk-free rate.
         min_weight: Minimum weight per asset.
         max_weight: Maximum weight per asset.
+        constraints: Optional real-world constraints (see :func:`min_variance`).
+        tickers:    Canonical universe (only required for ticker-keyed
+            constraints).
 
     Returns:
         OptimResult with optimal weights.
@@ -340,41 +450,43 @@ def target_return(
     failed = _validate_bounds_or_failure(n, min_weight, max_weight)
     if failed is not None:
         return failed
+    bounds, extra, total, cash, turnover, problems = \
+        _resolve_engine_constraints(
+            n, tickers, min_weight, max_weight, constraints, "Target-return")
+    if problems:
+        return _failure(n, problems[0])
     if not np.isfinite(target):
         return _failure(n, f"Target return {target!r} is not finite.")
-    lo, hi = feasible_return_range(mu_arr, min_weight, max_weight)
+    lo, hi = feasible_return_range(mu_arr, min_weight, max_weight,
+                                   total=total, cash_rf=cash * rf)
     if not lo - 1e-9 <= target <= hi + 1e-9:
         return _failure(
             n,
             f"Target return {target:.2%} is outside the feasible range "
             f"[{lo:.2%}, {hi:.2%}] under the current weight bounds.",
         )
-    w0 = np.ones(n) / n
+    w0 = np.full(n, total / n)
 
-    constraints = _make_constraints(n) + [
-        {"type": "eq", "fun": lambda w: _port_ret(w, mu_arr) - target}
+    cons = extra + [
+        {"type": "eq",
+         "fun": lambda w: _port_ret(w, mu_arr) + cash * rf - target}
     ]
 
     try:
-        res = minimize(
-            fun=lambda w: _port_vol(w, cov_arr),
-            x0=w0,
-            method="SLSQP",
-            bounds=_make_bounds(n, min_weight, max_weight),
-            constraints=constraints,
-            options={"ftol": 1e-12, "maxiter": 1000},
-        )
+        res = _run_solve(
+            penalised_objective(
+                lambda w: _port_vol(w, cov_arr), constraints, n),
+            n, bounds, cons, w0, turnover)
     except Exception as e:
         return _failure(n, f"Target-return optimisation failed: {e}")
 
-    w = np.asarray(res.x, dtype=float)
-    if not res.success or not np.all(np.isfinite(w)):
-        msg = res.message if isinstance(res.message, str) else str(res.message)
+    w = _take_solve_weights(res, n)
+    if w is None or not getattr(res, "success", False):
+        msg = getattr(res, "message", "?")
+        msg = msg if isinstance(msg, str) else str(msg)
         return _failure(n, f"Target-return did not converge: {msg}")
 
-    ret = _port_ret(w, mu_arr)
-    vol = _port_vol(w, cov_arr)
-    sr = (ret - rf) / vol if vol > 0 else 0.0
+    ret, vol, sr = _cash_stats(w, mu_arr, cov_arr, rf, cash)
     return OptimResult(weights=w, expected_return=ret, volatility=vol, sharpe=sr,
                        success=True, message="Converged")
 
@@ -386,6 +498,8 @@ def target_volatility(
     rf: float = 0.05,
     min_weight: float = 0.0,
     max_weight: float = 1.0,
+    constraints: OptimizationConstraints | None = None,
+    tickers: list[str] | None = None,
 ) -> OptimResult:
     """
     Maximise return subject to a target volatility constraint.
@@ -399,6 +513,9 @@ def target_volatility(
         rf:          Risk-free rate.
         min_weight:  Minimum weight per asset.
         max_weight:  Maximum weight per asset.
+        constraints: Optional real-world constraints (see :func:`min_variance`).
+        tickers:    Canonical universe (only required for ticker-keyed
+            constraints).
 
     Returns:
         OptimResult with optimal weights.
@@ -407,44 +524,46 @@ def target_volatility(
     failed = _validate_bounds_or_failure(n, min_weight, max_weight)
     if failed is not None:
         return failed
+    bounds, extra, total, cash, turnover, problems = \
+        _resolve_engine_constraints(
+            n, tickers, min_weight, max_weight, constraints,
+            "Target-volatility")
+    if problems:
+        return _failure(n, problems[0])
     if not np.isfinite(target_vol) or target_vol <= 0:
         return _failure(
             n,
             f"Target volatility must be a positive finite number, got {target_vol!r}.",
         )
-    lo, hi = feasible_volatility_range(mu_arr, cov_arr, min_weight, max_weight)
+    lo, hi = feasible_volatility_range(mu_arr, cov_arr, min_weight, max_weight,
+                                           total=total)
     if not lo - 1e-9 <= target_vol <= hi + 1e-9:
         return _failure(
             n,
             f"Target volatility {target_vol:.2%} is outside the feasible range "
             f"[{lo:.2%}, {hi:.2%}] under the current weight bounds.",
         )
-    w0 = np.ones(n) / n
+    w0 = np.full(n, total / n)
 
-    constraints = _make_constraints(n) + [
+    cons = extra + [
         {"type": "eq", "fun": lambda w: _port_vol(w, cov_arr) - target_vol}
     ]
 
     try:
-        res = minimize(
-            fun=lambda w: -_port_ret(w, mu_arr),
-            x0=w0,
-            method="SLSQP",
-            bounds=_make_bounds(n, min_weight, max_weight),
-            constraints=constraints,
-            options={"ftol": 1e-12, "maxiter": 1000},
-        )
+        res = _run_solve(
+            penalised_objective(
+                lambda w: -_port_ret(w, mu_arr), constraints, n),
+            n, bounds, cons, w0, turnover)
     except Exception as e:
         return _failure(n, f"Target-volatility optimisation failed: {e}")
 
-    w = np.asarray(res.x, dtype=float)
-    if not res.success or not np.all(np.isfinite(w)):
-        msg = res.message if isinstance(res.message, str) else str(res.message)
+    w = _take_solve_weights(res, n)
+    if w is None or not getattr(res, "success", False):
+        msg = getattr(res, "message", "?")
+        msg = msg if isinstance(msg, str) else str(msg)
         return _failure(n, f"Target-volatility did not converge: {msg}")
 
-    ret = _port_ret(w, mu_arr)
-    vol = _port_vol(w, cov_arr)
-    sr = (ret - rf) / vol if vol > 0 else 0.0
+    ret, vol, sr = _cash_stats(w, mu_arr, cov_arr, rf, cash)
     return OptimResult(weights=w, expected_return=ret, volatility=vol, sharpe=sr,
                        success=True, message="Converged")
 

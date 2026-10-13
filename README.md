@@ -1,18 +1,41 @@
-# portcalc — Live Portfolio Intelligence & Accounting Platform
+# portcalc — Institutional Portfolio Workstation
 
-A modular Python portfolio research platform with a Streamlit web interface:
-live marks and NAV, a transaction ledger with FIFO lots and cash accounting,
-TWR/XIRR performance, return attribution, a research-only rebalancing
-planner, plus institutional analytics (risk, optimisation, backtesting,
-walk-forward, factors) with purchase-date cost basis and USD/GBP/EUR
+A modular Python portfolio research workstation with a Streamlit web
+interface: a persistent multi-portfolio SQLite workspace, streaming market
+data with polling fallback, a corrected transaction ledger with audit
+trail, institutional risk estimation, constrained optimisation, a
+walk-forward robustness lab, a research-only execution simulator, a
+persistent research library with re-runs and comparison, and printable
+HTML institutional reports — plus live marks and NAV, FIFO lots and cash
+accounting, TWR/XIRR performance, return attribution, and USD/GBP/EUR
 multi-currency support.
 
 ## Features
 
+- **Persistent workspace** — local SQLite store (`portcalc.db`,
+  git-ignored) with versioned migrations; multiple portfolios (create,
+  rename, switch, duplicate with explicit research opt-in, archive,
+  guarded delete); session working copy with hash-guarded atomic saves;
+  portable JSON import/export round-trips independently of the DB
+- **Transaction accounting 2.0** — edit/delete with confirmation,
+  deterministic rebuild from the ledger (lots/cash/realised/holdings never
+  mutated directly), immutable revision audit trail (CREATE/UPDATE/DELETE
+  with before/after payloads), running cash/position display, FIFO lot
+  drilldown, notes, ticker/type/date/text filters, atomic CSV import with
+  preview and duplicate warnings
+- **Streaming market data** — provider abstraction, Alpaca WebSocket
+  (trades + quotes) with SIP→IEX→REST→Yahoo fallback and cached
+  capability, single connection manager, incremental subscription
+  (holdings + watchlist + selected ticker), thread-safe quote store
+  (newest timestamp wins), backoff reconnect/resubscribe, heartbeat
+  (STREAMING/POLLING/FALLBACK/STALE/CLOSED), 30s UI fragment refresh that
+  never recomputes historical analytics
 - **Live market data** — quote model (bid/ask/last/previous close), explicit
   mark policy (mid → last → fallback, never invented), freshness
   (LIVE/DELAYED/STALE/CLOSED/FALLBACK), US session detection, feed fallback
-  (SIP→IEX), Yahoo fallback; no background threads, no auto-rerun loops
+  (SIP→IEX), Yahoo fallback; the poll path uses no background threads and
+  no auto-rerun loops (streaming uses one daemon worker thread plus a 30s
+  status-only fragment that never recomputes historical analytics)
 - **Live portfolio** — NAV, Day P&L vs previous close, live weights, live
   risk snapshot (historical estimates labelled as such)
 - **Transaction ledger** — BUY/SELL/DIVIDEND/FEE/DEPOSIT/WITHDRAWAL/INTEREST
@@ -59,6 +82,39 @@ multi-currency support.
 - **Purchase dates & cost basis** — split-adjusted estimates, GBp
   normalisation, manual execution-price override
 - **Multi-currency** — USD/GBP/EUR base with date-matched historical FX
+- **Risk estimation lab** — Sample (default, preserves history), EWMA
+  (configurable decay, correct normalisation), Ledoit-Wolf shrinkage;
+  estimation windows (1y/2y/3y/5y/expanding) on Base Currency returns;
+  diagnostics (condition number, eigenvalues, effective rank, PSD safety,
+  correlation stability, estimator comparison); training slices only,
+  never any look-ahead
+- **Constrained optimisation** — per-asset min/max table with feasibility
+  explainer, turnover limit (one-way Σ|Δ|/2 vs current), cost-averse
+  planning penalty (not backtest accounting), quote-currency caps, cash
+  target, custom ERC risk budgets; before/after + stability diagnostics
+- **Walk-forward robustness lab** — grid over lookbacks × frequencies ×
+  risk models × costs reusing the unchanged no-look-ahead engine; result
+  matrix, Sharpe heatmap, robustness scorecard (median/worst/best/
+  dispersion, turnover, drawdown), cost sensitivity + break-even, result
+  cache, progress + size guard, CSV export
+- **Execution simulator** — MARKET/LIMIT research fills (BUY near ask,
+  SELL near bid + slippage bps + flat/bps commission, conservative LIMIT
+  rule, deterministic partial fills), blotter (NEW/PARTIAL/FILLED/
+  CANCELLED/REJECTED), sandbox-only application, rebalance-plan
+  integration, cost comparison; SIMULATION ONLY banner, no broker orders
+  ever sent
+- **Research workspace** — saved analyses (Scenario/Optimisation/Static
+  Backtest/OOS/Walk-Forward/WF Robustness/Stress) with full config +
+  result summary (never giant arrays), per-view “Save to Research”,
+  library table (Name/Type/Portfolio/Created/Last Run/Tags), plain-text
+  notes, re-run on current data (Saved vs Recomputed, explicit
+  overwrite), compatible-type comparison with exact config differences,
+  rename/delete, per-portfolio isolation
+- **Institutional reporting** — self-contained printable HTML report
+  (Portfolio Summary/Holdings/P&L/Performance/Risk/Attribution/Stress/
+  Saved Analyses + metadata: portfolio, UTC time, base, benchmark,
+  data-through, sources, freshness disclaimer); all user content escaped,
+  no secrets embedded, print CSS for PDF-via-browser
 - **Portfolio persistence** — schema v2 JSON (positions, ledger,
   watchlist, settings) with v1 import compatibility and deterministic
   aggregate→lot migration (`portfolio.json`), analysis snapshot export
@@ -103,33 +159,48 @@ portcalc/
 │   ├── insights.py         # Deterministic portfolio observations
 │   ├── bl.py               # Black-Litterman UI inputs
 │   ├── ledger.py           # Ledger session-state helpers
+│   ├── workspace.py        # DB workspace ↔ session mapping
 │   └── views/              # One render module per research tab
-│       └── overview.py risk.py optimise.py scenarios.py
+│       └── overview.py risk.py optimise.py scenario.py
 │           performance.py security.py backtest.py factors.py
+│           research.py accounting.py
 ├── data/
 │   ├── __init__.py
 │   ├── market_data.py      # yfinance wrappers (+intraday, prev closes)
 │   ├── live_market.py      # Quotes, marks, store, ingestor, snapshot
+│   ├── ws_stream.py        # Streaming provider + connection manager
 │   ├── pipeline.py         # Cached loaders + composed data plumbing
 │   ├── fx.py               # FX + instrument metadata
 │   ├── alpaca.py           # Live US prices (valuation only)
 │   └── factors.py          # French data library access
+├── storage/                # SQLite workspace (no ORM, no secrets)
+│   ├── database.py         # Connection factory + atomic() helper
+│   ├── migrations.py       # Deterministic idempotent schema versions
+│   ├── repositories.py     # Typed access (portfolios/ledger/research)
+│   └── models.py           # Plain dataclasses
 └── analytics/
     ├── __init__.py
     ├── returns.py          # Log returns, mean, covariance, correlation
     ├── portfolio.py        # Portfolio metrics, Sharpe, risk contributions, CML
     ├── var.py              # Parametric, historical, Monte Carlo VaR + CVaR
     ├── risk_extra.py       # Component/marginal VaR, skew, Omega, capture
+    ├── estimation.py       # Sample / EWMA / Ledoit-Wolf + diagnostics
+    ├── constraints.py      # Real-world optimisation constraint model
     ├── optimisation.py     # SLSQP optimisation, efficient frontier, rebalancing
     ├── scenario.py         # Monte Carlo forward simulation, stress scenarios
     ├── allocation.py       # ERC, MaxDiv, Black-Litterman, OOS windows
     ├── backtest.py         # Static backtesting engine (exact costs)
     ├── walkforward.py      # Walk-forward optimisation engine
+    ├── robustness.py       # WF robustness grid + scorecard
+    ├── execution.py        # Research execution simulator (no brokerage)
+    ├── research.py         # Saved-analysis re-runners + comparison
+    ├── report.py           # Printable HTML institutional report
     ├── currency.py         # FX maths (no look-ahead)
     ├── positions.py        # Cost basis, valuation, splits, dividends
     ├── performance.py      # Drawdowns, rolling metrics, benchmark stats
     ├── performance_cashflows.py  # TWR/XIRR, flow-matched benchmark
     ├── ledger.py           # Transactions, FIFO lots, cash, realised P&L
+    ├── ledger_csv.py       # Atomic CSV import with preview
     ├── persistence.py      # Schema v2, migration, import validation
     ├── history.py          # Transaction-aware NAV reconstruction
     ├── attribution.py      # Contributions, winners/losers, FX split
@@ -271,7 +342,8 @@ into backtest wealth paths (which use adjusted prices).
   (10s cache) where configured.
 - Estimated purchase close: raw close on the selected trading date,
   split-adjusted to current shares; execution-time/fills excluded.
-- Single acquisition date per position; FIFO/LIFO not modelled.
+  Classic sidebar adds remain single-aggregate shortcuts; full-form ledger
+  transactions support multiple lots with FIFO accounting.
 - Dividend estimates: cash amounts × shares × payment-date FX, only for
   payments after purchase; broker-exact entitlement not claimed.
 - Currency conversion via Yahoo FX (`GBPUSD=X`, `EURUSD=X`), USD-routed;
@@ -282,8 +354,8 @@ into backtest wealth paths (which use adjusted prices).
   bias); rebalances execute at the next eligible close (approximation);
   static out-of-sample weights are never re-estimated in-test.
 - TradingView charts show native market quotation, display only.
-- Data model notes for future work: positions are single-lot aggregates
+- Data model notes: classic sidebar positions are single-lot aggregates
   (`purchase_date` may be null, prices are per current split-adjusted
-  share); cash balances, multi-lot tax lots and realised-P&L ledgers are
-  not modelled yet, so those extensions need no redesign of the analytics
-  layer, only new position kinds and ledger views.
+  share); the transaction ledger additionally models currency-keyed cash
+  balances, multi-lot FIFO lots and realised-P&L lots ledgers with an
+  immutable revision audit trail.

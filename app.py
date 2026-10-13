@@ -45,7 +45,16 @@ from analytics.ledger import (
 )
 from analytics.persistence import (
     export_portfolio_v2,
+    migrate_v1_to_ledger,
     validate_portfolio_import,
+)
+from storage import database as ws_db
+from storage import repositories as ws_repo
+from storage.database import workspace_db_path
+from ui.workspace import (
+    legacy_seed_state,
+    workspace_signature,
+    workspace_to_session,
 )
 from data.market_data import fetch_current_prices
 from analytics.positions import (
@@ -85,6 +94,7 @@ from ui.views import optimise as views_optimise
 from ui.views import scenario as views_scenario
 from ui.views import overview as views_overview
 from ui.views import risk as views_risk
+from ui.views import research as views_research
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -92,6 +102,7 @@ from ui.views import risk as views_risk
 
 PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio.json")
 SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
+
 
 DEFAULT_PORTFOLIO = {
     "AAPL":  {"shares": 10, "avg_cost": 150.0},
@@ -135,7 +146,7 @@ def load_portfolio() -> dict:
 
 
 def save_portfolio(portfolio: dict) -> None:
-    """Persist portfolio to JSON file."""
+    """Legacy JSON write — file mode only (DB mode syncs at end of run)."""
     try:
         with open(PORTFOLIO_FILE, "w") as f:
             json.dump(portfolio, f, indent=2)
@@ -161,7 +172,7 @@ def load_settings() -> dict:
 
 
 def save_settings(settings: dict) -> None:
-    """Persist UI settings (never secrets — base currency only)."""
+    """Legacy JSON write — file mode only (DB mode syncs at end of run)."""
     try:
         with open(SETTINGS_FILE, "w") as f:
             json.dump({"schema_version": 1,
@@ -169,6 +180,19 @@ def save_settings(settings: dict) -> None:
                       f, indent=2)
     except IOError as e:
         st.warning(f"Could not save settings: {e}")
+
+
+def _persist_portfolio_now() -> None:
+    """Write-through for file mode; DB mode persists via end-of-run sync."""
+    if not st.session_state.get("_db_ok"):
+        save_portfolio(st.session_state.portfolio)
+
+
+def _persist_settings_now() -> None:
+    """Write-through for file mode; DB mode persists via end-of-run sync."""
+    if not st.session_state.get("_db_ok"):
+        save_settings({"base_currency": st.session_state.get(
+            "base_currency", "USD")})
 
 
 def _complete_add_position(sym, shares, purchase_date, price_native,
@@ -214,7 +238,7 @@ def _complete_add_position(sym, shares, purchase_date, price_native,
         if isinstance(inst, dict) else float(
             getattr(inst, "quote_scale", 1.0)),
     }
-    save_portfolio(st.session_state.portfolio)
+    _persist_portfolio_now()
     st.session_state.data_loaded = False
     _label = {"estimate": "estimated close", "manual": "actual execution",
               "legacy": "legacy cost"}.get(source, source)
@@ -260,11 +284,159 @@ def _complete_add_position(sym, shares, purchase_date, price_native,
 # Session state initialisation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Workspace bootstrap — SQLite is the durable store (Task 10, Milestone 1).
+# Session holds the working copy; every mutation persists via
+# _sync_workspace_to_db (hash-guarded, called post-sidebar and end of run).
+# JSON files are first-run seed only. When the database is unavailable the
+# shell degrades to the legacy file behaviour (single portfolio).
+# ---------------------------------------------------------------------------
+
+def _workspace_seed_default(conn) -> None:
+    """Create the default portfolio from legacy files on a fresh database."""
+    legacy_pos = load_portfolio()
+    legacy_base = load_settings().get("base_currency", "USD")
+    seed = legacy_seed_state(legacy_pos, legacy_base)
+    ws_repo.create_portfolio(
+        conn, "My Portfolio", seed["base_currency"],
+        seed["bt_benchmark"], 0.05,
+        portfolio_id=ws_repo.DEFAULT_PORTFOLIO_ID)
+    from analytics.persistence import transaction_from_dict
+    ws_repo.save_workspace(
+        conn, ws_repo.DEFAULT_PORTFOLIO_ID,
+        positions=seed["portfolio"],
+        transactions=[transaction_from_dict(d)
+                      for d in seed["ledger_txns"]],
+        watchlist=seed["watchlist"],
+        base_currency=seed["base_currency"],
+        benchmark=seed["bt_benchmark"])
+    ws_repo.set_active_portfolio_id(conn, ws_repo.DEFAULT_PORTFOLIO_ID)
+
+
+def _workspace_apply_session(state: dict, portfolio_id: str) -> None:
+    """Load a DB workspace into session (working copy)."""
+    st.session_state.portfolio = state["portfolio"]
+    st.session_state.ledger_txns = state["ledger_txns"]
+    st.session_state.watchlist = state["watchlist"]
+    st.session_state.base_currency = state["base_currency"]
+    st.session_state.bt_benchmark = state["bt_benchmark"]
+    st.session_state["_ws_pid"] = portfolio_id
+    st.session_state["_ws_hash"] = workspace_signature(
+        state["portfolio"], state["ledger_txns"], state["watchlist"],
+        state["base_currency"], state["bt_benchmark"])
+
+
+def _workspace_resolve_active(conn) -> str:
+    """Active portfolio id: session choice wins, else DB pointer, else deflt."""
+    wanted = st.session_state.get("_ws_pid")
+    if wanted:
+        try:
+            _rec = ws_repo.get_portfolio(conn, wanted)
+            if not _rec.archived:
+                return wanted
+        except ValueError:
+            pass
+    try:
+        pointed = ws_repo.get_active_portfolio_id(conn)
+        if pointed:
+            _rec = ws_repo.get_portfolio(conn, pointed)
+            if not _rec.archived:
+                return pointed
+    except ValueError:
+        pass
+    return ws_repo.DEFAULT_PORTFOLIO_ID
+
+
+def _workspace_switch_to(portfolio_id: str) -> None:
+    """Point session at another portfolio; next lines reload from the DB."""
+    st.session_state["_ws_pid"] = portfolio_id
+    for _k in ("portfolio", "ledger_txns", "watchlist", "base_currency",
+               "bt_benchmark", "ws_switcher", "_ws_hash", "pending_buy",
+               "confirm_reset", "wf_results", "robust_res", "robust_cache",
+               "sim_sandbox"):
+        st.session_state.pop(_k, None)
+    # Per-analysis recomputation state is keyed dynamically (rs_fresh_<id>):
+    # drop every such key so the newly active portfolio never shows the
+    # previous portfolio's Saved-vs-Recomputed artefacts.
+    for _k in [k for k in list(st.session_state.keys())
+               if isinstance(k, str) and k.startswith("rs_fresh_")]:
+        st.session_state.pop(_k, None)
+    st.session_state.data_loaded = False
+
+
+def _sync_workspace_to_db() -> None:
+    """Persist the working copy (no-op when unchanged, invalid or file mode).
+
+    Invalid ledgers are never written: the run keeps going on the session
+    copy and the next valid run persists. DB errors flash once in the
+    sidebar instead of breaking the run.
+    """
+    if not st.session_state.get("_db_ok"):
+        return
+    _pid = st.session_state.get("_ws_pid")
+    if not _pid:
+        return
+    try:
+        _txns, _err = parse_session_transactions(
+            st.session_state.ledger_txns)
+        if _err is not None:
+            return
+        _sig = workspace_signature(
+            st.session_state.portfolio, st.session_state.ledger_txns,
+            st.session_state.watchlist,
+            st.session_state.get("base_currency", "USD"),
+            st.session_state.get("bt_benchmark", "SPY"))
+        if _sig == st.session_state.get("_ws_hash"):
+            return
+        _conn = ws_db.connect(workspace_db_path())
+        try:
+            ws_repo.save_workspace(
+                _conn, _pid, positions=st.session_state.portfolio,
+                transactions=_txns,
+                watchlist=list(st.session_state.watchlist),
+                base_currency=st.session_state.get("base_currency", "USD"),
+                benchmark=st.session_state.get("bt_benchmark", "SPY"))
+        finally:
+            _conn.close()
+        st.session_state["_ws_hash"] = _sig
+    except Exception as e:
+        flash(f"Workspace save failed ({e}); your edits are kept for "
+              "this session only.", "warning")
+
+
+st.session_state["_db_ok"] = False
+try:
+    _boot_conn = ws_db.connect(workspace_db_path())
+    try:
+        if not ws_repo.list_portfolios(_boot_conn, include_archived=True):
+            _workspace_seed_default(_boot_conn)
+            _boot_conn.commit()
+        _active_pid = _workspace_resolve_active(_boot_conn)
+        try:
+            ws_repo.set_active_portfolio_id(_boot_conn, _active_pid)
+            _boot_conn.commit()
+        except ValueError:
+            pass
+        if st.session_state.get("_ws_pid") != _active_pid or \
+                "portfolio" not in st.session_state:
+            _workspace_apply_session(
+                workspace_to_session(
+                    ws_repo.load_workspace(_boot_conn, _active_pid)),
+                _active_pid)
+        st.session_state["_db_ok"] = True
+    finally:
+        _boot_conn.close()
+except Exception:
+    st.session_state["_db_ok"] = False
+
 if "portfolio" not in st.session_state:
+    # File mode (database unavailable): legacy single-portfolio behaviour.
     st.session_state.portfolio = load_portfolio()
 
 if "base_currency" not in st.session_state:
-    st.session_state.base_currency = load_settings().get("base_currency", "USD")
+    st.session_state.base_currency = load_settings().get(
+        "base_currency", "USD") if not st.session_state.get("_db_ok") \
+        else "USD"
 
 if "data_loaded" not in st.session_state:
     st.session_state.data_loaded = False
@@ -276,6 +448,8 @@ if "watchlist" not in st.session_state:
     st.session_state.watchlist = []
 if "ledger_cleared" not in st.session_state:
     st.session_state.ledger_cleared = False
+if "bt_benchmark" not in st.session_state:
+    st.session_state.bt_benchmark = "SPY"
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +465,183 @@ with st.sidebar:
     st.markdown("## 📈 Portfolio Editor")
     render_flash()  # rerun-surviving confirmations render once, here
 
+    if st.session_state.get("_db_ok"):
+        st.markdown('<div class="pc-kicker">WORKSPACE</div>',
+                    unsafe_allow_html=True)
+        try:
+            _ws_conn = ws_db.connect(workspace_db_path())
+            try:
+                _ws_all = ws_repo.list_portfolios(_ws_conn)
+                _ws_arch = [p for p in ws_repo.list_portfolios(
+                    _ws_conn, include_archived=True) if p.archived]
+            finally:
+                _ws_conn.close()
+        except Exception as e:
+            st.warning(f"Workspace unavailable: {e}")
+            _ws_all, _ws_arch = [], []
+        _ws_pid_now = st.session_state.get("_ws_pid")
+        _ws_ids = [p.portfolio_id for p in _ws_all]
+        if _ws_ids:
+            if _ws_pid_now not in _ws_ids:
+                _ws_pid_now = _ws_ids[0]
+            _ws_names = {p.portfolio_id: p.name for p in _ws_all}
+            _sel = st.selectbox(
+                "Portfolio", _ws_ids, index=_ws_ids.index(_ws_pid_now),
+                format_func=lambda _pid: _ws_names.get(_pid, _pid),
+                key="ws_switcher",
+                help="Each portfolio keeps its own positions, ledger, "
+                     "watchlist and settings.")
+            if _sel != st.session_state.get("_ws_pid"):
+                try:
+                    _sw_conn = ws_db.connect(workspace_db_path())
+                    try:
+                        ws_repo.set_active_portfolio_id(_sw_conn, _sel)
+                    finally:
+                        _sw_conn.close()
+                except ValueError as e:
+                    st.error(str(e))
+                else:
+                    _workspace_switch_to(_sel)
+                    st.rerun()
+        with st.expander("Manage portfolios", expanded=False):
+            _new_name = st.text_input("New portfolio name", value="",
+                                      key="ws_new_name",
+                                      placeholder="e.g. ISA 2026")
+            if st.button("Create + switch", key="ws_create"):
+                _label = str(_new_name or "").strip()
+                if not _label:
+                    st.error("Name the new portfolio first.")
+                else:
+                    try:
+                        _c = ws_db.connect(workspace_db_path())
+                        try:
+                            _np = ws_repo.create_portfolio(
+                                _c, _label,
+                                st.session_state.get("base_currency",
+                                                     "USD"),
+                                st.session_state.get("bt_benchmark",
+                                                     "SPY"), 0.05)
+                            ws_repo.set_active_portfolio_id(
+                                _c, _np.portfolio_id)
+                        finally:
+                            _c.close()
+                    except ValueError as e:
+                        st.error(str(e))
+                    else:
+                        _workspace_switch_to(_np.portfolio_id)
+                        flash(f"Switched to '{_label}'.", "success")
+                        st.rerun()
+            _ren = st.text_input("Rename active", value=str(
+                {p.portfolio_id: p.name for p in _ws_all}.get(
+                    st.session_state.get("_ws_pid"), "")),
+                key="ws_rename")
+            if st.button("Rename", key="ws_rename_go"):
+                try:
+                    _c = ws_db.connect(workspace_db_path())
+                    try:
+                        ws_repo.rename_portfolio(
+                            _c, st.session_state.get("_ws_pid"), _ren)
+                    finally:
+                        _c.close()
+                except ValueError as e:
+                    st.error(str(e))
+                else:
+                    flash("Portfolio renamed.", "success")
+                    st.rerun()
+            _dup = st.text_input("Duplicate active as", value="", key="ws_dup",
+                                 placeholder="e.g. Core copy")
+            _dup_research = st.checkbox(
+                "Include saved research", value=False, key="ws_dup_research",
+                help="Off (default): the clone starts with an empty research "
+                     "library. On: copy saved analyses into the clone with "
+                     "fresh ids (explicit opt-in).")
+            if st.button("Duplicate + switch", key="ws_dup_go"):
+                try:
+                    _c = ws_db.connect(workspace_db_path())
+                    try:
+                        _cp = ws_repo.duplicate_portfolio(
+                            _c, st.session_state.get("_ws_pid"), _dup,
+                            include_research=bool(_dup_research))
+                        ws_repo.set_active_portfolio_id(
+                            _c, _cp.portfolio_id)
+                    finally:
+                        _c.close()
+                except ValueError as e:
+                    st.error(str(e))
+                else:
+                    _workspace_switch_to(_cp.portfolio_id)
+                    flash(f"Switched to '{_cp.name}'.", "success")
+                    st.rerun()
+            _arch_opts = [p for p in _ws_all
+                          if p.portfolio_id != st.session_state.get("_ws_pid")
+                          and p.portfolio_id != ws_repo.DEFAULT_PORTFOLIO_ID]
+            if _arch_opts:
+                _arch_pick = st.selectbox(
+                    "Archive (keeps data, hides here)",
+                    [p.portfolio_id for p in _arch_opts],
+                    format_func=lambda _pid: {
+                        p.portfolio_id: p.name for p in _arch_opts
+                    }.get(_pid, _pid), key="ws_archive_pick")
+                if st.button("Archive", key="ws_archive_go"):
+                    try:
+                        _c = ws_db.connect(workspace_db_path())
+                        try:
+                            ws_repo.set_archived(_c, _arch_pick, True)
+                        finally:
+                            _c.close()
+                    except ValueError as e:
+                        st.error(str(e))
+                    else:
+                        flash("Portfolio archived.", "info")
+                        st.rerun()
+            if _ws_arch:
+                _un_pick = st.selectbox(
+                    "Unarchive",
+                    [p.portfolio_id for p in _ws_arch],
+                    format_func=lambda _pid: {
+                        p.portfolio_id: p.name for p in _ws_arch
+                    }.get(_pid, _pid), key="ws_unarchive_pick")
+                if st.button("Unarchive", key="ws_unarchive_go"):
+                    try:
+                        _c = ws_db.connect(workspace_db_path())
+                        try:
+                            ws_repo.set_archived(_c, _un_pick, False)
+                        finally:
+                            _c.close()
+                    except ValueError as e:
+                        st.error(str(e))
+                    else:
+                        flash("Portfolio unarchived.", "success")
+                        st.rerun()
+            _del_opts = [p for p in _ws_all
+                         if p.portfolio_id != st.session_state.get("_ws_pid")
+                         and p.portfolio_id != ws_repo.DEFAULT_PORTFOLIO_ID]
+            if _del_opts:
+                _del_pick = st.selectbox(
+                    "Delete (forever)",
+                    [p.portfolio_id for p in _del_opts],
+                    format_func=lambda _pid: {
+                        p.portfolio_id: p.name for p in _del_opts
+                    }.get(_pid, _pid), key="ws_delete_pick")
+                _del_ok = st.checkbox(
+                    "I understand this deletes its positions, ledger and "
+                    "research forever.", key="ws_delete_ack")
+                if st.button("Delete portfolio", key="ws_delete_go",
+                             disabled=not _del_ok):
+                    try:
+                        _c = ws_db.connect(workspace_db_path())
+                        try:
+                            ws_repo.delete_portfolio(_c, _del_pick)
+                        finally:
+                            _c.close()
+                    except ValueError as e:
+                        st.error(str(e))
+                    else:
+                        flash("Portfolio deleted.", "warning")
+                        st.rerun()
+    else:
+        st.caption("File mode — database unavailable (single portfolio).")
+
     st.markdown('<div class="pc-kicker">PORTFOLIO</div>',
                 unsafe_allow_html=True)
     # --- Base currency (global valuation currency) ---
@@ -302,7 +653,7 @@ with st.sidebar:
         key="base_currency",
         help="Currency used to value and aggregate the portfolio.")
     if st.session_state.base_currency != _prev_base:
-        save_settings({"base_currency": st.session_state.base_currency})
+        _persist_settings_now()
 
     st.markdown("---")
 
@@ -484,7 +835,7 @@ with st.sidebar:
                        "holding kept. Use a Sell transaction instead.")
             continue
         del st.session_state.portfolio[t]
-        save_portfolio(st.session_state.portfolio)
+        _persist_portfolio_now()
         st.session_state.data_loaded = False
         st.rerun()
 
@@ -581,7 +932,9 @@ with st.sidebar:
                     type=tx_type, ticker=_sym,
                     quantity=float(tx_qty),
                     price_native=float(tx_price) if _show_price else 1.0,
-                    currency=tx_ccy, fee=float(tx_fee), purchase_fx=_fx,
+                    currency=tx_ccy,
+                    fee=float(tx_qty) if tx_type == "FEE"
+                    else float(tx_fee), purchase_fx=_fx,
                     notes="", source="user", move_cash=True,
                     created_at=datetime.now(timezone.utc)))
                 _all, _parse_err = parse_session_transactions(
@@ -673,7 +1026,21 @@ with st.sidebar:
         _uploaded = st.file_uploader("Import Portfolio (JSON)", type=["json"],
                                      key="import_json")
         if _uploaded is not None:
-            if st.button("Replace portfolio with import", key="import_apply"):
+            if st.session_state.get("_db_ok"):
+                _imp_mode = st.radio(
+                    "Import target",
+                    ["Replace active portfolio", "Create new portfolio"],
+                    key="import_mode",
+                    help="Replace overwrites this portfolio only — other "
+                         "portfolios are untouched. Create keeps everything "
+                         "and switches to the new copy.")
+                _imp_new_name = st.text_input(
+                    "New portfolio name", value="Imported",
+                    key="import_new_name") \
+                    if _imp_mode == "Create new portfolio" else ""
+            else:
+                _imp_mode, _imp_new_name = "Replace active portfolio", ""
+            if st.button("Apply import", key="import_apply"):
                 try:
                     _doc = json.load(_uploaded)
                     _imp = validate_portfolio_import(_doc)
@@ -684,32 +1051,80 @@ with st.sidebar:
                 else:
                     # Import REPLACES all state (Programme 176: no merges,
                     # so re-importing can never duplicate ledger entries).
-                    st.session_state.portfolio = _imp.positions
-                    st.session_state.ledger_txns = [
-                        transaction_to_dict(t) for t in _imp.transactions]
-                    st.session_state.watchlist = list(_imp.watchlist)
-                    st.session_state.ledger_cleared = False
-                    if _imp_base := _imp.base_currency:
-                        if _imp_base in SUPPORTED_BASE_CURRENCIES:
+                    _imp_base = _imp.base_currency if (
+                        _imp.base_currency in SUPPORTED_BASE_CURRENCIES
+                    ) else None
+                    _imp_bench = str(
+                        _imp.settings.get("benchmark") or "SPY")
+                    if _imp_mode == "Create new portfolio" and \
+                            st.session_state.get("_db_ok"):
+                        _label = str(_imp_new_name or "").strip() or "Imported"
+                        try:
+                            _c = ws_db.connect(workspace_db_path())
+                            try:
+                                _nip = ws_repo.create_portfolio(
+                                    _c, _label, _imp_base or
+                                    st.session_state.get("base_currency",
+                                                         "USD"),
+                                    _imp_bench, 0.05)
+                                ws_repo.save_workspace(
+                                    _c, _nip.portfolio_id,
+                                    positions=_imp.positions,
+                                    transactions=list(_imp.transactions),
+                                    watchlist=list(_imp.watchlist),
+                                    base_currency=_imp_base,
+                                    benchmark=_imp_bench)
+                                ws_repo.set_active_portfolio_id(
+                                    _c, _nip.portfolio_id)
+                            finally:
+                                _c.close()
+                        except ValueError as e:
+                            st.error(f"Import rejected: {e}")
+                        else:
+                            _workspace_switch_to(_nip.portfolio_id)
+                            flash(f"Imported into new portfolio '{_label}' "
+                                  f"({len(_imp.positions)} positions, "
+                                  f"{len(_imp.transactions)} transactions).",
+                                  "success")
+                            st.rerun()
+                    else:
+                        st.session_state.portfolio = _imp.positions
+                        st.session_state.ledger_txns = [
+                            transaction_to_dict(t)
+                            for t in _imp.transactions]
+                        st.session_state.watchlist = list(_imp.watchlist)
+                        st.session_state.ledger_cleared = False
+                        if _imp_base:
                             st.session_state.base_currency = _imp_base
-                            save_settings({"base_currency": _imp_base})
-                    if _imp.settings.get("benchmark"):
-                        st.session_state.bt_benchmark = str(
-                            _imp.settings["benchmark"])
-                    save_portfolio(st.session_state.portfolio)
-                    st.session_state.data_loaded = False
-                    flash(f"Imported {len(_imp.positions)} positions, "
-                          f"{len(_imp.transactions)} transactions "
-                          f"(base {_imp.base_currency}).", "success")
-                    st.rerun()
+                            _persist_settings_now()
+                        if _imp.settings.get("benchmark"):
+                            st.session_state.bt_benchmark = _imp_bench
+                        _persist_portfolio_now()
+                        st.session_state.data_loaded = False
+                        flash(f"Imported {len(_imp.positions)} positions, "
+                              f"{len(_imp.transactions)} transactions "
+                              f"(base {_imp.base_currency}).", "success")
+                        st.rerun()
 
-        # --- Reset with intentional confirmation ---
-        if st.button("Reset Portfolio", key="reset_start"):
+        # --- Reset with intentional confirmation (active portfolio only) ---
+        _reset_name = "this portfolio"
+        if st.session_state.get("_db_ok"):
+            try:
+                _rc = ws_db.connect(workspace_db_path())
+                try:
+                    _reset_name = ws_repo.get_portfolio(
+                        _rc, st.session_state.get("_ws_pid")).name
+                finally:
+                    _rc.close()
+            except (ValueError, TypeError):
+                pass
+        if st.button(f"Reset '{_reset_name}'", key="reset_start"):
             st.session_state.confirm_reset = True
             st.rerun()
         if st.session_state.get("confirm_reset"):
-            st.warning("Delete ALL positions, transactions, cash and "
-                       "watchlist? This cannot be undone.")
+            st.warning(f"Delete ALL positions, transactions, cash and "
+                       f"watchlist in '{_reset_name}'? Other portfolios are "
+                       "untouched. This cannot be undone.")
             _r1, _r2 = st.columns(2)
             with _r1:
                 if st.button("Confirm reset", key="reset_confirm"):
@@ -717,10 +1132,10 @@ with st.sidebar:
                     st.session_state.ledger_txns = []
                     st.session_state.watchlist = []
                     st.session_state.ledger_cleared = False
-                    save_portfolio(st.session_state.portfolio)
+                    _persist_portfolio_now()
                     st.session_state.confirm_reset = False
                     st.session_state.data_loaded = False
-                    flash("Portfolio reset — positions, ledger and "
+                    flash(f"'{_reset_name}' reset — positions, ledger and "
                           "watchlist removed.", "warning")
                     st.rerun()
             with _r2:
@@ -743,6 +1158,10 @@ with st.sidebar:
             "currency-keyed; negative cash rejected. TWR excludes external "
             "flows; XIRR needs both flow signs. No orders are ever sent.")
 
+
+# Persist sidebar mutations before any early stop below (empty portfolio
+# or market-data failure must not lose the working copy).
+_sync_workspace_to_db()
 
 try:
     tickers = canonical_tickers(list(st.session_state.portfolio.keys()))
@@ -848,6 +1267,7 @@ ledger_cash = _ledger_view["cash"]
 # ---------------------------------------------------------------------------
 
 from data.pipeline import build_live_snapshot, load_previous_closes
+from data.ws_stream import get_stream_manager, overlay_stream_marks
 
 try:
     _prev_closes = load_previous_closes(tuple(tickers))
@@ -862,6 +1282,28 @@ except Exception:
     live_snapshot = {"_status": {"feed": None,
                                  "feed_note": "snapshot unavailable",
                                  "n_symbols": 0, "at": ""}}
+
+# M3 — true streaming overlay: the manager owns one process-wide live
+# connection (holdings + watchlist + Security Detail ticker); fresher
+# stream quotes replace poll marks via the same mark policy, and the
+# stream status lands in the snapshot for the header strip. Any stream
+# failure degrades to the poll snapshot above — never breaks the run.
+try:
+    _stream_mgr = get_stream_manager()
+    _sec_pick = st.session_state.get("security_ticker")
+    _universe = list(tickers) + list(_watch_syms)
+    if _sec_pick and _sec_pick not in _universe:
+        _universe = _universe + [_sec_pick]
+    _stream_status = _stream_mgr.ensure(_universe)
+    live_snapshot = overlay_stream_marks(live_snapshot, _stream_mgr.store)
+    _st = dict(live_snapshot.get("_status", {}))
+    _st["stream_mode"] = _stream_status.get("mode")
+    _st["stream_note"] = _stream_status.get("note")
+    _st["stream_feed"] = _stream_status.get("feed")
+    _st["stream_age_s"] = _stream_status.get("newest_quote_age_s")
+    live_snapshot["_status"] = _st
+except Exception:
+    pass
 
 # Live securities value from marks (native marks × current FX) + cash = NAV.
 # Legacy Yahoo-based valuations above stay untouched for cost/P&L analytics.
@@ -973,17 +1415,57 @@ _h3.metric("Cash", format_money(_cash_base, base_ccy),
            help="Currency-keyed cash from the transaction ledger.")
 _h4.metric("Base Currency", base_ccy)
 _live_note = live_snapshot.get("_status", {}).get("feed_note", "")
+_stream_mode = live_snapshot.get("_status", {}).get("stream_mode", "?")
+_stream_feed = live_snapshot.get("_status", {}).get("stream_feed")
+_stream_age = live_snapshot.get("_status", {}).get("stream_age_s")
+_stream_bit = f" · Stream: {_stream_mode}" + (
+    f" ({str(_stream_feed).upper()})" if _stream_feed else "") + (
+    f" · quote {_stream_age:.0f}s old"
+    if isinstance(_stream_age, (int, float)) else "")
 st.caption(f"Benchmark {str(_header_bench)} · Data through {_header_through} "
-           f"· Live: {_live_note}"
+           f"· Live: {_live_note}{_stream_bit}"
            + (" · Partial marks: " + ", ".join(live_incomplete)
               if live_incomplete else ""))
 st.markdown("---")
 
+
+@st.fragment(run_every=30)
+def _live_status_strip():
+    """Restrained live refresh: this fragment alone reruns every 30s.
+
+    Historical analytics live outside the fragment and never recompute
+    because of quote ticks; only this status line refreshes.
+    """
+    try:
+        _s = get_stream_manager().status()
+        _age_txt = (f"{_s['newest_quote_age_s']:.0f}s old"
+                    if isinstance(_s.get("newest_quote_age_s"),
+                                  (int, float)) else "no quotes yet")
+        _feed_txt = (f" · {str(_s['feed']).upper()}"
+                     if _s.get("feed") else "")
+        st.caption(f"Market data: **{_s['mode']}**{_feed_txt} · "
+                   f"{_age_txt} · {_s.get('note', '')} "
+                   f"({_s.get('n_symbols', 0)} symbols)")
+    except Exception:
+        pass
+
+
+_live_status_strip()
+
 # ---------------------------------------------------------------------------
-# Main tabs
+# Main tabs — M9 navigation audit decision: keep the familiar 9-tab
+# workstation (Overview / Risk / Optimise / Scenario / Performance /
+# Security / Backtest / Factors / Research). A grouped OVERVIEW-PORTFOLIO-
+# RISK-STRATEGY-RESEARCH hierarchy was considered, but the flat tab strip
+# preserves muscle memory, keeps deep links stable, and each tab already
+# groups its own modes internally (Optimise: Classical/Risk-Based/BL/
+# Compare/Plan; Backtest: Historical/OOS/Walk-Forward + Robustness Lab;
+# Scenario: Monte Carlo/Historical stress). Portfolio accounting lives in
+# Overview (Holdings/Transactions/Lots/Cash/Watchlist); saved analyses live
+# in Research with per-view "Save to Research" entry points.
 # ---------------------------------------------------------------------------
 
-tab_overview, tab_risk, tab_optimise, tab_scenario, tab_perf, tab_security, tab_backtest, tab_factors = st.tabs([
+tab_overview, tab_risk, tab_optimise, tab_scenario, tab_perf, tab_security, tab_backtest, tab_factors, tab_research = st.tabs([
     "📈 Overview",
     "⚠️  Risk",
     "🎯 Optimise",
@@ -992,6 +1474,7 @@ tab_overview, tab_risk, tab_optimise, tab_scenario, tab_perf, tab_security, tab_
     "🔍 Security Detail",
     "🧪 Backtest",
     "📐 Factor Analysis",
+    "🔬 Research",
 ])
 
 
@@ -1030,3 +1513,11 @@ with tab_backtest:
 # ============================================================
 with tab_factors:
     render_section("Factor Analysis", views_factors.render, ctx)
+# TAB 9 — RESEARCH LIBRARY (Milestone 8: persistent saved analyses)
+# ============================================================
+with tab_research:
+    render_section("Research", views_research.render, ctx)
+
+# End-of-run persist: ledger auto-migration and in-tab edits (Overview
+# delete) land here; hash-guarded so clean runs are a cheap no-op.
+_sync_workspace_to_db()

@@ -36,6 +36,15 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
+from .constraints import (
+    OptimizationConstraints,
+    budget_total,
+    check_constraints,
+    penalised_objective,
+    risk_budget_objective,
+    slsqp_fragments,
+    validate_risk_budgets,
+)
 from .portfolio import (
     portfolio_expected_return,
     portfolio_std,
@@ -344,22 +353,12 @@ def _alloc_success(
     rf: float,
     message: str = "Converged",
 ) -> AllocationResult:
-    """Build a success result with full diagnostics."""
-    summary = allocation_summary(w, mu, cov, rf, tickers)
-    return AllocationResult(
-        method=method, success=True,
-        weights=pd.Series(np.asarray(w, dtype=float), index=tickers),
-        expected_return=summary["expected_return"],
-        volatility=summary["volatility"],
-        sharpe=summary["sharpe"],
-        diversification_ratio=summary["diversification_ratio"],
-        risk_contributions=summary["risk_contributions"],
-        message=message,
-    )
+    """Build a success result with full diagnostics (no cash sleeve)."""
+    return _alloc_success_cash(method, tickers, w, mu, cov, rf, 0.0, message)
 
 
 def _slsqp_check(
-    res, w: np.ndarray, n: int, min_weight: float, max_weight: float,
+    res, w: np.ndarray, n: int, bounds, total: float,
     label: str,
 ) -> AllocationResult | None:
     """Return a failure result if an SLSQP solve is unusable, else None."""
@@ -368,41 +367,102 @@ def _slsqp_check(
         msg = getattr(res, "message", "?")
         msg = msg if isinstance(msg, str) else str(msg)
         return _alloc_failure(label, f"{label} did not converge: {msg}")
-    if abs(float(w.sum()) - 1.0) > 1e-6:
+    if abs(float(w.sum()) - total) > 1e-6:
         return _alloc_failure(
-            label, f"{label} weights do not sum to 1 (got {float(w.sum()):.6f}).")
-    if np.any(w < min_weight - 1e-9) or np.any(w > max_weight + 1e-9):
+            label, f"{label} weights do not sum to {total:.6f} "
+                   f"(got {float(w.sum()):.6f}).")
+    lo = np.array([b[0] for b in bounds], dtype=float)
+    hi = np.array([b[1] for b in bounds], dtype=float)
+    if np.any(w < lo - 1e-9) or np.any(w > hi + 1e-9):
         return _alloc_failure(label, f"{label} weights violate bounds.")
     return None
 
 
-def _bounds(n: int, min_weight: float, max_weight: float) -> list[tuple]:
-    return [(min_weight, max_weight)] * n
+def _resolve_alloc_constraints(tickers: list[str], n: int,
+                               min_weight: float, max_weight: float,
+                               constraints: OptimizationConstraints | None,
+                               label: str):
+    """Pre-flight shared by the allocation solvers (see optimisation).
 
-
-def _sum_to_one() -> list[dict]:
-    return [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
-
-
-# ---------------------------------------------------------------------------
-# Equal Risk Contribution (risk parity)
-# ---------------------------------------------------------------------------
-
-def _erc_objective(w: np.ndarray, cov_arr: np.ndarray, n: int) -> float:
-    """Sum of squared deviations of percentage risk contributions from 1/N.
-
-    Deliberately *not* inverse-volatility weighting, which coincides with
-    risk parity only when correlations are equal.
+    Returns ``(bounds, extra, total, cash, turnover, problems)``; ``extra``
+    never carries the raw turnover inequality (aux reformulation instead).
     """
-    var = float(w @ cov_arr @ w)
-    if not np.isfinite(var) or var <= 0:
-        return 1e6
-    vol = float(np.sqrt(var))
-    mrc = cov_arr @ w
-    prc = (w * mrc / vol) / vol
-    if not np.all(np.isfinite(prc)):
-        return 1e6
-    return float(((prc - 1.0 / n) ** 2).sum())
+    from .constraints import turnover_reference
+
+    tickers = canonical_tickers(list(tickers))
+    try:
+        problems = check_constraints(tickers, constraints,
+                                     min_weight, max_weight)
+    except ValueError as e:
+        return None, None, 1.0, 0.0, None, [f"{label}: {e}"]
+    if problems:
+        return None, None, 1.0, 0.0, None, \
+            [f"{label}: {p}" for p in problems]
+    try:
+        bounds, extra = slsqp_fragments(tickers, constraints,
+                                        min_weight, max_weight,
+                                        include_turnover=False)
+        total = budget_total(constraints)
+    except ValueError as e:
+        return None, None, 1.0, 0.0, None, [f"{label}: {e}"]
+    turnover = None
+    if constraints is not None and constraints.turnover_limit is not None:
+        try:
+            turnover = (turnover_reference(constraints, n),
+                        float(constraints.turnover_limit))
+        except ValueError as e:
+            return None, None, 1.0, 0.0, None, [f"{label}: {e}"]
+    return bounds, extra, total, 1.0 - total, turnover, []
+
+
+def _run_alloc_solve(fun, n: int, bounds, cons, x0, turnover):
+    """Direct SLSQP, or the kink-free auxiliary form on a turnover cap."""
+    from scipy.optimize import minimize
+
+    if turnover is None:
+        return minimize(fun=fun, x0=np.asarray(x0, dtype=float),
+                        method="SLSQP", bounds=bounds, constraints=cons,
+                        options={"ftol": 1e-12, "maxiter": 1000})
+    from .constraints import solve_with_turnover
+    ref, limit = turnover
+    return solve_with_turnover(fun, n, bounds, cons, ref, limit, x0)
+
+
+def _take_alloc_weights(res, n: int):
+    from .constraints import _take_weights
+    return _take_weights(res, n)
+
+
+def _alloc_success_cash(method: str, tickers: list[str], w: np.ndarray,
+                        mu: np.ndarray, cov: pd.DataFrame, rf: float,
+                        cash: float, message: str = "Converged"
+                        ) -> AllocationResult:
+    """Success result with cash-aware portfolio stats.
+
+    Volatility, diversification ratio and risk contributions describe the
+    risky sleeve (cash carries no risk); expected return and Sharpe include
+    ``cash × rf``. The message states the cash sleeve when present.
+    """
+    summary = allocation_summary(w, mu, cov, rf, tickers)
+    port_ret = float(summary["expected_return"] + cash * rf)
+    vol = float(summary["volatility"])
+    sharpe = float((port_ret - rf) / vol) if vol > 0 else 0.0
+    note = message if cash <= 0 else f"{message} (cash {(cash):.1%})"
+    return AllocationResult(
+        method=method, success=True,
+        weights=pd.Series(np.asarray(w, dtype=float), index=tickers),
+        expected_return=port_ret, volatility=vol, sharpe=sharpe,
+        diversification_ratio=summary["diversification_ratio"],
+        risk_contributions=summary["risk_contributions"], message=note)
+
+
+# ---------------------------------------------------------------------------
+# Equal Risk Contribution (risk parity / custom risk budgets)
+# ---------------------------------------------------------------------------
+
+# NOTE: the ERC objective lives in constraints.risk_budget_objective (the
+# equal-budget special case); inverse-volatility weighting is deliberately
+# not used — it coincides with risk parity only under equal correlations.
 
 
 def equal_risk_contribution(
@@ -412,13 +472,19 @@ def equal_risk_contribution(
     rf: float = 0.05,
     min_weight: float = 0.0,
     max_weight: float = 1.0,
+    budgets: dict | pd.Series | None = None,
+    constraints: OptimizationConstraints | None = None,
 ) -> AllocationResult:
-    """Long-only Equal Risk Contribution portfolio.
+    """Long-only Equal Risk Contribution portfolio (or custom risk budgets).
 
-    Minimises ``Σ(PRC_i − 1/N)²`` subject to budget + bounds, starting from
-    equal weights. On success the percentage risk contributions are
-    approximately equal (within ``ERC_PRCTOL``); otherwise a structured
-    failure is returned instead of misleading weights.
+    Minimises ``Σ(PRC_i − b_i)²`` (``b_i = 1/N`` by default) subject to
+    budget + bounds, starting from equal weights. With ``budgets`` the same
+    solver targets custom risk shares (validated to be non-negative and sum
+    to 1). ``constraints`` adds per-asset bounds, turnover/cost handling,
+    currency caps and a cash target (budgets then apply to the risky sleeve).
+    On success the percentage risk contributions match their targets within
+    ``ERC_PRCTOL``; otherwise a structured failure is returned instead of
+    misleading weights.
     """
     method = "Equal Risk Contribution"
     tickers = canonical_tickers(list(tickers))
@@ -436,33 +502,50 @@ def equal_risk_contribution(
         raise ValueError("Expected returns must be finite with length n.")
     if not np.isfinite(rf):
         raise ValueError(f"Risk-free rate must be finite, got {rf!r}.")
+    if budgets is not None and constraints is not None \
+            and constraints.risk_budgets is not None:
+        return _alloc_failure(
+            method, "Pass risk budgets either directly or via constraints, "
+                    "not both.")
+    merged = budgets if budgets is not None else (
+        constraints.risk_budgets if constraints is not None else None)
+    try:
+        targets = validate_risk_budgets(merged, tickers)
+    except ValueError as e:
+        return _alloc_failure(method, str(e))
+    budget_arr = (targets.values.astype(float) if targets is not None
+                  else np.full(n, 1.0 / n))
+    bounds, extra, total, cash, turnover, problems = \
+        _resolve_alloc_constraints(
+            tickers, n, min_weight, max_weight, constraints, "Risk parity")
+    if problems:
+        return _alloc_failure(method, problems[0])
     cov_arr = cov_df.values
-    w0 = np.ones(n) / n
+    w0 = np.full(n, total / n)
 
     try:
-        res = minimize(
-            fun=lambda w: _erc_objective(w, cov_arr, n),
-            x0=w0,
-            method="SLSQP",
-            bounds=_bounds(n, min_weight, max_weight),
-            constraints=_sum_to_one(),
-            options={"ftol": 1e-12, "maxiter": 1000},
-        )
+        res = _run_alloc_solve(
+            penalised_objective(
+                lambda w: risk_budget_objective(w, cov_arr, budget_arr),
+                constraints, n),
+            n, bounds, extra, w0, turnover)
     except Exception as e:  # never leak solver exceptions
         return _alloc_failure(method, f"Risk-parity optimisation failed: {e}")
 
-    w = np.asarray(res.x, dtype=float)
-    bad = _slsqp_check(res, w, n, min_weight, max_weight, "Risk parity")
+    w = _take_alloc_weights(res, n)
+    if w is None:
+        return _alloc_failure(method, "Risk parity returned unusable weights.")
+    bad = _slsqp_check(res, w, n, bounds, total, "Risk parity")
     if bad is not None:
         return bad
     prc = risk_contributions_simple(w, cov_df, tickers)
-    dev = float(np.abs(prc.values - 1.0 / n).max())
+    dev = float(np.abs(prc.values - budget_arr).max())
     if not np.isfinite(dev) or dev > ERC_PRCTOL:
         return _alloc_failure(
             method,
-            f"Risk parity did not equalise contributions "
+            f"Risk budgeting did not match targets "
             f"(max deviation {dev:.2%} > {ERC_PRCTOL:.0%} tolerance).")
-    return _alloc_success(method, tickers, w, mu_arr, cov_df, rf)
+    return _alloc_success_cash(method, tickers, w, mu_arr, cov_df, rf, cash)
 
 
 # ---------------------------------------------------------------------------
@@ -476,12 +559,15 @@ def maximum_diversification(
     rf: float = 0.05,
     min_weight: float = 0.0,
     max_weight: float = 1.0,
+    constraints: OptimizationConstraints | None = None,
 ) -> AllocationResult:
     """Maximum Diversification portfolio: maximise ``Σwσ / √(w'Σw)``.
 
     Subject to budget + bounds from an equal-weight start. For ordinary
     long-only inputs DR ≥ 1 mathematically; a computed DR below ``1 − tol``
     signals numerical trouble and returns failure rather than a fake result.
+    ``constraints`` adds per-asset bounds, turnover/cost handling, currency
+    caps and a cash target (the ratio is maximised over the risky sleeve).
     """
     method = "Maximum Diversification"
     tickers = canonical_tickers(list(tickers))
@@ -499,6 +585,12 @@ def maximum_diversification(
         raise ValueError("Expected returns must be finite with length n.")
     if not np.isfinite(rf):
         raise ValueError(f"Risk-free rate must be finite, got {rf!r}.")
+    bounds, extra, total, cash, turnover, problems = \
+        _resolve_alloc_constraints(
+            tickers, n, min_weight, max_weight, constraints,
+            "Max diversification")
+    if problems:
+        return _alloc_failure(method, problems[0])
     cov_arr = cov_df.values
     asset_vol = np.sqrt(np.maximum(np.diag(cov_arr), 0.0))
 
@@ -508,21 +600,19 @@ def maximum_diversification(
             return 1e6
         return -float((w @ asset_vol) / np.sqrt(var))
 
-    w0 = np.ones(n) / n
+    w0 = np.full(n, total / n)
     try:
-        res = minimize(
-            fun=neg_dr,
-            x0=w0,
-            method="SLSQP",
-            bounds=_bounds(n, min_weight, max_weight),
-            constraints=_sum_to_one(),
-            options={"ftol": 1e-12, "maxiter": 1000},
-        )
+        res = _run_alloc_solve(
+            penalised_objective(neg_dr, constraints, n),
+            n, bounds, extra, w0, turnover)
     except Exception as e:
         return _alloc_failure(method, f"Max-diversification failed: {e}")
 
-    w = np.asarray(res.x, dtype=float)
-    bad = _slsqp_check(res, w, n, min_weight, max_weight,
+    w = _take_alloc_weights(res, n)
+    if w is None:
+        return _alloc_failure(
+            method, "Max diversification returned unusable weights.")
+    bad = _slsqp_check(res, w, n, bounds, total,
                        "Max diversification")
     if bad is not None:
         return bad
@@ -537,7 +627,7 @@ def maximum_diversification(
             method,
             f"Diversification ratio {dr:.4f} below 1 — numerically "
             "inconsistent for a long-only portfolio.")
-    return _alloc_success(method, tickers, w, mu_arr, cov_df, rf)
+    return _alloc_success_cash(method, tickers, w, mu_arr, cov_df, rf, cash)
 
 
 # ---------------------------------------------------------------------------
@@ -768,12 +858,15 @@ def black_litterman_allocation(
     rf: float = 0.05,
     min_weight: float = 0.0,
     max_weight: float = 1.0,
+    constraints: OptimizationConstraints | None = None,
 ) -> AllocationResult:
     """Constrained mean-variance utility on BL posterior returns.
 
     Maximises ``w'μ_BL − (δ/2)·w'Σw`` subject to budget + bounds from an
     equal-weight start. Structured failure (never fake weights) on any
-    solver/validation problem.
+    solver/validation problem. ``constraints`` adds per-asset bounds,
+    turnover/cost handling, currency caps and a cash target (the posterior
+    utility is maximised over the risky sleeve; stats stay cash-aware).
     """
     method = "Black-Litterman"
     tickers = canonical_tickers(list(tickers))
@@ -794,30 +887,34 @@ def black_litterman_allocation(
         return _alloc_failure(method, "Posterior returns must be finite (length n).")
     if not np.isfinite(rf):
         return _alloc_failure(method, f"Risk-free rate must be finite, got {rf!r}.")
+    bounds, extra, total, cash, turnover, problems = \
+        _resolve_alloc_constraints(
+            tickers, n, min_weight, max_weight, constraints,
+            "Black-Litterman")
+    if problems:
+        return _alloc_failure(method, problems[0])
     cov_arr = cov_df.values
 
     def neg_utility(w: np.ndarray) -> float:
         val = float(w @ mu_arr - (delta / 2.0) * (w @ cov_arr @ w))
         return -val if np.isfinite(val) else 1e6
 
-    w0 = np.ones(n) / n
+    w0 = np.full(n, total / n)
     try:
-        res = minimize(
-            fun=neg_utility,
-            x0=w0,
-            method="SLSQP",
-            bounds=_bounds(n, min_weight, max_weight),
-            constraints=_sum_to_one(),
-            options={"ftol": 1e-12, "maxiter": 1000},
-        )
+        res = _run_alloc_solve(
+            penalised_objective(neg_utility, constraints, n),
+            n, bounds, extra, w0, turnover)
     except Exception as e:
         return _alloc_failure(method, f"BL utility optimisation failed: {e}")
 
-    w = np.asarray(res.x, dtype=float)
-    bad = _slsqp_check(res, w, n, min_weight, max_weight, "Black-Litterman")
+    w = _take_alloc_weights(res, n)
+    if w is None:
+        return _alloc_failure(
+            method, "Black-Litterman returned unusable weights.")
+    bad = _slsqp_check(res, w, n, bounds, total, "Black-Litterman")
     if bad is not None:
         return bad
-    return _alloc_success(method, tickers, w, mu_arr, cov_df, rf)
+    return _alloc_success_cash(method, tickers, w, mu_arr, cov_df, rf, cash)
 
 
 def estimate_risk_aversion_from_benchmark(

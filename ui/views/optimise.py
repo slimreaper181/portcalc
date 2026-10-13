@@ -22,6 +22,22 @@ from analytics.allocation import (
     maximum_diversification,
     simple_returns_from_prices,
 )
+from analytics.constraints import (
+    OptimizationConstraints,
+    check_constraints,
+    max_single_name_shift,
+    turnover_fraction,
+)
+from analytics.estimation import (
+    ESTIMATOR_LABELS,
+    ESTIMATORS,
+    correlation_stability,
+    covariance_diagnostics,
+    estimate_covariance,
+    estimate_mean_returns,
+    estimation_window_slice,
+    ledoit_wolf_shrinkage,
+)
 from analytics.currency import currency_symbol
 from analytics.optimisation import (
     efficient_frontier,
@@ -351,15 +367,70 @@ def render(ctx):
                 "are re-solved here on the same simple basis (their cards above "
                 "use log-return inputs)."
             )
+            r1, r2, r3 = st.columns(3)
+            with r1:
+                risk_model = st.selectbox(
+                    "Risk model",
+                    list(ESTIMATORS), index=0, key="inst_risk_model",
+                    format_func=lambda m: ESTIMATOR_LABELS.get(m, m),
+                    help="Sample preserves all historical results. EWMA reacts "
+                         "faster to recent volatility. Ledoit-Wolf shrinks "
+                         "toward the scaled identity (stable in small samples).")
+            with r2:
+                ewma_lam = st.slider(
+                    "EWMA decay λ", 0.80, 0.99, 0.94, 0.01, key="inst_ewma",
+                    help="Higher λ = longer memory. Applies to EWMA only.",
+                    disabled=(risk_model != "ewma"))
+            with r3:
+                est_window = st.selectbox(
+                    "Estimation window",
+                    ["expanding", "1y", "2y", "3y", "5y"], index=0,
+                    key="inst_window",
+                    help="Trailing window of Base Currency history. Strictly "
+                         "past data only.")
             try:
-                simp_rets = simple_returns_from_prices(prices, tickers)
-                mu_simp = annualised_mean_returns_simple(simp_rets)
-                cov_simp = annualised_covariance_simple(simp_rets)
+                _px = estimation_window_slice(
+                    prices, prices.index[-1] + pd.Timedelta(days=1),
+                    est_window)
+                simp_rets = simple_returns_from_prices(_px, tickers)
+                mu_simp = estimate_mean_returns(simp_rets)
+                cov_simp = estimate_covariance(
+                    simp_rets, method=risk_model, ewma_lambda=float(ewma_lam))
             except ValueError as e:
                 st.error(f"Cannot build simple-return statistics: {e}")
                 simp_ok = False
             else:
                 simp_ok = True
+                _diag = covariance_diagnostics(cov_simp.values)
+                _dcols = st.columns(4)
+                _cond_txt = ("∞" if _diag["cond"] == float("inf")
+                             else ("n/a" if not np.isfinite(_diag["cond"])
+                                   else f"{_diag['cond']:.1f}"))
+                _dcols[0].metric("Condition №", _cond_txt,
+                                 help="Largest/smallest eigenvalue. High = "
+                                      "unstable minimum-variance weights.")
+                _dcols[1].metric("Min eigenvalue", f"{_diag['eig_min']:.2e}")
+                _dcols[2].metric("Max eigenvalue", f"{_diag['eig_max']:.2e}")
+                _dcols[3].metric("Effective rank",
+                                 f"{_diag['effective_rank']:.2f}",
+                                 help="Participation ratio: 1 = concentrated, "
+                                      "N = perfectly spread risk.")
+                _psd_note = ("PSD check passed."
+                             if _diag["psd_ok"] else
+                             "NOT positive semidefinite — allocations below "
+                             "may be unreliable.")
+                if risk_model == "ledoit_wolf":
+                    try:
+                        _sh = ledoit_wolf_shrinkage(simp_rets)
+                        st.caption(f"Risk model: Ledoit-Wolf "
+                                   f"(shrinkage δ={_sh:.2f}) · "
+                                   f"window {est_window} · {_psd_note}")
+                    except ValueError:
+                        st.caption(f"Risk model: Ledoit-Wolf · "
+                                   f"window {est_window} · {_psd_note}")
+                else:
+                    st.caption(f"Risk model: {ESTIMATOR_LABELS[risk_model]} · "
+                               f"window {est_window} · {_psd_note}")
 
             if simp_ok:
                 if opt_mode == "Risk-Based":
@@ -370,9 +441,9 @@ def render(ctx):
                     inst_methods = st.multiselect(
                         "Allocation methods",
                         ["Current", "Equal Weight", "Min Variance", "Max Sharpe",
-                         "Risk Parity", "Max Diversification", "Black-Litterman"],
+                          "Risk Parity", "Max Diversification", "Black-Litterman"],
                         default=["Current", "Equal Weight", "Risk Parity",
-                                 "Max Diversification"],
+                                  "Max Diversification"],
                         key="inst_methods",
                         help="Methods to compare side by side.")
                 bl_cfg, bl_err = None, None
@@ -382,7 +453,141 @@ def render(ctx):
                     if bl_err:
                         st.error(f"Black-Litterman inputs: {bl_err}")
 
+                # ---- Real-world constraints (Milestone 5) ----
+                _ccy_of = {}
+                for _t in tickers:
+                    _inst = (instruments or {}).get(_t)
+                    _nc = getattr(_inst, "native_currency", None)
+                    if _nc:
+                        _ccy_of[_t] = str(_nc).upper()
+                _ccys = sorted(set(_ccy_of.values()))
+                with st.expander("Real-world constraints", expanded=False):
+                    st.caption(
+                        "Practical portfolio design: per-asset bounds, "
+                        "turnover limit (one-way Σ|Δ|/2), cost-averse planning "
+                        "penalty, quote-currency caps, cash target and custom "
+                        "ERC risk budgets. Off = classic theoretical solves.")
+                    use_c = st.checkbox(
+                        "Apply constraints to institutional solves",
+                        value=False, key="inst_use_constraints")
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        to_limit = st.slider(
+                            "Turnover limit (one-way)", 0.0, 1.0, 0.25, 0.01,
+                            format="%.0f%%", key="inst_turnover",
+                            help="Relative to current weights.",
+                            disabled=not use_c)
+                    with c2:
+                        cost_bps = st.number_input(
+                            "Cost-aversion (bps)", min_value=0.0,
+                            max_value=500.0, value=0.0, step=5.0,
+                            key="inst_cost",
+                            help="Planning penalty per unit turnover — not "
+                                 "the exact backtest accounting.",
+                            disabled=not use_c)
+                    with c3:
+                        cash_t = st.slider(
+                            "Cash target", 0.0, 0.5, 0.0, 0.01, format="%.0f%%",
+                            key="inst_cash",
+                            help="Risky weights + cash = 100%.",
+                            disabled=not use_c)
+                    _bdf = pd.DataFrame({
+                        "Ticker": tickers,
+                        "Min": [float(min_w)] * len(tickers),
+                        "Max": [float(max_w)] * len(tickers)})
+                    bounds_ed = st.data_editor(
+                        _bdf, key="inst_bounds", width="stretch",
+                        hide_index=True, disabled=not use_c,
+                        help="Per-asset weight bounds (validated globally).")
+                    ccy_caps: dict = {}
+                    if _ccys and use_c:
+                        st.markdown("**Quote-currency caps** (Base-valued "
+                                    "risky weights)")
+                        _ccols = st.columns(max(len(_ccys), 1))
+                        for _i, _c in enumerate(_ccys):
+                            with _ccols[_i % max(len(_ccols), 1)]:
+                                _cap = st.slider(
+                                    f"{_c} ≤", 0.0, 1.0, 1.0, 0.05,
+                                    format="%.0f%%", key=f"inst_ccy_{_c}")
+                                if _cap < 1.0 - 1e-12:
+                                    ccy_caps[_c] = float(_cap)
+                    budgets = None
+                    if "Risk Parity" in inst_methods:
+                        _eq = 100.0 / len(tickers)
+                        _rdf = pd.DataFrame({
+                            "Ticker": tickers,
+                            "Budget %": [_eq] * len(tickers)})
+                        rb_ed = st.data_editor(
+                            _rdf, key="inst_budgets", width="stretch",
+                            hide_index=True, disabled=not use_c,
+                            help="Custom share of total risk per asset "
+                                 "(must sum to 100%). Equal = classic ERC.")
+                        try:
+                            _bv = pd.to_numeric(
+                                rb_ed["Budget %"],
+                                errors="coerce").values.astype(float) / 100.0
+                            if use_c and np.all(np.isfinite(_bv)) and not np.allclose(
+                                    _bv, 1.0 / len(tickers)):
+                                budgets = dict(zip(tickers, _bv))
+                        except (KeyError, ValueError, TypeError):
+                            budgets = None
+                _inst_c: OptimizationConstraints | None = None
+                if use_c:
+                    try:
+                        _pmin = dict(zip(
+                            bounds_ed["Ticker"].astype(str),
+                            pd.to_numeric(bounds_ed["Min"],
+                                          errors="coerce").astype(float)))
+                        _pmax = dict(zip(
+                            bounds_ed["Ticker"].astype(str),
+                            pd.to_numeric(bounds_ed["Max"],
+                                          errors="coerce").astype(float)))
+                    except (KeyError, ValueError, TypeError):
+                        _pmin, _pmax = {}, {}
+                    _inst_c = OptimizationConstraints(
+                        per_asset_min=_pmin, per_asset_max=_pmax,
+                        turnover_limit=float(to_limit),
+                        turnover_reference=np.asarray(weights, dtype=float),
+                        transaction_cost_bps=float(cost_bps),
+                        cash_target=float(cash_t),
+                        asset_currencies=[_ccy_of.get(t) for t in tickers],
+                        currency_caps=ccy_caps or None,
+                        risk_budgets=budgets)
+                    _cprobs = check_constraints(tickers, _inst_c, min_w, max_w)
+                    for _p in _cprobs:
+                        st.error(f"Constraint conflict — {_p}")
+                    if _cprobs:
+                        st.caption("Solves below still attempt honestly; "
+                                   "infeasible methods fail with messages, "
+                                   "never fallback weights.")
+
+                def _solve_inst(_m: str, _c):
+                    if _m == "Min Variance":
+                        return _optim_to_alloc(
+                            "Min Variance",
+                            min_variance(mu_simp.values, cov_simp.values,
+                                         rf_rate, min_w, max_w,
+                                         constraints=_c, tickers=tickers),
+                            tickers, mu_simp.values, cov_simp, rf_rate)
+                    if _m == "Max Sharpe":
+                        return _optim_to_alloc(
+                            "Max Sharpe",
+                            max_sharpe(mu_simp.values, cov_simp.values,
+                                       rf_rate, min_w, max_w,
+                                       constraints=_c, tickers=tickers),
+                            tickers, mu_simp.values, cov_simp, rf_rate)
+                    if _m == "Risk Parity":
+                        return equal_risk_contribution(
+                            tickers, mu_simp.values, cov_simp, rf_rate,
+                            min_w, max_w, constraints=_c)
+                    if _m == "Max Diversification":
+                        return maximum_diversification(
+                            tickers, mu_simp.values, cov_simp, rf_rate,
+                            min_w, max_w, constraints=_c)
+                    return None
+
                 inst_allocs: dict[str, AllocationResult] = {}
+                inst_plain: dict[str, AllocationResult] = {}
                 if "Current" in inst_methods:
                     inst_allocs["Current"] = _snapshot_alloc(
                         "Current", weights, tickers, mu_simp.values, cov_simp,
@@ -392,26 +597,12 @@ def render(ctx):
                         "Equal Weight", np.ones(len(tickers)) / len(tickers),
                         tickers, mu_simp.values, cov_simp, rf_rate,
                         "Equal weights (1/N).")
-                if "Min Variance" in inst_methods:
-                    inst_allocs["Min Variance"] = _optim_to_alloc(
-                        "Min Variance",
-                        min_variance(mu_simp.values, cov_simp.values, rf_rate,
-                                     min_w, max_w),
-                        tickers, mu_simp.values, cov_simp, rf_rate)
-                if "Max Sharpe" in inst_methods:
-                    inst_allocs["Max Sharpe"] = _optim_to_alloc(
-                        "Max Sharpe",
-                        max_sharpe(mu_simp.values, cov_simp.values, rf_rate,
-                                   min_w, max_w),
-                        tickers, mu_simp.values, cov_simp, rf_rate)
-                if "Risk Parity" in inst_methods:
-                    inst_allocs["Risk Parity"] = equal_risk_contribution(
-                        tickers, mu_simp.values, cov_simp, rf_rate,
-                        min_w, max_w)
-                if "Max Diversification" in inst_methods:
-                    inst_allocs["Max Diversification"] = maximum_diversification(
-                        tickers, mu_simp.values, cov_simp, rf_rate,
-                        min_w, max_w)
+                for _m in ("Min Variance", "Max Sharpe", "Risk Parity",
+                           "Max Diversification"):
+                    if _m in inst_methods:
+                        inst_allocs[_m] = _solve_inst(_m, _inst_c)
+                        if use_c:
+                            inst_plain[_m] = _solve_inst(_m, None)
                 bl_post = None
                 if "Black-Litterman" in inst_methods:
                     if bl_err or bl_cfg is None:
@@ -426,8 +617,40 @@ def render(ctx):
                         bl_post, bl_alloc = _run_bl_pipeline(
                             tickers, cov_simp, bl_cfg["ref"], weights,
                             bl_cfg["delta"], bl_cfg["tau"], bl_cfg["views"],
-                            rf_rate, min_w, max_w)
+                            rf_rate, min_w, max_w, constraints=_inst_c)
                         inst_allocs["Black-Litterman"] = bl_alloc
+                if use_c and inst_plain:
+                    st.markdown("#### Before / After Constraints")
+                    _w0 = np.asarray(weights, dtype=float)
+                    _brows = []
+                    for _m, _pa in inst_plain.items():
+                        _ca = inst_allocs.get(_m)
+                        if _pa is None or not _pa.success \
+                                or _ca is None or not _ca.success:
+                            _brows.append({
+                                "Method": _m,
+                                "Unconstrained Vol": (
+                                    f"{_pa.volatility:.2%}"
+                                    if _pa is not None and _pa.success
+                                    else "failed"),
+                                "Constrained Vol": (
+                                    f"{_ca.volatility:.2%}"
+                                    if _ca is not None and _ca.success
+                                    else "failed"),
+                                "Turnover vs Current": "n/a",
+                                "Max Shift": "n/a"})
+                            continue
+                        _cw = _ca.weights.values.astype(float)
+                        _brows.append({
+                            "Method": _m,
+                            "Unconstrained Vol": f"{_pa.volatility:.2%}",
+                            "Constrained Vol": f"{_ca.volatility:.2%}",
+                            "Turnover vs Current":
+                                f"{turnover_fraction(_cw, _w0):.2%}",
+                            "Max Shift":
+                                f"{max_single_name_shift(_cw, _w0):.2%}"})
+                    st.dataframe(pd.DataFrame(_brows).set_index("Method"),
+                                 width="stretch")
 
                 for _m, _a in inst_allocs.items():
                     if not _a.success:
@@ -461,6 +684,123 @@ def render(ctx):
                     st.caption(
                         "RC Dispersion is the std of percentage risk contributions "
                         "(near zero = evenly spread risk, the risk-parity ideal).")
+
+                    # ---- Save to Research (Milestone 8: optimisation) ----
+                    try:
+                        from ui.views.research import save_analysis_button
+                        _opt_methods = [
+                            {"Current": "current",
+                             "Equal Weight": "equal_weight",
+                             "Min Variance": "min_variance",
+                             "Max Sharpe": "max_sharpe",
+                             "Risk Parity": "erc",
+                             "Max Diversification": "max_diversification",
+                             "Black-Litterman": "black_litterman"}.get(
+                                m, m) for m in ok_allocs]
+                        _opt_cfg = {
+                            "tickers": list(tickers),
+                            "methods": _opt_methods,
+                            "risk_model": str(risk_model),
+                            "ewma_lambda": float(ewma_lam),
+                            "window": str(est_window),
+                            "min_w": float(min_w),
+                            "max_w": float(max_w),
+                            "rf": float(rf_rate),
+                            "base_ccy": str(base_ccy),
+                        }
+                        _opt_res: dict = {"methods": {}}
+                        for _m, _a in ok_allocs.items():
+                            try:
+                                _w = np.asarray(
+                                    _a.weights.values, dtype=float)
+                                _opt_res["methods"][_m] = {
+                                    "success": True,
+                                    "weights": {
+                                        t: float(x)
+                                        for t, x in zip(tickers, _w)},
+                                    "metrics": {
+                                        "expected_return": float(
+                                            _a.expected_return),
+                                        "volatility": float(_a.volatility),
+                                        "sharpe": float(_a.sharpe)}}
+                            except (ValueError, TypeError, AttributeError):
+                                continue
+                        save_analysis_button(
+                            "optimisation", _opt_cfg, _opt_res,
+                            key="opt_save",
+                            label="Save to Research")
+                    except Exception:
+                        pass
+
+                    with st.expander("Estimator comparison (same portfolio)",
+                                     expanded=False):
+                        st.caption(
+                            "Same Base Currency returns, three risk models: "
+                            "portfolio volatility plus MinVar / ERC / MaxDiv "
+                            "weights re-solved per estimator. Means are "
+                            "identical (sample mean throughout).")
+                        try:
+                            _cmp_rows: dict = {}
+                            _cmp_w: dict = {}
+                            for _em in ESTIMATORS:
+                                _cc = estimate_covariance(
+                                    simp_rets, method=_em,
+                                    ewma_lambda=float(ewma_lam))
+                                _pv = float(np.sqrt(max(
+                                    float(weights @ _cc.values @ weights),
+                                    0.0)))
+                                _mv = min_variance(
+                                    mu_simp.values, _cc.values, rf_rate,
+                                    min_w, max_w)
+                                _er = equal_risk_contribution(
+                                    tickers, mu_simp.values, _cc, rf_rate,
+                                    min_w, max_w)
+                                _md = maximum_diversification(
+                                    tickers, mu_simp.values, _cc, rf_rate,
+                                    min_w, max_w)
+                                _cmp_rows[ESTIMATOR_LABELS[_em]] = {
+                                    "Portfolio Vol":
+                                        f"{_pv:.2%}",
+                                    "MinVar Vol":
+                                        (f"{_mv.volatility:.2%}"
+                                         if _mv.success else "failed"),
+                                    "ERC Vol":
+                                        (f"{_er.volatility:.2%}"
+                                         if _er.success else "failed"),
+                                    "MaxDiv Vol":
+                                        (f"{_md.volatility:.2%}"
+                                         if _md.success else "failed"),
+                                }
+                                if _mv.success and _mv.weights is not None:
+                                    _cmp_w[ESTIMATOR_LABELS[_em]] = (
+                                        pd.Series(
+                                            np.asarray(_mv.weights,
+                                                       dtype=float),
+                                            index=tickers))
+                            st.dataframe(pd.DataFrame(_cmp_rows).T,
+                                         width="stretch")
+                            if _cmp_w:
+                                st.caption("MinVar weights by estimator")
+                                st.dataframe(
+                                    pd.DataFrame(_cmp_w).T.style.format(
+                                        "{:.1%}"),
+                                    width="stretch")
+                        except ValueError as e:
+                            st.warning(f"Estimator comparison unavailable: {e}")
+
+                        try:
+                            if len(simp_rets) >= 520:
+                                _stab = correlation_stability(
+                                    simp_rets.iloc[-252:], simp_rets)
+                                st.caption(
+                                    "Correlation stability — trailing 1y vs "
+                                    "full window: Frobenius "
+                                    f"{_stab['frob']:.3f} · max |Δ| "
+                                    f"{_stab['max_abs']:.3f} · mean |Δ| "
+                                    f"{_stab['mean_abs']:.3f}. Descriptive "
+                                    "only — not a recommendation.")
+                        except ValueError:
+                            pass
 
                     if opt_mode == "Compare":
                         st.markdown("#### Weight Comparison Chart")
@@ -692,6 +1032,159 @@ def render(ctx):
                             "Order intents are descriptive research objects "
                             f"({len(_plan.intents)} legs). No execution, no "
                             "broker calls.")
+                        with st.expander("Execution simulation "
+                                         "(hypothetical fills)",
+                                         expanded=False):
+                            from analytics.execution import (
+                                SimConfig, SimQuote, apply_fills_sandbox,
+                                blotter_frame, cost_comparison,
+                                orders_from_intents, simulate_specs,
+                                simulation_summary)
+                            st.warning("SIMULATION ONLY — NO BROKER ORDERS "
+                                       "SENT. Fills are hypothetical.")
+                            s1, s2, s3, s4 = st.columns(4)
+                            with s1:
+                                _otype = st.selectbox(
+                                    "Order type", ["MARKET", "LIMIT"],
+                                    key="sim_otype",
+                                    help="LIMIT needs a price per leg below.")
+                            with s2:
+                                _slip = st.number_input(
+                                    "Slippage (bps)", min_value=0.0,
+                                    max_value=1000.0, value=5.0, step=1.0,
+                                    key="sim_slip")
+                            with s3:
+                                _cbps2 = st.number_input(
+                                    "Commission (bps)", min_value=0.0,
+                                    max_value=1000.0, value=0.0, step=1.0,
+                                    key="sim_cbps")
+                            with s4:
+                                _cflat = st.number_input(
+                                    "Commission flat (base)", min_value=0.0,
+                                    value=0.0, step=1.0, key="sim_cflat")
+                            try:
+                                _specs = orders_from_intents(
+                                    _plan.intents, order_type=_otype)
+                            except ValueError as e:
+                                st.error(f"Order specs: {e}")
+                                _specs = []
+                            _limits: dict = {}
+                            if _otype == "LIMIT" and _specs:
+                                st.caption("Limit prices (base per share).")
+                                _lcols = st.columns(max(1, len(_specs)))
+                                for _lc, _sp in zip(_lcols, _specs):
+                                    _def = None
+                                    _snap = (live_snapshot.get(
+                                        _sp["ticker"], {}) or {})
+                                    for _k in ("ask" if _sp["side"] == "BUY"
+                                               else "bid", "mark", "last"):
+                                        _v = _snap.get(_k)
+                                        if _v is not None and np.isfinite(
+                                                float(_v)):
+                                            _def = float(_v)
+                                            break
+                                    with _lc:
+                                        _limits[_sp["ticker"]] = st.number_input(
+                                            f"{_sp['ticker']} limit",
+                                            min_value=0.0,
+                                            value=float(_def or 0.0),
+                                            step=1.0,
+                                            key=f"sim_lim_{_sp['ticker']}")
+                                try:
+                                    _specs = orders_from_intents(
+                                        _plan.intents, order_type="LIMIT",
+                                        limits=_limits)
+                                except ValueError as e:
+                                    st.error(f"Limit specs: {e}")
+                                    _specs = []
+                            if _specs:
+                                _quotes = {}
+                                for _sp in _specs:
+                                    _snap = (live_snapshot.get(
+                                        _sp["ticker"], {}) or {})
+                                    _quotes[_sp["ticker"]] = SimQuote(
+                                        bid=_snap.get("bid"),
+                                        ask=_snap.get("ask"),
+                                        last=_snap.get("last"))
+                                try:
+                                    _orders = simulate_specs(
+                                        _specs, _quotes,
+                                        SimConfig(
+                                            slippage_bps=float(_slip),
+                                            commission_bps=float(_cbps2),
+                                            commission_flat=float(_cflat)))
+                                except ValueError as e:
+                                    st.error(f"Simulation: {e}")
+                                    _orders = []
+                                if _orders:
+                                    st.markdown("#### Blotter")
+                                    st.dataframe(
+                                        blotter_frame(_orders),
+                                        width="stretch", hide_index=True)
+                                    _sum = simulation_summary(_orders)
+                                    f1, f2, f3 = st.columns(3)
+                                    f1.metric(
+                                        "Filled",
+                                        f"{_sum['n_filled']}/{_sum['n_orders']}"
+                                        + (f" (+{_sum['n_partial']} partial)"
+                                           if _sum["n_partial"] else ""))
+                                    f2.metric("Simulated friction",
+                                              fmt_usd(_sum["total_friction"]),
+                                              help="Slippage + commissions.")
+                                    try:
+                                        _not = sum(
+                                            abs(float(_sp["quantity"])) * float(
+                                                _share_px.get(_sp["ticker"],
+                                                              0.0))
+                                            for _sp in _specs)
+                                        _cc = cost_comparison(
+                                            _sum["total_friction"],
+                                            float(_cbps), max(_not, 1e-9))
+                                        f3.metric(
+                                            "Modelled cost",
+                                            fmt_usd(_cc["modelled"]),
+                                            help="Planner assumption at "
+                                                 f"{float(_cbps):g} bps.")
+                                        st.caption(
+                                            f"Cost comparison — simulated "
+                                            f"{fmt_usd(_cc['simulated'])} vs "
+                                            f"modelled {fmt_usd(_cc['modelled'])} "
+                                            f"(Δ {fmt_usd(_cc['difference'])} on "
+                                            f"{fmt_usd(_cc['notional'])} notional). "
+                                            f"Both are estimates.")
+                                    except ValueError:
+                                        pass
+                                    if st.button(
+                                            "Apply fills to sandbox "
+                                            "(research copy)",
+                                            key="sim_sandbox"):
+                                        _hold = {
+                                            t: float(_cw[i]) * float(
+                                                portfolio_value) / float(
+                                                    _share_px.get(t, 1.0) or 1.0)
+                                            for i, t in enumerate(tickers)}
+                                        _nh, _nc = apply_fills_sandbox(
+                                            _hold, float(_pcash), _orders,
+                                            _share_px)
+                                        st.session_state["sim_sandbox"] = {
+                                            "holdings": _nh, "cash": _nc}
+                                    _sb = st.session_state.get("sim_sandbox")
+                                    if _sb:
+                                        st.caption(
+                                            "Sandbox holdings (research copy — "
+                                            "the real ledger is untouched).")
+                                        st.dataframe(
+                                            pd.DataFrame({
+                                                "Ticker": tickers,
+                                                "Sandbox Shares": [
+                                                    _sb["holdings"].get(t, 0.0)
+                                                    for t in tickers]}),
+                                            width="stretch", hide_index=True)
+                                        st.caption(
+                                            f"Sandbox cash: "
+                                            f"{fmt_usd(_sb['cash'])}.")
+                            else:
+                                st.caption("No actionable legs to simulate.")
 
 
     # ============================================================

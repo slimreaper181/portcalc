@@ -35,6 +35,7 @@ from data.pipeline import (
 )
 from ui.formatting import fmt_pct, fmt_usd, style_matrix
 from ui.feedback import flash
+from ui.views import accounting as views_accounting
 from ui.theme import CHART_THEME
 
 
@@ -550,76 +551,9 @@ def render(ctx):
         except (ValueError, KeyError, TypeError) as e:
             st.info(f"Live risk snapshot unavailable: {e}")
 
-    # ---- Transactions & open lots ----
+    # ---- Transactions & open lots (Accounting 2.0 surface) ----
     with st.expander("Transactions & Open Lots", expanded=False):
-        _tx_all = [t for t in (st.session_state.get("ledger_txns") or [])
-                   if isinstance(t, dict)]
-        if not _tx_all:
-            st.caption("No ledger transactions yet — record one in the "
-                       "sidebar, or add a holding (auto-migrated).")
-        else:
-            _f1, _f2 = st.columns(2)
-            with _f1:
-                _ft = st.selectbox(
-                    "Ticker filter", ["All"] + sorted(
-                        {str(t.get("ticker") or "") for t in _tx_all
-                         if t.get("ticker")}),
-                    key="ov_tx_ticker")
-            with _f2:
-                _fy = st.selectbox(
-                    "Type filter",
-                    ["All", "BUY", "SELL", "DIVIDEND", "FEE", "DEPOSIT",
-                     "WITHDRAWAL", "INTEREST"],
-                    key="ov_tx_type")
-            _rows = []
-            for _d in sorted(_tx_all,
-                             key=lambda d: (str(d.get("date", "")),
-                                            str(d.get("transaction_id", "")))):
-                if _ft != "All" and _d.get("ticker") != _ft:
-                    continue
-                if _fy != "All" and _d.get("type") != _fy:
-                    continue
-                _rows.append({
-                    "Date": str(_d.get("date", ""))[:10],
-                    "Type": _d.get("type"), "Ticker": _d.get("ticker") or "—",
-                    "Qty": _d.get("quantity"), "Price": _d.get("price_native"),
-                    "Ccy": _d.get("currency"), "Fee": _d.get("fee"),
-                    "Src": _d.get("source"),
-                })
-            st.dataframe(pd.DataFrame(_rows), width="stretch",
-                         hide_index=True)
-            st.caption("Delete corrects the ledger (derived lots/P&L/cash "
-                       "rebuild deterministically; never hand-edited).")
-            for _d in _tx_all:
-                _tid = str(_d.get("transaction_id", ""))
-                if st.button(f"Delete {_d.get('date','')} "
-                             f"{_d.get('type','')} {_tid[:6]}…",
-                             key=f"tx_del_{_tid}"):
-                    st.session_state.ledger_txns = [
-                        x for x in st.session_state.ledger_txns
-                        if not (isinstance(x, dict)
-                                and x.get("transaction_id") == _tid)]
-                    flash("Transaction deleted — ledger rebuilt.", "info")
-                    st.rerun()
-        if ledger_state is not None and ledger_state.open_lots:
-            st.markdown("#### Open Lots")
-            for _t in tickers:
-                _lots = [l for l in ledger_state.open_lots
-                         if l.ticker == _t]
-                if not _lots:
-                    continue
-                with st.expander(f"{_t} — {len(_lots)} lot(s)",
-                                 expanded=False):
-                    _lrows = [{
-                        "Bought": l.purchase_date.isoformat()
-                        if hasattr(l.purchase_date, "isoformat") else "—",
-                        "Shares": round(l.shares_remaining, 6),
-                        f"Cost ({l.native_currency})":
-                            round(l.cost_basis_native, 2),
-                        "Source": l.source,
-                    } for l in _lots]
-                    st.dataframe(pd.DataFrame(_lrows), width="stretch",
-                                 hide_index=True)
+        views_accounting.render_ledger_section(ctx)
 
     # ---- Watchlist (marks only — never holdings/P&L) ----
     _wl = [w for w in (st.session_state.get("watchlist") or [])
@@ -755,6 +689,124 @@ def render(ctx):
             file_name=f"{_snap['run_id']}.json", mime="application/json",
             key="dl_snap")
         st.caption(f"Run ID {_snap['run_id']} · inputs only, no secrets.")
+
+    # ---- Institutional report (Milestone 9: printable HTML, no secrets) ----
+    with st.expander("Institutional Report (HTML, print-ready)", expanded=False):
+        st.caption("Self-contained HTML for print/PDF via the browser. "
+                   "Point-in-time marks with stated sources — never claimed "
+                   "real-time. No credentials are ever embedded.")
+        try:
+            from analytics.report import build_report_html as _build_html
+            _pname = "Portfolio"
+            _analyses_refs: list = []
+            try:
+                if st.session_state.get("_db_ok"):
+                    from storage import database as _rdb
+                    from storage import repositories as _rrepo
+                    from storage.database import workspace_db_path as _rpath
+                    _rc = _rdb.connect(_rpath())
+                    try:
+                        _pid0 = st.session_state.get("_ws_pid")
+                        if _pid0:
+                            _pname = _rrepo.get_portfolio(_rc, _pid0).name
+                            for _a in _rrepo.list_analyses(_rc, _pid0)[:20]:
+                                _analyses_refs.append({
+                                    "name": _a.name, "type": _a.type,
+                                    "created": str(_a.created_at)[:19],
+                                    "last_run": str(_a.updated_at)[:19],
+                                    "tags": _a.tags or ""})
+                    finally:
+                        _rc.close()
+            except Exception:
+                pass
+            _cash_b = 0.0
+            for _ccy, _bal in (ledger_cash or {}).items():
+                _r = (ccy.get("fx_now", {}) or {}).get(_ccy)
+                if _r is not None and np.isfinite(float(_r)) \
+                        and float(_r) > 0:
+                    _cash_b += float(_bal) * float(_r)
+            _nav_now = float(portfolio_nav) if portfolio_nav else 0.0
+            _h_rows = []
+            for _v in valuations:
+                _mk = (live_snapshot.get(_v.ticker, {}) or {}).get("mark")
+                _h_rows.append({
+                    "ticker": _v.ticker, "shares": f"{_v.shares:g}",
+                    "mark": (f"{float(_mk):,.2f}"
+                             if _mk is not None else "—"),
+                    "value": f"{_v.base_market_value:,.2f}",
+                    "weight": (f"{val_agg['weights'].get(_v.ticker, 0.0):.1%}"),
+                    "pnl": (f"{_v.unrealised_pnl:+,.2f}"
+                            if _v.unrealised_pnl is not None else "—"),
+                    "currency": _v.native_currency})
+            _pnl_block: dict = {}
+            try:
+                if ledger_state is not None:
+                    _real = sum(
+                        e.realised_pnl_base for e in ledger_state.realised
+                        if e.realised_pnl_base is not None)
+                    _div = (ledger_state.dividend_income_base or 0.0) + \
+                        (ledger_state.interest_income_base or 0.0)
+                    _fee = ledger_state.fees_paid_base or 0.0
+                    _unr0 = val_agg.get("total_pnl")
+                    _pnl_block = {
+                        "unrealised": (f"{float(_unr0):,.2f}"
+                                       if _unr0 is not None else "—"),
+                        "realised": f"{float(_real):,.2f}",
+                        "income": f"{float(_div):,.2f}",
+                        "fees": f"{float(_fee):,.2f}",
+                        "total": "see Overview P&L",
+                        "net_flows": "see ledger"}
+            except Exception:
+                _pnl_block = {}
+            _risk_block: dict = {}
+            try:
+                from analytics.var import to_daily as _to_d
+                _var_pct = 1.645 * float(_to_d(port_vol)) \
+                    if port_vol and np.isfinite(float(port_vol)) else None
+                _risk_block = {
+                    "volatility": f"{float(port_vol):.2%}",
+                    "sharpe": f"{float(port_sharpe):.2f}",
+                    "var_95_1d": (f"{_var_pct * _nav_now:,.2f} {base_ccy}"
+                                   if _var_pct is not None else "—"),
+                    "max_drawdown": "see Performance",
+                    "note": ("Historical estimates combined with live "
+                             "exposure; no covariance refit on ticks.")}
+            except Exception:
+                _risk_block = {}
+            try:
+                _through = prices.index[-1].date().isoformat()
+            except Exception:
+                _through = None
+            _feed_note = ""
+            try:
+                _feed_note = (live_snapshot.get("_status", {}) or {}).get(
+                    "feed_note", "")
+            except Exception:
+                pass
+            _payload = {
+                "portfolio_name": _pname, "base_ccy": base_ccy,
+                "benchmark": st.session_state.get("bt_benchmark", "SPY"),
+                "data_through": _through, "fx_through": _through,
+                "freshness_note": (
+                    f"Marks are point-in-time ({_feed_note or 'stated feed'}); "
+                    "historical analytics through "
+                    f"{_through or 'stated date'}. Nothing is real-time."),
+                "nav": f"{_nav_now:,.2f} {base_ccy}",
+                "cash_base": f"{_cash_b:,.2f} {base_ccy}",
+                "day_pnl": (f"{float(day_pnl_base):+,.2f} {base_ccy}"
+                            if day_pnl_base is not None else "—"),
+                "n_positions": len(tickers),
+                "holdings": _h_rows, "pnl": _pnl_block,
+                "risk": _risk_block, "analyses": _analyses_refs,
+                "notes": "Generated from the current workspace state.",
+            }
+            _html = _build_html(_payload)
+            st.download_button(
+                "Download Institutional Report (HTML)",
+                data=_html, file_name="portcalc-report.html",
+                mime="text/html", key="dl_report")
+        except Exception as e:
+            st.warning(f"Report unavailable: {e}")
 
     st.markdown("---")
 

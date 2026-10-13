@@ -88,6 +88,18 @@ def test_insights_capped_ordered_and_advice_free():
     assert build_insights(None) == []
 
 
+def test_insights_advice_guard_raises_without_assert():
+    # Audit regression: the advice screen must raise ValueError (production
+    # invariant), never rely on `assert` (stripped under `python -O`).
+    from ui.insights import _assert_no_advice
+    _assert_no_advice("NVDA is 35% of capital.")
+    with pytest.raises(ValueError):
+        _assert_no_advice("You should buy NVDA now.")
+    import ui.insights as _ins
+    with pytest.raises(ValueError):
+        _ins._assert_no_advice("Strong buy signal detected.")
+
+
 def test_insights_cash_day_attribution_drag():
     out = build_insights({"cash_weight": 0.18, "day_pnl": 120.0,
                           "nav": 10000.0, "top_contributor": "NVDA",
