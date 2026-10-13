@@ -79,7 +79,10 @@ def render(ctx):
     portfolio_nav = ctx.get("portfolio_nav")
     day_pnl_base = ctx.get("day_pnl_base")
 
-    st.markdown("## Portfolio Overview")
+    from ui.theme import metric_strip as _strip
+    from ui.theme import page_header as _header
+    _header("PORTFOLIO OVERVIEW", "Portfolio Overview",
+            "Positions, valuation, ledger P&L and allocation at a glance.")
 
     # History period selector lives here
     hist_col, _ = st.columns([2, 8])
@@ -272,12 +275,15 @@ def render(ctx):
         _total = ((_unr_tot or 0.0) + _real_tot + _div_tot - _fee_tot
                   if _unr_tot is not None else None)
         st.markdown("### Investment P&L (ledger basis, live marks)")
-        p1, p2, p3, p4, p5 = st.columns(5)
-        p1.metric("Unrealised", fmt_usd(_unr_tot) if _unr_known else "—")
-        p2.metric("Realised", fmt_usd(_real_tot))
-        p3.metric("Income", fmt_usd(_div_tot))
-        p4.metric("Fees", fmt_usd(-_fee_tot))
-        p5.metric("Total", fmt_usd(_total) if _total is not None else "—")
+        _strip([
+            ("Unrealised", fmt_usd(_unr_tot) if _unr_known else "—",
+             "open lots at live marks"),
+            ("Realised", fmt_usd(_real_tot), "closed FIFO lots"),
+            ("Income", fmt_usd(_div_tot), "dividends + interest"),
+            ("Fees", fmt_usd(-_fee_tot), "reduces the total"),
+            ("Total", fmt_usd(_total) if _total is not None else "—",
+             "excl. external flows"),
+        ])
         st.caption(
             "Unrealised from open lots at live marks; realised from closed "
             "FIFO lots; income = recorded dividends + interest; fees reduce "

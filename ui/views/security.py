@@ -51,7 +51,9 @@ def render(ctx):
     ledger_state = ctx.get("ledger_state")
     watchlist = ctx.get("watchlist", [])
 
-    st.markdown("## Security Detail")
+    from ui.theme import page_header as _header
+    _header("SECURITY TERMINAL", "Security Detail",
+            "Quote, position, lots, risk relationship and history.")
 
     _choices = list(tickers) + [w for w in (watchlist or [])
                                 if w not in tickers]

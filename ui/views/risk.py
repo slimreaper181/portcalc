@@ -34,7 +34,10 @@ def render(ctx):
     weights = ctx["weights"]
     ccy = ctx["ccy"]
 
-    st.markdown("## Risk Analysis")
+    from ui.theme import metric_strip as _strip
+    from ui.theme import page_header as _header
+    _header("RISK ANALYTICS", "Risk Analysis",
+            "Value-at-risk, expected shortfall and the shape of tail risk.")
 
     r_col1, r_col2 = st.columns([1, 3])
 
@@ -71,10 +74,20 @@ def render(ctx):
         var_mc, mc_sim_rets = None, None
         st.error(f"Monte Carlo VaR error: {e}")
 
+    _strip([
+        ("Parametric VaR · 95%",
+         fmt_usd(var_param) if var_param is not None else "n/a",
+         f"{int(var_horizon)}d · normal assumption"),
+        ("Historical VaR · 95%",
+         fmt_usd(var_hist) if var_hist is not None else "n/a",
+         f"{int(var_horizon)}d · rolling windows"),
+        ("Monte Carlo VaR · 95%",
+         fmt_usd(var_mc) if var_mc is not None else "n/a",
+         f"{int(var_horizon)}d · 10,000 paths"),
+    ])
     v1, v2, v3 = st.columns(3)
     with v1:
         st.markdown("#### Parametric VaR")
-        st.metric("95% VaR", fmt_usd(var_param) if var_param is not None else "n/a")
         st.caption(
             "Assumes normally distributed returns. "
             f"At 95% confidence over {int(var_horizon)}d, potential loss ≤ "
@@ -82,7 +95,6 @@ def render(ctx):
         )
     with v2:
         st.markdown("#### Historical VaR")
-        st.metric("95% VaR", fmt_usd(var_hist) if var_hist is not None else "n/a")
         if var_hist is None:
             st.caption(f"Historical VaR unavailable: {hist_err}")
         else:
@@ -94,7 +106,6 @@ def render(ctx):
             )
     with v3:
         st.markdown("#### Monte Carlo VaR")
-        st.metric("95% VaR", fmt_usd(var_mc) if var_mc is not None else "n/a")
         st.caption(
             "10,000 simulated return paths using multivariate normal. "
             "Log returns are converted to simple P&L via exp(r)−1. "

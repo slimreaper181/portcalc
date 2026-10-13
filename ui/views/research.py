@@ -107,7 +107,10 @@ def _current_panels(tickers: list[str], base_ccy: str) -> dict:
 def render(ctx):
     """Render the Research tab from the shared context."""
     base_ccy = ctx.get("base_ccy", "USD")
-    st.markdown("## Research Library")
+    from ui.theme import page_header as _header
+    from ui.theme import tags_row as _tags_row
+    _header("RESEARCH WORKSPACE", "Research Library",
+            "Saved analyses persist per portfolio — rerun, compare, review.")
     st.caption("Saved analyses persist per portfolio (SQLite). Re-runs use "
                "current market data — Saved vs Recomputed stay distinct until "
                "you explicitly overwrite.")
@@ -143,6 +146,10 @@ def render(ctx):
     by_name = {r.name: r for r in rows}
     pick = st.selectbox("Open analysis", list(by_name), key="rs_open")
     row = by_name[pick]
+    _tags_row(parse_tags(row.tags or ""))
+    st.caption(f"{ANALYSIS_LABELS.get(row.type, row.type)} · "
+               f"Created {str(row.created_at)[:19]} · "
+               f"Last run {str(row.updated_at)[:19]}")
     try:
         config = json.loads(row.config_json or "{}")
         result = json.loads(row.result_json or "{}")

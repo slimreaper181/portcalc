@@ -122,7 +122,10 @@ def render(ctx):
     instruments = ctx.get("instruments", {})
     current_prices = ctx.get("current_prices", {})
 
-    st.markdown("## Portfolio Optimisation")
+    from ui.theme import page_header as _header
+    _header("PORTFOLIO CONSTRUCTION", "Portfolio Optimisation",
+            "Classical, risk-based and views-based allocations with "
+            "real-world constraints.")
 
     mu_arr  = mu.values
     cov_arr = cov.values

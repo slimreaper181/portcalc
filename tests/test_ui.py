@@ -153,3 +153,63 @@ def test_theme_tokens_stable():
     assert len(CHART_THEME) > 0
     t["accent"] = "neon"
     assert tokens()["accent"] != "neon"  # registry immutable via copy
+
+
+def test_appearance_modes_and_validation():
+    from ui.theme import (get_appearance, set_appearance, tokens,
+                          _apply_chart_mode)
+    from ui import theme as _th
+    assert get_appearance() == "light"  # safe default outside a session
+    with pytest.raises(ValueError):
+        set_appearance("neon")
+    assert set_appearance("dark") == "dark"
+    assert set_appearance("light") == "light"
+    try:
+        light, dark = tokens("light"), tokens("dark")
+        for key in ("background", "surface", "surface_elevated",
+                    "text_primary", "text_secondary", "border",
+                    "accent", "accent_soft", "success", "warning", "danger",
+                    "info"):
+            assert light[key].startswith("#") or \
+                light[key].startswith("rgba"), key
+            assert dark[key]
+        for key in ("shadow_sm", "shadow_md", "radius_sm", "radius_lg"):
+            assert light[key] and dark[key]
+        assert light["background"] != dark["background"]
+        assert light["accent"] != dark["accent"]
+        _apply_chart_mode("dark")
+        assert len(_th.CHART_THEME) > 0
+        assert len(_th.CHART_COLORS) == 8
+        dark_font = _th.CHART_THEME["font"]["color"]
+        _apply_chart_mode("light")
+        assert _th.CHART_THEME["font"]["color"] != dark_font
+        assert len(_th.CHART_THEME) > 0
+    finally:
+        _apply_chart_mode("light")  # never leak dark globals into other tests
+
+
+def test_pill_helpers_are_pure_and_escaped():
+    from ui.theme import pill, status_pill, tag_pill
+    assert "pc-pill-accent" in pill("LIVE", "live")
+    assert "pc-pill-warn" in status_pill("STALE")
+    assert "pc-pill-info" in status_pill("FALLBACK")
+    assert "<script>" not in pill('<script>alert(1)</script>', "live")
+    assert "&lt;script&gt;" in tag_pill('<script>x</script>')
+
+
+def test_appearance_key_survives_portfolio_switch():
+    # The toggle must persist across tabs AND portfolios: the switch
+    # routine must never pop the appearance key, and no analytical cache
+    # key may depend on it (display-only choice).
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parent.parent
+    app_src = root.joinpath("app.py").read_text(encoding="utf-8")
+    assert "appearance_selector" in app_src  # toggle exists in the shell
+    m = re.search(r"def _workspace_switch_to.*?data_loaded.*?False",
+                  app_src, re.S)
+    assert m is not None
+    assert "appearance" not in m.group(0)  # switch never clears the theme
+    for view in (root / "ui" / "views").glob("*.py"):
+        text = view.read_text(encoding="utf-8")
+        assert "appearance" not in text, view.name  # views never key on it

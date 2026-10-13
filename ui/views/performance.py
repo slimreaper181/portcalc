@@ -48,7 +48,9 @@ def render(ctx):
     native_panel = ctx["native_panel"]
     portfolio_nav = ctx.get("portfolio_nav")
 
-    st.markdown("## Performance vs Benchmark")
+    from ui.theme import page_header as _header
+    _header("PERFORMANCE", "Performance vs Benchmark",
+            "Realised history, cash-flow returns and attribution.")
 
     if "bench_ticker" not in st.session_state:
         st.session_state.bench_ticker = "SPY"

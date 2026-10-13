@@ -99,7 +99,10 @@ def render(ctx):
     tickers = ctx["tickers"]
     weights = ctx["weights"]
 
-    st.markdown("## Historical Backtest")
+    from ui.theme import metric_strip as _strip
+    from ui.theme import page_header as _header
+    _header("HISTORICAL RESEARCH", "Historical Backtest",
+            "Static, out-of-sample and walk-forward evidence — no look-ahead.")
     st.caption(
         "Reconstructs this portfolio from historical **adjusted** Yahoo Finance "
         "prices only — no live/Alpaca prices, no look-ahead. Adjusted closes "
@@ -562,13 +565,13 @@ def render(ctx):
                 _base_nm = _dnm.replace(" (0 bps)", "")
                 if _base_nm in _wf_dyn:
                     _net = _wf_dyn[_base_nm].metrics["final_value"]
-                    d1, d2, d3 = st.columns(3)
-                    d1.metric("Gross Final Value (0 bps)", fmt_usd(_gross))
-                    d2.metric("Net Final Value", fmt_usd(_net))
-                    d3.metric("Transaction Cost Drag", fmt_usd(_gross - _net),
-                              help="Zero-cost final wealth minus net final "
-                                   "wealth — lost compounding included, not "
-                                   "summed costs.")
+                    _strip([
+                        ("Gross Final (0 bps)", fmt_usd(_gross),
+                         "zero-cost twin"),
+                        ("Net Final", fmt_usd(_net), "after costs"),
+                        ("Cost Drag", fmt_usd(_gross - _net),
+                         "compounding included"),
+                    ])
             st.caption(RF_CONSTANT_NOTE)
             st.caption(
                 "Currency conversion covers the estimation era onward (lookback "

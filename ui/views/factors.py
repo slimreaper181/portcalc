@@ -56,7 +56,9 @@ def render(ctx):
     tickers = ctx["tickers"]
     weights = ctx["weights"]
 
-    st.markdown("## Factor Analysis")
+    from ui.theme import page_header as _header
+    _header("FACTOR RESEARCH", "Factor Analysis",
+            "CAPM and Fama-French exposures on French library data.")
     st.caption(
         "Why did this portfolio perform the way it did? Simple daily "
         "portfolio returns (never log returns) regressed on simple "

@@ -40,7 +40,10 @@ def render(ctx):
     tickers = ctx["tickers"]
     ccy = ctx["ccy"]
 
-    st.markdown("## Scenario & Monte Carlo Simulation")
+    from ui.theme import metric_strip as _strip
+    from ui.theme import page_header as _header
+    _header("FORWARD RESEARCH", "Scenario & Monte Carlo Simulation",
+            "Simulated paths under stress regimes, plus historical shocks.")
     sc_mode = st.radio(
         "Analysis mode", ["Monte Carlo", "Historical stress"],
         index=0, key="sc_mode", horizontal=True,
@@ -143,14 +146,17 @@ def render(ctx):
                             )
                             return  # section-local return (was st.stop()): sibling tabs keep rendering
 
-                    # Key metrics: large currency values get 2 columns x 2 rows
-                    # so full "$6,589.31"-style values always fit.
-                    r1a, r1b = st.columns(2)
-                    r1a.metric("Expected Final Value", fmt_usd(metrics["expected_value"]))
-                    r1b.metric("Median Outcome",        fmt_usd(metrics["median_value"]))
-                    r2a, r2b = st.columns(2)
-                    r2a.metric("Worst 5% Outcome",     fmt_usd(metrics["worst_5pct"]))
-                    r2b.metric("Probability of Loss",  fmt_pct(metrics["prob_loss"]))
+                    # Key metrics: one summary strip (same values, grouped).
+                    _strip([
+                        ("Expected Final",
+                         fmt_usd(metrics["expected_value"]), "mean outcome"),
+                        ("Median Outcome",
+                         fmt_usd(metrics["median_value"]), "typical path"),
+                        ("Worst 5% Outcome",
+                         fmt_usd(metrics["worst_5pct"]), "tail outcome"),
+                        ("Probability of Loss",
+                         fmt_pct(metrics["prob_loss"]), "share of paths"),
+                    ])
                     if metrics.get("contributions", 0) > 0:
                         _csym = currency_symbol(base_ccy)
                         st.caption(

@@ -116,7 +116,8 @@ DEFAULT_PORTFOLIO = {
 # Page configuration + visual theme (single design system in ui/theme.py)
 # ---------------------------------------------------------------------------
 
-from ui.theme import inject_theme
+from ui.theme import (appearance_selector, inject_theme, metric_strip,
+                       page_header, pills_row)
 inject_theme()
 
 
@@ -462,6 +463,9 @@ if "bt_benchmark" not in st.session_state:
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
+    st.markdown('<div class="pc-kicker">APPEARANCE</div>',
+                unsafe_allow_html=True)
+    appearance_selector()
     st.markdown("## 📈 Portfolio Editor")
     render_flash()  # rerun-surviving confirmations render once, here
 
@@ -1402,18 +1406,18 @@ try:
     _header_through = format_date(prices.index[-1])
 except Exception:
     _header_through = "—"
-st.markdown("## Portfolio Calc")
-st.caption("Portfolio Research & Risk")
-_h1, _h2, _h3, _h4 = st.columns(4)
-_h1.metric("NAV", format_money(portfolio_nav, base_ccy),
-           help="Live securities value (mark prices) + cash.")
-_h2.metric("Day P&L", format_signed_money(day_pnl_base, base_ccy)
-           if live_holdings else "—",
-           help="Mark vs previous official close (pre/post-market marks "
-                "compared against the last close; see methodology).")
-_h3.metric("Cash", format_money(_cash_base, base_ccy),
-           help="Currency-keyed cash from the transaction ledger.")
-_h4.metric("Base Currency", base_ccy)
+page_header("PORTFOLIO WORKSTATION", "Portfolio Calc",
+            "Portfolio Research & Risk")
+metric_strip([
+    ("Portfolio NAV", format_money(portfolio_nav, base_ccy),
+     "Live securities value + cash"),
+    ("Day P&L", format_signed_money(day_pnl_base, base_ccy)
+     if live_holdings else "—",
+     "Mark vs previous official close"),
+    ("Cash", format_money(_cash_base, base_ccy),
+     "Currency-keyed ledger cash"),
+    ("Base Currency", base_ccy, f"Benchmark {str(_header_bench)}"),
+])
 _live_note = live_snapshot.get("_status", {}).get("feed_note", "")
 _stream_mode = live_snapshot.get("_status", {}).get("stream_mode", "?")
 _stream_feed = live_snapshot.get("_status", {}).get("stream_feed")
@@ -1422,6 +1426,14 @@ _stream_bit = f" · Stream: {_stream_mode}" + (
     f" ({str(_stream_feed).upper()})" if _stream_feed else "") + (
     f" · quote {_stream_age:.0f}s old"
     if isinstance(_stream_age, (int, float)) else "")
+pills_row([
+    (str(_stream_mode), str(_stream_mode)),
+    (str(_stream_feed).upper() if _stream_feed else "FALLBACK",
+     "fallback" if not _stream_feed or str(_stream_feed).lower() == "yahoo"
+     else "info"),
+    (f"Base {base_ccy}", "neutral"),
+    (str(_header_bench), "neutral"),
+])
 st.caption(f"Benchmark {str(_header_bench)} · Data through {_header_through} "
            f"· Live: {_live_note}{_stream_bit}"
            + (" · Partial marks: " + ", ".join(live_incomplete)
