@@ -1,0 +1,321 @@
+"""views.risk — Risk tab (rendered by the app shell).
+
+Extracted from the application shell; analytics live in
+``analytics/``, fetching in ``data/``. Receives the shared
+context dict and renders into the active tab.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from analytics.performance import historical_cvar
+from analytics.var import (
+    historical_var,
+    mean_to_daily,
+    monte_carlo_var,
+    parametric_var,
+    to_daily,
+)
+from ui.formatting import fmt_pct, fmt_usd
+from ui.theme import CHART_THEME
+
+
+def render(ctx):
+    """Render the Risk tab from the shared context."""
+    cov = ctx["cov"]
+    mu = ctx["mu"]
+    port_daily_returns = ctx["port_daily_returns"]
+    port_vol = ctx["port_vol"]
+    portfolio_value = ctx["portfolio_value"]
+    weights = ctx["weights"]
+    ccy = ctx["ccy"]
+
+    st.markdown("## Risk Analysis")
+
+    r_col1, r_col2 = st.columns([1, 3])
+
+    with r_col1:
+        var_horizon = st.number_input(
+            "VaR Horizon (days)", min_value=1, max_value=30, value=1, step=1
+        )
+        st.caption("VaR confidence fixed at 95% (industry standard)")
+
+    st.markdown("---")
+
+    # Daily parameters (log-return space)
+    port_std_daily  = to_daily(port_vol)
+    mu_daily        = mean_to_daily(mu.values)
+    cov_daily       = cov.values / 252
+
+    try:
+        var_param = parametric_var(port_std_daily, portfolio_value, 0.95, int(var_horizon))
+    except ValueError as e:
+        var_param = None
+        st.error(f"Parametric VaR error: {e}")
+    try:
+        var_hist = historical_var(
+            port_daily_returns, portfolio_value, 0.95, int(var_horizon)
+        )
+    except ValueError as e:
+        var_hist = None
+        hist_err = str(e)
+    try:
+        var_mc, mc_sim_rets = monte_carlo_var(
+            weights, mu_daily, cov_daily, portfolio_value, 0.95, int(var_horizon), 10_000
+        )
+    except ValueError as e:
+        var_mc, mc_sim_rets = None, None
+        st.error(f"Monte Carlo VaR error: {e}")
+
+    v1, v2, v3 = st.columns(3)
+    with v1:
+        st.markdown("#### Parametric VaR")
+        st.metric("95% VaR", fmt_usd(var_param) if var_param is not None else "n/a")
+        st.caption(
+            "Assumes normally distributed returns. "
+            f"At 95% confidence over {int(var_horizon)}d, potential loss ≤ "
+            f"{fmt_usd(var_param) if var_param is not None else 'n/a'}."
+        )
+    with v2:
+        st.markdown("#### Historical VaR")
+        st.metric("95% VaR", fmt_usd(var_hist) if var_hist is not None else "n/a")
+        if var_hist is None:
+            st.caption(f"Historical VaR unavailable: {hist_err}")
+        else:
+            n_win = len(port_daily_returns) - int(var_horizon) + 1
+            st.caption(
+                "Uses genuine rolling "
+                f"{int(var_horizon)}-day historical returns ({n_win:,} overlapping "
+                "windows). No normality or √T-scaling assumption."
+            )
+    with v3:
+        st.markdown("#### Monte Carlo VaR")
+        st.metric("95% VaR", fmt_usd(var_mc) if var_mc is not None else "n/a")
+        st.caption(
+            "10,000 simulated return paths using multivariate normal. "
+            "Log returns are converted to simple P&L via exp(r)−1. "
+            "Captures correlation structure."
+        )
+
+    # Historical CVaR (Expected Shortfall) at the same horizon
+    st.markdown("---")
+    st.markdown("### Historical CVaR (Expected Shortfall)")
+    try:
+        cvar_out = historical_cvar(
+            port_daily_returns, portfolio_value, 0.95, int(var_horizon)
+        )
+    except ValueError as e:
+        cvar_out = None
+        st.warning(f"Historical CVaR unavailable: {e}")
+
+    if cvar_out is not None:
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.metric(
+                f"95% Historical VaR ({int(var_horizon)}d)",
+                fmt_usd(cvar_out["var_currency"]),
+                help="Loss threshold exceeded in the worst 5% of historical periods.",
+            )
+            st.caption(f"Cutoff return: {cvar_out['var_pct']:.2%}")
+        with cc2:
+            st.metric(
+                f"95% Historical CVaR ({int(var_horizon)}d)",
+                fmt_usd(cvar_out["cvar_currency"]),
+                help="Average loss once the VaR threshold has been exceeded.",
+            )
+            st.caption(
+                f"Average tail loss: {cvar_out['cvar_pct']:.2%} "
+                f"over {cvar_out['n_tail']:,} of {cvar_out['n_windows']:,} "
+                "genuine rolling windows."
+            )
+        st.caption(
+            "VaR estimates the loss threshold exceeded in the worst 5% of periods. "
+            "CVaR estimates the average loss once that threshold has been exceeded."
+        )
+
+    st.markdown("---")
+
+    # Return distribution
+    st.markdown("### Daily Return Distribution")
+    fig_dist = go.Figure()
+    fig_dist.add_trace(go.Histogram(
+        x=port_daily_returns,
+        nbinsx=60,
+        name="Daily Returns",
+        marker_color="rgba(88, 166, 255, 0.6)",
+        marker_line=dict(color="rgba(88,166,255,0.9)", width=0.5),
+    ))
+    var_pct_5 = np.percentile(port_daily_returns, 5)
+    fig_dist.add_vline(x=var_pct_5, line=dict(color="#f85149", dash="dash", width=2))
+    fig_dist.add_annotation(
+        x=var_pct_5, text="5th pct",
+        showarrow=True, arrowcolor="#f85149",
+        font=dict(color="#f85149"), yref="paper", y=0.9,
+    )
+    fig_dist.update_layout(
+        **CHART_THEME,
+        title="Portfolio Daily Return Distribution",
+        xaxis_title="Daily Return", yaxis_title="Count",
+    )
+    st.plotly_chart(fig_dist, width="stretch")
+
+    # MC simulation return histogram
+    if mc_sim_rets is not None:
+        st.markdown("### Monte Carlo Simulated Returns")
+        fig_mc = go.Figure(go.Histogram(
+            x=mc_sim_rets,
+            nbinsx=60,
+            marker_color="rgba(240, 136, 62, 0.6)",
+            marker_line=dict(color="rgba(240,136,62,0.9)", width=0.5),
+        ))
+        var_mc_pct = np.percentile(mc_sim_rets, 5)
+        fig_mc.add_vline(x=var_mc_pct, line=dict(color="#f85149", dash="dash", width=2))
+        fig_mc.add_annotation(
+            x=var_mc_pct, text="VaR 5th pct",
+            showarrow=True, arrowcolor="#f85149",
+            font=dict(color="#f85149"), yref="paper", y=0.9,
+        )
+        fig_mc.update_layout(
+            **CHART_THEME,
+            title=f"MC Simulated {int(var_horizon)}-Day Portfolio Returns (simple returns)",
+            xaxis_title="Portfolio Return", yaxis_title="Count",
+        )
+        st.plotly_chart(fig_mc, width="stretch")
+
+    # ---- Advanced diagnostics (institutional, methodology-labelled) ----
+    with st.expander("Advanced Diagnostics", expanded=False):
+        st.caption("Parametric decompositions and distribution diagnostics "
+                   "on the same covariance/return inputs as above.")
+        try:
+            from analytics.risk_extra import (
+                component_var as _cvar,
+                diversification_benefit as _divben,
+                distribution_stats as _dist,
+                herfindahl as _herf,
+                marginal_var as _mvar,
+                omega_ratio as _omega,
+            )
+            _w = np.asarray(weights, dtype=float)
+            _tickers = list(ctx.get("tickers", [])) or [
+                f"a{i}" for i in range(len(_w))]
+            import pandas as _pd
+            _cov_l = _pd.DataFrame(np.asarray(cov.values if hasattr(
+                cov, "values") else cov), index=_tickers, columns=_tickers)
+            _pv = parametric_var(port_std_daily, 1.0, 0.95,
+                                 int(var_horizon))
+            _comp = _cvar(_w, _cov_l, _pv, portfolio_value)
+            _marg = _mvar(_w, _cov_l, _pv, portfolio_value)
+            _cd = pd.DataFrame({
+                "Component VaR": [fmt_usd(v) for v in _comp.values],
+                "Marginal VaR": [fmt_usd(v) for v in _marg.values]},
+                index=list(_comp.index))
+            st.dataframe(_cd, width="stretch")
+            st.caption(
+                f"Component VaR sums to {float(_comp.sum()):,.2f} vs total "
+                f"parametric VaR {fmt_usd(_pv * portfolio_value)} "
+                "(reconciliation by construction).")
+            _db = _divben(_w, _cov_l)
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Diversification Benefit",
+                      fmt_pct(_db["diversification_benefit"]),
+                      help="Weighted standalone volatility minus portfolio "
+                           "volatility (long-only, never negative).")
+            _herf_v = _herf(_w)
+            d2.metric("Herfindahl", f"{_herf_v:.3f}",
+                      help="Sum of squared weights (1/N diversified → 1 "
+                           "concentrated).")
+            d3.metric("Effective Holdings",
+                      f"{1.0 / _herf_v:.2f}" if _herf_v > 0 else "—",
+                      help="1 / Herfindahl: holding count of an equally "
+                           "weighted portfolio with the same concentration.")
+            try:
+                _ds = _dist(port_daily_returns)
+                _sk1, _sk2 = st.columns(2)
+                _sk1.metric(
+                    "Skew / Excess Kurtosis",
+                    f"{_ds['skewness']:.2f} / {_ds['excess_kurtosis']:.2f}",
+                    help="Population moments of daily log returns; kurtosis "
+                         "is excess (Fisher, normal = 0).")
+                with _sk2:
+                    _mar = st.number_input(
+                        "Omega MAR (%)", value=0.0, step=0.5,
+                        key="risk_omega_mar",
+                        help="Minimum acceptable return threshold for the "
+                             "Omega ratio.")
+                _om = _omega(np.asarray(port_daily_returns, dtype=float),
+                             float(_mar) / 100.0)
+                st.metric(f"Omega Ratio (MAR {float(_mar):.1f}%)",
+                          f"{_om:.2f}" if np.isfinite(_om) else "∞",
+                          help="Average gain above the threshold per unit of "
+                               "average loss below it (+∞ when no downside).")
+            except ValueError as e:
+                st.caption(f"Distribution diagnostics unavailable: {e}")
+        except ValueError as e:
+            st.warning(f"Advanced diagnostics unavailable: {e}")
+
+    # ---- Benchmark-relative & rolling risk (trailing only) ----
+    with st.expander("Benchmark & Rolling Risk", expanded=False):
+        st.caption("Trailing windows only — no future leakage. Benchmark "
+                   "comes from the same cached loader as Performance.")
+        _bt = st.text_input("Benchmark ticker", value=st.session_state.get(
+            "bench_ticker", "SPY"), key="risk_bench",
+            help="Any Yahoo Finance ticker.")
+        _rw = st.selectbox("Rolling window (trading days)", [63, 126, 252],
+                           index=0, key="risk_rollwin")
+        try:
+            from analytics.performance import log_returns_from_prices as _lrp
+            from analytics.risk_extra import (
+                rolling_beta as _rbeta, rolling_correlation as _rcorr,
+                rolling_tracking_error as _rte,
+                upside_downside_capture as _cap)
+            from data.pipeline import (
+                base_benchmark_series as _bbs, load_benchmark_data as _lbd)
+            from analytics.validation import (
+                validate_ticker_symbol as _vts)
+            _bsym = _vts(_bt)
+            _bp = _bbs(_lbd(_bsym, "2y"), _bsym,
+                       st.session_state.get("base_currency", "USD"),
+                       ccy.get("fx_hist"))
+        except ValueError as e:
+            st.warning(f"Benchmark unavailable: {e}")
+            _bp = None
+        if _bp is not None:
+            try:
+                _br = _lrp(_bp)
+                _pr = pd.Series(port_daily_returns).dropna()
+                _common = pd.DataFrame(
+                    {"p": _pr, "b": _br}).dropna()
+                if len(_common) < int(_rw):
+                    st.info("Insufficient overlap for the rolling window.")
+                else:
+                    _beta = _rbeta(_common["p"], _common["b"], int(_rw))
+                    _te = _rte(_common["p"], _common["b"], int(_rw))
+                    _cap = _cap(_common["p"], _common["b"])
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Trailing Beta",
+                              f"{float(_beta.dropna().iloc[-1]):.2f}",
+                              help="cov(portfolio, benchmark)/var(benchmark) "
+                                   "over the trailing window.")
+                    c2.metric("Tracking Error (ann.)",
+                              f"{float(_te.dropna().iloc[-1]):.2%}")
+                    c3.metric(
+                        "Up / Down Capture",
+                        f"{_cap['upside_capture']:.2f} / "
+                        f"{_cap['downside_capture']:.2f}",
+                        help="Mean portfolio return per unit of benchmark "
+                             "return on benchmark-up/down days.")
+                    fig_beta = go.Figure()
+                    fig_beta.add_trace(go.Scatter(
+                        x=_beta.index, y=_beta.values, mode="lines",
+                        name="Rolling Beta",
+                        line=dict(color="#58a6ff", width=2)))
+                    fig_beta.update_layout(
+                        **CHART_THEME, title=f"Trailing Beta vs {_bsym}",
+                        xaxis_title="Date", yaxis_title="Beta")
+                    st.plotly_chart(fig_beta, width="stretch")
+            except ValueError as e:
+                st.warning(f"Rolling risk unavailable: {e}")

@@ -1,10 +1,17 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
 .env
 .streamlit/
 portfolio.json
+portcalc.db
+portcalc.db-wal
+portcalc.db-shm
+.portcalc.db
+.portcalc.db-wal
+.portcalc.db-shm
 *.egg-info/
 dist/
 build/
