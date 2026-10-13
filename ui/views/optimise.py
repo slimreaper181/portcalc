@@ -685,6 +685,53 @@ def render(ctx):
                         "RC Dispersion is the std of percentage risk contributions "
                         "(near zero = evenly spread risk, the risk-parity ideal).")
 
+                    # ---- Save to Research (Milestone 8: optimisation) ----
+                    try:
+                        from ui.views.research import save_analysis_button
+                        _opt_methods = [
+                            {"Current": "current",
+                             "Equal Weight": "equal_weight",
+                             "Min Variance": "min_variance",
+                             "Max Sharpe": "max_sharpe",
+                             "Risk Parity": "erc",
+                             "Max Diversification": "max_diversification",
+                             "Black-Litterman": "black_litterman"}.get(
+                                m, m) for m in ok_allocs]
+                        _opt_cfg = {
+                            "tickers": list(tickers),
+                            "methods": _opt_methods,
+                            "risk_model": str(risk_model),
+                            "ewma_lambda": float(ewma_lam),
+                            "window": str(est_window),
+                            "min_w": float(min_w),
+                            "max_w": float(max_w),
+                            "rf": float(rf_rate),
+                            "base_ccy": str(base_ccy),
+                        }
+                        _opt_res: dict = {"methods": {}}
+                        for _m, _a in ok_allocs.items():
+                            try:
+                                _w = np.asarray(
+                                    _a.weights.values, dtype=float)
+                                _opt_res["methods"][_m] = {
+                                    "success": True,
+                                    "weights": {
+                                        t: float(x)
+                                        for t, x in zip(tickers, _w)},
+                                    "metrics": {
+                                        "expected_return": float(
+                                            _a.expected_return),
+                                        "volatility": float(_a.volatility),
+                                        "sharpe": float(_a.sharpe)}}
+                            except (ValueError, TypeError, AttributeError):
+                                continue
+                        save_analysis_button(
+                            "optimisation", _opt_cfg, _opt_res,
+                            key="opt_save",
+                            label="Save to Research")
+                    except Exception:
+                        pass
+
                     with st.expander("Estimator comparison (same portfolio)",
                                      expanded=False):
                         st.caption(

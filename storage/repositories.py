@@ -174,8 +174,13 @@ def delete_portfolio(conn: sqlite3.Connection, portfolio_id: str) -> None:
 
 
 def duplicate_portfolio(conn: sqlite3.Connection, portfolio_id: str,
-                        name: str) -> Portfolio:
-    """Clone settings + positions + transactions + watchlist."""
+                        name: str,
+                        include_research: bool = False) -> Portfolio:
+    """Clone settings + positions + transactions + watchlist.
+
+    Saved research is NOT copied unless ``include_research`` is set (the
+    user opts in explicitly); copies get fresh ids under the clone.
+    """
     src = get_portfolio(conn, portfolio_id)
     label = str(name or "").strip()
     if not label:
@@ -203,6 +208,19 @@ def duplicate_portfolio(conn: sqlite3.Connection, portfolio_id: str,
         "INSERT INTO watchlist (portfolio_id, ticker, added_at) "
         "SELECT ?, ticker, added_at FROM watchlist WHERE portfolio_id = ?",
         (clone.portfolio_id, portfolio_id))
+    if include_research:
+        for row in conn.execute(
+                "SELECT name, type, config_json, result_json, tags, notes "
+                "FROM saved_analyses WHERE portfolio_id = ?",
+                (portfolio_id,)).fetchall():
+            conn.execute(
+                "INSERT INTO saved_analyses (analysis_id, portfolio_id, "
+                "name, type, config_json, result_json, tags, notes, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?)",
+                (_new_id(), clone.portfolio_id, row["name"], row["type"],
+                 row["config_json"], row["result_json"], row["tags"],
+                 row["notes"], now, now))
     conn.execute("UPDATE portfolios SET updated_at = ? WHERE portfolio_id = ?",
                  (now, clone.portfolio_id))
     return get_portfolio(conn, clone.portfolio_id)

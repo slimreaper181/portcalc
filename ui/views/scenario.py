@@ -188,6 +188,35 @@ def render(ctx):
                         width="stretch",
                     )
 
+                    # ---- Save to Research (Milestone 8: scenario) ----
+                    try:
+                        from ui.views.research import save_analysis_button
+                        _sc_cfg = {
+                            "tickers": list(tickers),
+                            "weights": [float(x) for x in
+                                        np.asarray(weights, dtype=float)],
+                            "scenario": str(scenario_choice),
+                            "return_shock": float(custom_shock),
+                            "vol_multiplier": float(custom_vol),
+                            "horizon_years": float(_years),
+                            "n_sims": int(_n_sims),
+                            "seed": 7,
+                            "capital": float(initial_investment),
+                            "base_ccy": str(base_ccy),
+                        }
+                        _sc_res = {"metrics": {
+                            k: float(metrics[k]) for k in
+                            ("expected_value", "median_value", "worst_5pct",
+                             "best_5pct", "prob_loss", "mean_max_drawdown")
+                            if k in metrics},
+                            "label": str(sc_info.get("label", ""))}
+                        save_analysis_button(
+                            "scenario", _sc_cfg, _sc_res,
+                            key="sc_save",
+                            label="Save to Research")
+                    except Exception:
+                        pass
+
                 else:
                     st.markdown(
                         """
@@ -322,3 +351,27 @@ def render(ctx):
                 st.caption(
                     f"Covered: {_res['actual_start']} to {_res['actual_end']} "
                     f"({len(_res['values']):,} trading days). " + METHOD_NOTE)
+                # ---- Save to Research (Milestone 8: stress) ----
+                try:
+                    from ui.views.research import save_analysis_button
+                    _st_cfg = {
+                        "tickers": list(tickers),
+                        "weights": [float(x) for x in
+                                    np.asarray(weights, dtype=float)],
+                        "window": str(_sw),
+                        "custom_start": (str(_cs) if _cs else None),
+                        "custom_end": (str(_ce) if _ce else None),
+                        "capital": float(portfolio_value),
+                        "rf": 0.05,
+                        "base_ccy": str(base_ccy),
+                    }
+                    _st_res = {"metrics": {
+                        k: float(_res[k]) for k in
+                        ("total_return", "max_drawdown", "volatility")
+                        if k in _res}}
+                    save_analysis_button(
+                        "stress", _st_cfg, _st_res,
+                        key="stress_save",
+                        label="Save to Research")
+                except Exception:
+                    pass

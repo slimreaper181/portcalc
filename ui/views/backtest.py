@@ -674,6 +674,41 @@ def render(ctx):
                     f"{fmt_usd(_wf_all[_wf_static_name].metrics['final_value'])} "
                     f"vs walk-forward {fmt_usd(_wfd['final_value'])} — the gap "
                     f"answers whether re-estimating helped.")
+            # ---- Save to Research (Milestone 8: walk-forward) ----
+            try:
+                from ui.views.research import save_analysis_button as _save_wf
+                _wf_cfg = {
+                    "tickers": list(tickers),
+                    "methods": list(_wf_methods),
+                    "test_start": str(pd.Timestamp(wf_start).date()),
+                    "test_end": str(pd.Timestamp(wf_end).date()),
+                    "lookback_years": float(wf_lookback),
+                    "window_type": str(wf_window).lower(),
+                    "frequency": str(_wf_freq),
+                    "costs_bps": float(wf_costs),
+                    "capital": float(bt_capital),
+                    "min_w": float(wf_minw),
+                    "max_w": float(wf_maxw),
+                    "estimator": str(wf_estimator),
+                    "ewma_lambda": float(wf_ewma),
+                    "rf": float(rf_rate),
+                    "base_ccy": str(base_ccy),
+                }
+                _wf_res: dict = {"methods": {}}
+                for _nm, _r in _wf_dyn.items():
+                    try:
+                        _wf_res["methods"][_nm] = {"metrics": {
+                            k: float(_r.metrics[k]) for k in
+                            ("final_value", "cagr", "sharpe",
+                             "annualised_volatility", "max_drawdown",
+                             "total_costs")
+                            if k in _r.metrics}}
+                    except (ValueError, TypeError, KeyError, AttributeError):
+                        continue
+                _save_wf("walkforward", _wf_cfg, _wf_res, key="wf_save",
+                         label="Save to Research")
+            except Exception:
+                pass
 
         # ---- Walk-Forward Robustness Lab (Milestone 6) ----
         st.markdown("---")
@@ -831,6 +866,33 @@ def render(ctx):
                     data=grid_to_csv(_rl_result).encode("utf-8"),
                     file_name="robustness-grid.csv",
                     mime="text/csv", key="rl_dl")
+                # ---- Save to Research (Milestone 8: robustness) ----
+                try:
+                    from ui.views.research import (
+                        save_analysis_button as _save_rl)
+                    _rl_save_cfg = {
+                        "tickers": list(tickers),
+                        "methods": list(_rl_cfg.methods),
+                        "lookbacks": [float(x) for x in _rl_cfg.lookbacks],
+                        "frequencies": list(_rl_cfg.frequencies),
+                        "estimators": list(_rl_cfg.estimators),
+                        "costs_bps": [float(c) for c in _rl_cfg.costs_bps],
+                        "window_type": str(_rl_cfg.window_type),
+                        "test_start": str(pd.Timestamp(wf_start).date()),
+                        "test_end": str(pd.Timestamp(wf_end).date()),
+                        "capital": float(bt_capital),
+                        "rf": float(rf_rate),
+                        "base_ccy": str(base_ccy),
+                    }
+                    _rl_save_res = {"metrics": {
+                        "n_cells": len(_cells),
+                        "n_ok": len(_ok)},
+                        "scorecard": _rl_result.scorecard.to_dict(
+                            orient="records")[:50]}
+                    _save_rl("robustness", _rl_save_cfg, _rl_save_res,
+                             key="rl_save", label="Save to Research")
+                except Exception:
+                    pass
 
     if bt_mode == "Historical":
         # ---- Prepare the common-date window (real data only) ----
@@ -952,6 +1014,37 @@ def render(ctx):
             "cost-modelled). CAGR uses actual calendar elapsed time; "
             "Annualised Return is the log-space mean and is kept separate."
         )
+        # ---- Save to Research (Milestone 8: static backtest) ----
+        try:
+            from ui.views.research import save_analysis_button as _save_bt
+            _bt_cfg = {
+                "tickers": list(tickers),
+                "weights": [float(x) for x in
+                            np.asarray(weights, dtype=float)],
+                "start": str(pd.Timestamp(bt_start).date()),
+                "end": str(pd.Timestamp(bt_end).date()),
+                "capital": float(bt_capital),
+                "costs_bps": float(bt_costs),
+                "frequency": str(_freq),
+                "benchmark": str(bench_sym_bt or ""),
+                "rf": float(rf_rate),
+                "base_ccy": str(base_ccy),
+            }
+            _bt_res: dict = {"methods": {}}
+            for _nm, _r in _results.items():
+                try:
+                    _bt_res["methods"][_nm] = {"metrics": {
+                        k: float(_r.metrics[k]) for k in
+                        ("final_value", "cagr", "sharpe",
+                         "annualised_volatility", "max_drawdown",
+                         "total_costs")
+                        if k in _r.metrics}}
+                except (ValueError, TypeError, KeyError):
+                    continue
+            _save_bt("backtest", _bt_cfg, _bt_res, key="bt_save",
+                     label="Save to Research")
+        except Exception:
+            pass
 
         # ---- Drawdown (selected strategy vs benchmark) ----
         st.markdown("---")
@@ -1360,6 +1453,42 @@ def render(ctx):
             "cost-modelled). Frozen estimation weights were never re-estimated "
             "during the test."
         )
+        # ---- Save to Research (Milestone 8: OOS) ----
+        try:
+            from ui.views.research import save_analysis_button as _save_oos
+            _oos_methods = [m for m, on in (
+                ("equal_weight", oos_eq), ("min_variance", oos_mv),
+                ("max_sharpe", oos_ms), ("erc", oos_erc),
+                ("max_diversification", oos_md),
+                ("black_litterman", oos_bl)) if on]
+            _oos_cfg = {
+                "tickers": list(tickers),
+                "methods": _oos_methods,
+                "test_start": str(pd.Timestamp(oos_start).date()),
+                "test_end": str(pd.Timestamp(bt_end).date()),
+                "lookback_years": float(oos_lookback),
+                "frequency": str(_oos_freq),
+                "costs_bps": float(oos_costs),
+                "capital": float(_oos_cap),
+                "estimator": str(oos_estimator),
+                "ewma_lambda": float(oos_ewma),
+                "rf": float(rf_rate),
+                "base_ccy": str(base_ccy),
+            }
+            _oos_res: dict = {"methods": {}}
+            for _nm, _r in oos_results.items():
+                try:
+                    _oos_res["methods"][_nm] = {"metrics": {
+                        k: float(_r.metrics[k]) for k in
+                        ("final_value", "cagr", "sharpe",
+                         "annualised_volatility", "max_drawdown")
+                        if k in _r.metrics}}
+                except (ValueError, TypeError, KeyError):
+                    continue
+            _save_oos("oos", _oos_cfg, _oos_res, key="oos_save",
+                      label="Save to Research")
+        except Exception:
+            pass
 
 
     # ============================================================

@@ -94,6 +94,7 @@ from ui.views import optimise as views_optimise
 from ui.views import scenario as views_scenario
 from ui.views import overview as views_overview
 from ui.views import risk as views_risk
+from ui.views import research as views_research
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -542,12 +543,18 @@ with st.sidebar:
                     st.rerun()
             _dup = st.text_input("Duplicate active as", value="", key="ws_dup",
                                  placeholder="e.g. Core copy")
+            _dup_research = st.checkbox(
+                "Include saved research", value=False, key="ws_dup_research",
+                help="Off (default): the clone starts with an empty research "
+                     "library. On: copy saved analyses into the clone with "
+                     "fresh ids (explicit opt-in).")
             if st.button("Duplicate + switch", key="ws_dup_go"):
                 try:
                     _c = ws_db.connect(workspace_db_path())
                     try:
                         _cp = ws_repo.duplicate_portfolio(
-                            _c, st.session_state.get("_ws_pid"), _dup)
+                            _c, st.session_state.get("_ws_pid"), _dup,
+                            include_research=bool(_dup_research))
                         ws_repo.set_active_portfolio_id(
                             _c, _cp.portfolio_id)
                     finally:
@@ -1442,7 +1449,7 @@ _live_status_strip()
 # Main tabs
 # ---------------------------------------------------------------------------
 
-tab_overview, tab_risk, tab_optimise, tab_scenario, tab_perf, tab_security, tab_backtest, tab_factors = st.tabs([
+tab_overview, tab_risk, tab_optimise, tab_scenario, tab_perf, tab_security, tab_backtest, tab_factors, tab_research = st.tabs([
     "📈 Overview",
     "⚠️  Risk",
     "🎯 Optimise",
@@ -1451,6 +1458,7 @@ tab_overview, tab_risk, tab_optimise, tab_scenario, tab_perf, tab_security, tab_
     "🔍 Security Detail",
     "🧪 Backtest",
     "📐 Factor Analysis",
+    "🔬 Research",
 ])
 
 
@@ -1489,6 +1497,10 @@ with tab_backtest:
 # ============================================================
 with tab_factors:
     render_section("Factor Analysis", views_factors.render, ctx)
+# TAB 9 — RESEARCH LIBRARY (Milestone 8: persistent saved analyses)
+# ============================================================
+with tab_research:
+    render_section("Research", views_research.render, ctx)
 
 # End-of-run persist: ledger auto-migration and in-tab edits (Overview
 # delete) land here; hash-guarded so clean runs are a cheap no-op.
