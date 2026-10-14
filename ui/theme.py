@@ -262,9 +262,18 @@ def _apply_chart_mode(mode: str) -> None:
 # Global stylesheet
 # ---------------------------------------------------------------------------
 
-def _css(t: dict) -> str:
-    """Stylesheet for one token set (stable selectors + pc-* classes)."""
+def _css(t: dict, mode: str) -> str:
+    """Stylesheet for one token set (stable selectors + pc-* classes).
+
+    Root-cause design: EVERY text-bearing widget selector gets an explicit
+    foreground/background/border per mode, plus ``color-scheme`` on the
+    root, so rendering never depends on Streamlit's base chrome or the
+    browser/OS colour scheme. Selectors stay at the test-id / baseweb /
+    ARIA-role level already used by this codebase — no deep-DOM hacks.
+    """
+    scheme = "dark" if mode == "dark" else "light"
     return f"""
+html {{ color-scheme: {scheme}; }}
 html, body, [class*="css"] {{
   font-family: {t['font']};
   font-feature-settings: "cv11", "ss01";
@@ -272,27 +281,70 @@ html, body, [class*="css"] {{
 .stApp {{ background: {t['background']}; color: {t['text_primary']}; }}
 .block-container {{ padding-top: 1.5rem; max-width: 1400px; }}
 
-/* ---------- sidebar ---------- */
+/* ---------- base text (explicit so browser chrome never wins) ---------- */
+div[data-testid="stMarkdownContainer"] p,
+div[data-testid="stMarkdownContainer"] li {{
+  color: {t['text_primary']};
+}}
+div[data-testid="stCaptionContainer"] {{
+  color: {t['text_secondary']};
+}}
+div[data-testid="stCaptionContainer"] p {{ color: {t['text_secondary']}; }}
+
+/* ---------- sidebar (full inheritance audit) ---------- */
 section[data-testid="stSidebar"] {{
   background: {t['surface']}; border-right: 1px solid {t['border']};
+  color: {t['text_primary']};
+}}
+section[data-testid="stSidebar"] div[data-testid="stMarkdownContainer"] p,
+section[data-testid="stSidebar"] div[data-testid="stMarkdownContainer"] li {{
+  color: {t['text_primary']};
+}}
+section[data-testid="stSidebar"] div[data-testid="stCaptionContainer"],
+section[data-testid="stSidebar"] div[data-testid="stCaptionContainer"] p {{
+  color: {t['text_secondary']};
 }}
 section[data-testid="stSidebar"] .stMarkdown h2 {{
   font-size: 13px; letter-spacing: 2px; color: {t['text_secondary']};
 }}
 
-/* ---------- segmented tab navigation ---------- */
-div[data-testid="stTabs"] div[role="tablist"] {{
+/* ---------- widget labels / help ---------- */
+div[data-testid="stWidgetLabel"] label,
+div[data-testid="stWidgetLabel"] p {{
+  color: {t['text_secondary']};
+}}
+div[data-testid="stWidgetLabel"] {{
+  color: {t['text_secondary']};
+}}
+[data-testid="stTooltipIcon"], [data-testid="stHelpIcon"] {{
+  color: {t['text_muted']};
+}}
+
+/* ---------- segmented tab navigation ----------
+   Multi-variant selectors (test-id + baseweb + ARIA role) so the active
+   state never falls through to Streamlit's default red primary. Selected
+   uses our own background + accent text + blue underline; the native
+   underline/shadow is neutralised. */
+div[data-testid="stTabs"] div[role="tablist"],
+div[data-testid="stTabs"] div[data-baseweb="tab-list"] {{
   background: {t['surface']}; border: 1px solid {t['border']};
   border-radius: 999px; padding: 4px; gap: 2px;
   box-shadow: {t['shadow_sm']};
 }}
-div[data-testid="stTabs"] button {{
+div[data-testid="stTabs"] button[role="tab"],
+div[data-testid="stTabs"] div[data-baseweb="tab"] {{
   color: {t['text_secondary']}; border-radius: 999px; font-weight: 600;
-  padding: 6px 14px;
+  padding: 6px 14px; box-shadow: none;
+  border-bottom: 2px solid transparent;
 }}
-div[data-testid="stTabs"] button:hover {{ color: {t['text_primary']}; }}
-div[data-testid="stTabs"] button[aria-selected="true"] {{
+div[data-testid="stTabs"] button[role="tab"]:hover,
+div[data-testid="stTabs"] div[data-baseweb="tab"]:hover {{
+  color: {t['text_primary']}; background: {t['surface_subtle']};
+}}
+div[data-testid="stTabs"] button[role="tab"][aria-selected="true"],
+div[data-testid="stTabs"] div[data-baseweb="tab"][aria-selected="true"] {{
   color: {t['accent_hover']}; background: {t['accent_soft']};
+  box-shadow: none; border-bottom: 2px solid {t['accent']};
 }}
 
 /* ---------- metric cards + summary strips ---------- */
@@ -319,6 +371,7 @@ div[data-testid="stMetricDelta"] {{ font-variant-numeric: tabular-nums; }}
 .stButton>button, .stDownloadButton>button {{
   border-radius: 10px; font-weight: 650;
   border: 1px solid {t['border']};
+  color: {t['text_primary']};
 }}
 .stButton>button[kind="primary"], .stDownloadButton>button[kind="primary"] {{
   background: {t['accent']}; border-color: {t['accent']}; color: #FFFFFF;
@@ -332,27 +385,73 @@ div[data-testid="stMetricDelta"] {{ font-variant-numeric: tabular-nums; }}
   background: {t['surface']}; color: {t['accent_hover']};
   border-color: {t['border_strong']};
 }}
+.stButton>button[kind="tertiary"] {{
+  background: transparent; border-color: transparent;
+  color: {t['text_muted']}; font-weight: 600;
+}}
+.stButton>button[kind="tertiary"]:hover {{
+  color: {t['danger']}; background: {t['surface_subtle']};
+  border-color: {t['border']};
+}}
+.stButton>button:disabled, .stDownloadButton>button:disabled {{
+  opacity: 0.65; color: {t['text_muted']};
+}}
 
-/* ---------- inputs ---------- */
+/* ---------- inputs (explicit per-mode surfaces + text) ---------- */
 div[data-baseweb="select"] > div {{
   background: {t['surface']}; border-color: {t['border_strong']};
-  border-radius: 10px;
+  border-radius: 10px; color: {t['text_primary']};
 }}
-input, textarea {{
+div[data-baseweb="select"] span {{
+  color: {t['text_primary']};
+}}
+div[data-testid="stTextInput"] input,
+div[data-testid="stNumberInput"] input,
+div[data-testid="stTextArea"] textarea,
+div[data-testid="stDateInput"] input {{
+  background: {t['surface']}; color: {t['text_primary']};
+  border-color: {t['border_strong']};
   border-radius: 10px !important;
 }}
-div[data-testid="stSlider"] {{ padding-top: 6px; }}
-div[data-testid="stCheckbox"] label {{ color: {t['text_primary']}; }}
+input::placeholder, textarea::placeholder {{
+  color: {t['text_muted']}; opacity: 1;
+}}
+div[role="listbox"], div[data-baseweb="popover"], div[data-baseweb="menu"] {{
+  background: {t['surface_elevated']}; color: {t['text_primary']};
+}}
+div[data-testid="stSlider"] {{
+  padding-top: 6px; color: {t['text_primary']};
+}}
+div[data-testid="stRadio"] label, div[data-testid="stCheckbox"] label {{
+  color: {t['text_primary']};
+}}
+div[data-testid="stRadio"] {{
+  color: {t['text_primary']};
+}}
+input:disabled, textarea:disabled, [aria-disabled="true"] {{
+  color: {t['text_muted']}; opacity: 0.8;
+}}
 
 /* ---------- expanders / alerts / tables / dividers ---------- */
 details.stExpander {{
   border: 1px solid {t['border']}; border-radius: {t['radius_lg']};
   background: {t['surface']}; box-shadow: {t['shadow_sm']};
+  color: {t['text_primary']};
+}}
+details.stExpander summary {{
+  color: {t['text_primary']}; font-weight: 650;
 }}
 .stAlert {{ border-radius: {t['radius_md']}; }}
 .stDataFrame {{
   border: 1px solid {t['border']}; border-radius: 14px;
   box-shadow: {t['shadow_sm']}; background: {t['surface']};
+  color: {t['text_primary']};
+}}
+.stDataFrame th {{
+  color: {t['text_secondary']}; font-weight: 700;
+}}
+.stDataFrame [role="gridcell"] {{
+  color: {t['text_primary']};
 }}
 hr {{ border-color: {t['border']}; }}
 
@@ -373,7 +472,7 @@ hr {{ border-color: {t['border']}; }}
   text-transform: uppercase; color: {t['accent_hover']}; margin-bottom: 2px;
 }}
 .pc-kicker {{
-  font-size: 11px; letter-spacing: 2px; color: {t['text_muted']};
+  font-size: 11px; letter-spacing: 2px; color: {t['text_secondary']};
   margin-bottom: 4px; font-weight: 700;
 }}
 .pc-title {{
@@ -404,7 +503,7 @@ hr {{ border-color: {t['border']}; }}
   line-height: 1.2; overflow-wrap: anywhere;
 }}
 .pc-strip-sub {{
-  font-size: 12.5px; color: {t['text_muted']}; margin-top: 3px;
+  font-size: 12.5px; color: {t['text_secondary']}; margin-top: 3px;
 }}
 .pc-pill {{
   display: inline-block; padding: 2px 12px; border-radius: 999px;
@@ -463,7 +562,7 @@ def inject_theme() -> None:
     except Exception:
         pass
     _apply_chart_mode(mode)
-    st.markdown(f"<style>{_css(_MODES[mode])}</style>",
+    st.markdown(f"<style>{_css(_MODES[mode], mode)}</style>",
                 unsafe_allow_html=True)
 
 

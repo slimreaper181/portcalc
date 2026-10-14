@@ -197,6 +197,50 @@ def test_pill_helpers_are_pure_and_escaped():
     assert "&lt;script&gt;" in tag_pill('<script>x</script>')
 
 
+def test_active_tab_uses_accent_never_danger():
+    # Browser-QA regression: the selected-tab rule must carry the BLUE
+    # brand accent; red is reserved for loss/danger/error. Checks the exact
+    # selected-state rule blocks (not the whole stylesheet).
+    import re
+    from ui.theme import _css, DARK, LIGHT
+    for mode, toks in (("light", LIGHT), ("dark", DARK)):
+        css = _css(toks, mode)
+        blocks = [b for b in css.split("}") if "aria-selected" in b]
+        assert blocks, mode  # selected-state rules must exist
+        for b in blocks:
+            assert toks["accent"] in b or toks["accent_hover"] in b or \
+                toks["accent_soft"] in b, (mode, b[:120])
+            assert toks["danger"] not in b, (mode, b[:120])
+            assert toks["negative"] not in b, (mode, b[:120])
+
+
+def test_status_strip_labels_benchmark_explicitly():
+    # Browser-QA regression: the benchmark pill must read "Benchmark SPY",
+    # never a bare unexplained ticker; feed/mode pills stay labelled too.
+    import pathlib
+    app_src = pathlib.Path(__file__).resolve().parent.parent.joinpath(
+        "app.py").read_text(encoding="utf-8")
+    assert "Benchmark {" in app_src
+    assert "Yahoo fallback" in app_src
+    assert "Base {" in app_src
+
+
+def test_light_sidebar_selectors_carry_explicit_text():
+    # Browser-QA regression: every text-bearing widget/sidebar selector
+    # declares an explicit foreground per mode (no inheritance gamble).
+    from ui.theme import _css, DARK, LIGHT
+    needed = ["stSidebar", "stWidgetLabel", "stCaptionContainer",
+              "stMarkdownContainer", "color-scheme", "stTooltipIcon",
+              "role=\"tablist\"", "role=\"tab\"", "stTextInput",
+              "stNumberInput", "stRadio", "stCheckbox", "stDataFrame",
+              "stExpander", "listbox", "stSlider", "stMetric"]
+    for mode, toks in (("light", LIGHT), ("dark", DARK)):
+        css = _css(toks, mode)
+        for sel in needed:
+            assert sel in css, (mode, sel)
+        assert ("color-scheme: light" in css) != (mode == "dark")
+
+
 def test_appearance_key_survives_portfolio_switch():
     # The toggle must persist across tabs AND portfolios: the switch
     # routine must never pop the appearance key, and no analytical cache

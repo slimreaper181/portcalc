@@ -1,0 +1,11 @@
+# Streamlit server/theme configuration (committed — display only).
+#
+# Only primaryColor is set here: it drives Streamlit-native accent chrome
+# that custom CSS cannot reliably reach (tab underline, slider fill, radio
+# dots, focus rings). It must stay the BLUE brand accent — red is reserved
+# for loss/danger/error. Page/widget surfaces and BOTH light/dark
+# appearances are owned by ui/theme.py (which switches per session), so no
+# base/background/text colours are pinned here.
+
+[theme]
+primaryColor = "#2563EB"

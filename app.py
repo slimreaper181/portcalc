@@ -786,7 +786,8 @@ with st.sidebar:
                 f"**{ticker}** — {_p.shares:g} sh · buy {_buy} ({_src})")
         except ValueError:
             col1.markdown(f"**{ticker}** — (invalid entry, remove me)")
-        if col2.button("✕", key=f"rm_{ticker}"):
+        if col2.button("✕", key=f"rm_{ticker}", type="tertiary",
+                         help=f"Remove {ticker}"):
             to_remove.append(ticker)
 
     for t in to_remove:
@@ -979,7 +980,8 @@ with st.sidebar:
     for _w in list(st.session_state.watchlist):
         _c1, _c2 = st.columns([3, 1])
         _c1.markdown(f"**{_w}**")
-        if _c2.button("✕", key=f"wl_rm_{_w}"):
+        if _c2.button("✕", key=f"wl_rm_{_w}", type="tertiary",
+                         help=f"Stop watching {_w}"):
             st.session_state.watchlist = [
                 x for x in st.session_state.watchlist if x != _w]
             flash(f"Stopped watching {_w}.", "info")
@@ -1418,26 +1420,32 @@ metric_strip([
      "Currency-keyed ledger cash"),
     ("Base Currency", base_ccy, f"Benchmark {str(_header_bench)}"),
 ])
-_live_note = live_snapshot.get("_status", {}).get("feed_note", "")
 _stream_mode = live_snapshot.get("_status", {}).get("stream_mode", "?")
 _stream_feed = live_snapshot.get("_status", {}).get("stream_feed")
-_stream_age = live_snapshot.get("_status", {}).get("stream_age_s")
-_stream_bit = f" · Stream: {_stream_mode}" + (
-    f" ({str(_stream_feed).upper()})" if _stream_feed else "") + (
-    f" · quote {_stream_age:.0f}s old"
-    if isinstance(_stream_age, (int, float)) else "")
+_feed_raw = str(_stream_feed or "").strip().lower()
+_is_fallback = (not _feed_raw) or ("yahoo" in _feed_raw)
+_feed_pill = "Yahoo fallback" if _is_fallback else f"{_feed_raw.upper()} stream"
+_mode_kind = {"STREAMING": "live", "LIVE": "live",
+              "POLLING": "neutral"}.get(
+                  str(_stream_mode).strip().upper(), "info")
 pills_row([
-    (str(_stream_mode), str(_stream_mode)),
-    (str(_stream_feed).upper() if _stream_feed else "FALLBACK",
-     "fallback" if not _stream_feed or str(_stream_feed).lower() == "yahoo"
-     else "info"),
+    (_feed_pill, "warn" if _is_fallback else "info"),
+    (str(_stream_mode), _mode_kind),
     (f"Base {base_ccy}", "neutral"),
-    (str(_header_bench), "neutral"),
+    (f"Benchmark {str(_header_bench)}", "neutral"),
 ])
-st.caption(f"Benchmark {str(_header_bench)} · Data through {_header_through} "
-           f"· Live: {_live_note}{_stream_bit}"
-           + (" · Partial marks: " + ", ".join(live_incomplete)
-              if live_incomplete else ""))
+try:
+    _through_txt = prices.index[-1].strftime("%d %b %Y")
+except Exception:
+    _through_txt = _header_through
+_caption_bits = [f"Data through {_through_txt}",
+                 f"{len(tickers)} securities"]
+if live_incomplete:
+    _caption_bits.append("Partial marks: " + ", ".join(live_incomplete))
+if _is_fallback:
+    _caption_bits.append("Market data fallback active — "
+                         "streaming credentials unavailable.")
+st.caption(" · ".join(_caption_bits))
 st.markdown("---")
 
 
@@ -1449,14 +1457,16 @@ def _live_status_strip():
     because of quote ticks; only this status line refreshes.
     """
     try:
+        from ui.theme import pill as _strip_pill
         _s = get_stream_manager().status()
         _age_txt = (f"{_s['newest_quote_age_s']:.0f}s old"
                     if isinstance(_s.get("newest_quote_age_s"),
                                   (int, float)) else "no quotes yet")
-        _feed_txt = (f" · {str(_s['feed']).upper()}"
-                     if _s.get("feed") else "")
-        st.caption(f"Market data: **{_s['mode']}**{_feed_txt} · "
-                   f"{_age_txt} · {_s.get('note', '')} "
+        _smode = str(_s.get("mode", "?"))
+        _skind = {"STREAMING": "live", "LIVE": "live",
+                  "POLLING": "neutral"}.get(_smode.strip().upper(), "info")
+        st.markdown(_strip_pill(_smode, _skind), unsafe_allow_html=True)
+        st.caption(f"{_age_txt} · {_s.get('note', '')} "
                    f"({_s.get('n_symbols', 0)} symbols)")
     except Exception:
         pass
